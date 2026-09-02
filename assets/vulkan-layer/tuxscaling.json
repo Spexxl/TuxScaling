@@ -1,0 +1,12 @@
+{
+  "file_format_version": "1.0.0",
+  "layer": {
+    "name": "VK_LAYER_TUXSCALING_overlay",
+    "type": "GLOBAL",
+    "library_path": "libtuxscaling_layer.so",
+    "api_version": "1.3.280",
+    "implementation_version": "1",
+    "description": "TuxScaling temporal upscaling layer",
+    "disable_environment": "TUXSCALING_DISABLE"
+  }
+}
