@@ -46,7 +46,7 @@ members = ["crates/*", "xtask"]
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 ash = "0.38"
