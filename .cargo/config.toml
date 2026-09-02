@@ -1,0 +1,5 @@
+[build]
+incremental = true
+
+[alias]
+xtask = "run --package xtask --"

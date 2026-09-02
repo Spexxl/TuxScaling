@@ -1,0 +1,5 @@
+/target/
+**/*.spv
+*.log
+.idea/
+.vscode/
