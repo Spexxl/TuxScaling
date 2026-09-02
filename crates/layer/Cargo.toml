@@ -1,0 +1,15 @@
+[package]
+name = "tuxscaling-layer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ash.workspace = true
+tracing.workspace = true
+tuxscaling-runtime = { path = "../runtime" }
+tuxscaling-vulkan = { path = "../vulkan" }
