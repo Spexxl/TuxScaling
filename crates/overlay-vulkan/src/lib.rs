@@ -28,7 +28,7 @@ pub struct OverlaySwapchain {
     framebuffers: Vec<vk::Framebuffer>,
     renderer: Renderer,
     context: egui::Context,
-    command_pool: vk::CommandPool,
+    command_pool: Option<vk::CommandPool>,
     frames: Vec<FrameSlot>,
     enabled: bool,
 }
@@ -54,7 +54,6 @@ impl OverlaySwapchain {
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         device: &ash::Device,
-        queue_family_index: u32,
         info: SwapchainInfo,
         images: Vec<vk::Image>,
     ) -> Result<Self, vk::Result> {
@@ -103,28 +102,6 @@ impl OverlaySwapchain {
             framebuffers.push(framebuffer);
         }
 
-        let command_pool_info = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(queue_family_index)
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        let command_pool = unsafe { device.create_command_pool(&command_pool_info, None) }?;
-        let allocate_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(images.len() as u32);
-        let command_buffers = unsafe { device.allocate_command_buffers(&allocate_info) }?;
-        let mut frames = Vec::with_capacity(images.len());
-        for command_buffer in command_buffers {
-            let render_complete =
-                unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
-            let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-            let fence = unsafe { device.create_fence(&fence_info, None) }?;
-            frames.push(FrameSlot {
-                command_buffer,
-                render_complete,
-                fence,
-            });
-        }
-
         let renderer = Renderer::with_default_allocator(
             instance,
             physical_device,
@@ -146,8 +123,8 @@ impl OverlaySwapchain {
             framebuffers,
             renderer,
             context: egui::Context::default(),
-            command_pool,
-            frames,
+            command_pool: None,
+            frames: Vec::new(),
             enabled: true,
         })
     }
@@ -156,16 +133,52 @@ impl OverlaySwapchain {
         self.enabled = false;
     }
 
+    unsafe fn initialize_frames(
+        &mut self,
+        device: &ash::Device,
+        queue_family_index: u32,
+    ) -> Result<(), vk::Result> {
+        if self.command_pool.is_some() {
+            return Ok(());
+        }
+        let command_pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let command_pool = unsafe { device.create_command_pool(&command_pool_info, None) }?;
+        let allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(self.images.len() as u32);
+        let command_buffers = unsafe { device.allocate_command_buffers(&allocate_info) }?;
+        let mut frames = Vec::with_capacity(self.images.len());
+        for command_buffer in command_buffers {
+            let render_complete =
+                unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
+            let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+            let fence = unsafe { device.create_fence(&fence_info, None) }?;
+            frames.push(FrameSlot {
+                command_buffer,
+                render_complete,
+                fence,
+            });
+        }
+        self.command_pool = Some(command_pool);
+        self.frames = frames;
+        Ok(())
+    }
+
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn prepare_frame(
         &mut self,
         device: &ash::Device,
         queue: vk::Queue,
+        queue_family_index: u32,
         image_index: u32,
     ) -> Result<FrameSubmission, vk::Result> {
         if !self.enabled {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
+        unsafe { self.initialize_frames(device, queue_family_index) }?;
         let image_index = image_index as usize;
         let image = *self
             .images
@@ -196,7 +209,11 @@ impl OverlaySwapchain {
         );
         if !frame.textures_delta.set.is_empty() {
             self.renderer
-                .set_textures(queue, self.command_pool, &frame.textures_delta.set)
+                .set_textures(
+                    queue,
+                    self.command_pool.expect("frame resources initialized"),
+                    &frame.textures_delta.set,
+                )
                 .map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?;
         }
 
@@ -299,7 +316,9 @@ impl OverlaySwapchain {
                 device.destroy_semaphore(frame.render_complete, None);
             }
         }
-        unsafe { device.destroy_command_pool(command_pool, None) };
+        if let Some(command_pool) = command_pool {
+            unsafe { device.destroy_command_pool(command_pool, None) };
+        }
         for framebuffer in framebuffers {
             unsafe { device.destroy_framebuffer(framebuffer, None) };
         }
