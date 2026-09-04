@@ -30,6 +30,11 @@ pub fn pyramid(width: u32, height: u32) -> Vec<Level> {
     }
     levels
 }
+
+fn visualization_needed(mode: u32) -> bool {
+    mode != 0
+}
+
 pub struct MotionField {
     pub vectors: vk::Image,
     pub confidence: vk::Image,
@@ -401,13 +406,15 @@ impl MotionEstimator {
                 grid.width,
                 grid.height,
             );
-            self.dispatch(
-                command,
-                6,
-                self.params(0, 0, valid, mode),
-                self.visualization.extent.width,
-                self.visualization.extent.height,
-            );
+            if visualization_needed(mode) {
+                self.dispatch(
+                    command,
+                    6,
+                    self.params(0, 0, valid, mode),
+                    self.visualization.extent.width,
+                    self.visualization.extent.height,
+                );
+            }
         }
         self.initialized = true;
     }
@@ -430,6 +437,15 @@ impl Drop for MotionEstimator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skips_visualization_for_the_original_view() {
+        assert!(!visualization_needed(0));
+        assert!(visualization_needed(1));
+        assert!(visualization_needed(2));
+        assert!(visualization_needed(3));
+    }
+
     #[test]
     fn odd_dimensions_keep_all_pixels_and_disjoint_levels() {
         let p = pyramid(127, 65);
