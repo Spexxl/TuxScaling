@@ -1,5 +1,3 @@
-//! Vendor-neutral temporal-upscaler contracts and backend dispatch.
-
 use ash::vk;
 use thiserror::Error;
 
@@ -32,7 +30,6 @@ pub enum BackendError {
     Internal(String),
 }
 
-/// The minimal resource description shared by future Vulkan backends.
 #[derive(Debug, Clone, Copy)]
 pub struct ImageResource {
     pub image: vk::Image,

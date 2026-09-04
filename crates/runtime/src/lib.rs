@@ -1,8 +1,5 @@
-//! Per-frame orchestration for the TuxScaling runtime.
-
 pub const CRATE_NAME: &str = "tuxscaling-runtime";
 
-/// The processing state for a swapchain runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeState {
     Disabled,
@@ -10,13 +7,11 @@ pub enum RuntimeState {
     Bypassed,
 }
 
-/// The result of a present-processing attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentDecision {
     PassThrough,
 }
 
-/// Minimal runtime shell used by the initial pass-through milestone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Runtime {
     state: RuntimeState,
@@ -33,7 +28,6 @@ impl Runtime {
         self.state
     }
 
-    /// Processing is intentionally bypassed until capture and reconstruction are implemented.
     pub const fn process_present(&self) -> PresentDecision {
         PresentDecision::PassThrough
     }

@@ -1,5 +1,3 @@
-//! Command-line diagnostics for TuxScaling.
-
 use anyhow::Result;
 use clap::Parser;
 

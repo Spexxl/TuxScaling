@@ -1,5 +1,3 @@
-//! Workspace development commands.
-
 use std::process::{Command, ExitCode};
 
 fn run(program: &str, args: &[&str]) -> bool {

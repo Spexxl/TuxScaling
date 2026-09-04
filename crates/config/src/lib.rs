@@ -1,5 +1,3 @@
-//! Versioned TOML configuration and validation.
-
 use serde::Deserialize;
 use thiserror::Error;
 

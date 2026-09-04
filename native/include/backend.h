@@ -14,7 +14,6 @@ typedef struct tuxscaling_backend_capabilities {
     uint32_t supports_frame_generation;
 } tuxscaling_backend_capabilities;
 
-/* The caller owns the returned context and must release it with destroy. */
 uint32_t tuxscaling_backend_query(
     uint32_t requested_abi_version,
     tuxscaling_backend_capabilities *out_capabilities);
