@@ -1,0 +1,13 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+void main() {
+    uvec2 q=gl_GlobalInvocationID.xy;
+    if(q.x>=p.width || q.y>=p.height) return;
+    float sum=0;
+    for(uint y=0;y<2;y++) for(uint x=0;x<2;x++) {
+        uvec2 s=min(q*2+uvec2(x,y),uvec2(p.parent_width,p.parent_height)-1);
+        sum+=current_luma[p.parent_offset+s.y*p.parent_width+s.x];
+    }
+    current_luma[p.offset+q.y*p.width+q.x]=sum*0.25;
+}

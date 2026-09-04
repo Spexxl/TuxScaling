@@ -1,0 +1,17 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+void main() {
+    uvec2 q=gl_GlobalInvocationID.xy;
+    if(q.x>=p.width || q.y>=p.height) return;
+    vec3 sum=vec3(0);
+    for(int y=0;y<2;y++) for(int x=0;x<2;x++) {
+        ivec2 pos=min(ivec2(q)*2+ivec2(x,y),textureSize(color_frame,0)-1);
+        vec3 c=texelFetch(color_frame,pos,0).rgb;
+        if(any(isnan(c)) || any(isinf(c))) c=vec3(0);
+        c=clamp(c,0,1);
+        if(p.decode_srgb!=0) c=mix(c/12.92,pow((c+0.055)/1.055,vec3(2.4)),greaterThan(c,vec3(0.04045)));
+        sum+=c;
+    }
+    current_luma[p.offset+q.y*p.width+q.x]=dot(sum*0.25,vec3(0.2126,0.7152,0.0722));
+}

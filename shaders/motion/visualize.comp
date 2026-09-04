@@ -1,0 +1,21 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+vec3 hsv(float h,float v) {
+    return v*clamp(abs(fract(h+vec3(0,2.0/3.0,1.0/3.0))*6-3)-1,0,1);
+}
+void main() {
+    ivec2 q=ivec2(gl_GlobalInvocationID.xy), size=imageSize(visualization);
+    if(any(greaterThanEqual(q,size))) return;
+    ivec2 grid=min(q/4,imageSize(motion_image)-1);
+    vec2 flow=imageLoad(motion_image,grid).xy;
+    float confidence=imageLoad(confidence_image,grid).r;
+    vec3 color;
+    if(p.mode==1) {
+        ivec2 l=min(q/2,ivec2(p.width,p.height)-1);
+        color=vec3(current_luma[uint(l.y)*p.width+uint(l.x)]);
+    } else if(scene_cut!=0) color=vec3(0);
+    else if(p.mode==3) color=vec3(confidence);
+    else color=hsv(atan(flow.y,flow.x)/6.2831853+0.5,clamp(length(flow)/16,0,1));
+    imageStore(visualization,q,vec4(color,1));
+}

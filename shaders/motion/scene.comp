@@ -1,0 +1,24 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+void main() {
+    if(any(notEqual(gl_GlobalInvocationID,uvec3(0)))) return;
+    float a[32],b[32];
+    for(int i=0;i<32;i++) { a[i]=0;b[i]=0; }
+    uint count=p.width*p.height;
+    for(uint i=0;i<count;i++) {
+        a[min(uint(clamp(current_luma[p.offset+i],0,1)*31),31)]+=1;
+        b[min(uint(clamp(previous_luma[p.offset+i],0,1)*31),31)]+=1;
+    }
+    float distance=0;
+    for(int i=0;i<32;i++) distance+=abs(a[i]-b[i])/float(count);
+    ivec2 size=imageSize(confidence_image);
+    uint good=0, samples=0;
+    for(int y=0;y<size.y;y+=4) for(int x=0;x<size.x;x+=4) {
+        if(imageLoad(confidence_image,ivec2(x,y)).r>0.2) good++;
+        samples++;
+    }
+    consistent=good;
+    distance_l1=distance;
+    scene_cut=(p.valid==0 || (distance>p.scene_distance_threshold && float(good)/float(max(samples,1))<p.scene_consistency_threshold))?1:0;
+}

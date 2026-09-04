@@ -1,0 +1,17 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+void main() {
+    uvec2 q=gl_GlobalInvocationID.xy;
+    uvec2 size=uvec2(imageSize(motion_image));
+    if(any(greaterThanEqual(q,size))) return;
+    vec4 f=forward_flow[q.y*size.x+q.x];
+    vec2 target=vec2(q)+f.xy*0.5;
+    ivec2 t=ivec2(round(target));
+    bool inside=all(greaterThanEqual(t,ivec2(0)))&&all(lessThan(t,ivec2(size)));
+    vec2 b=inside?backward_flow[uint(t.y)*size.x+uint(t.x)].xy:vec2(1000);
+    float consistency=length((f.xy+b)*2);
+    float confidence=inside&&p.valid!=0?exp(-f.z*12)*f.w*clamp(1-consistency/2,0,1):0;
+    imageStore(motion_image,ivec2(q),vec4(p.valid!=0?f.xy*2:vec2(0),0,0));
+    imageStore(confidence_image,ivec2(q),vec4(confidence));
+}

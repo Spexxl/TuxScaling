@@ -1,0 +1,10 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+void main() {
+    ivec2 q=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(q,imageSize(motion_image))) || scene_cut==0) return;
+    imageStore(motion_image,q,vec4(0));
+    imageStore(confidence_image,q,vec4(0));
+}
+

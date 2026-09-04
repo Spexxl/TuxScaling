@@ -1,0 +1,66 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+float source(ivec2 q) {
+    q=clamp(q,ivec2(0),ivec2(p.width,p.height)-1);
+    uint i=p.offset+uint(q.y)*p.width+uint(q.x);
+    return p.direction==0?current_luma[i]:previous_luma[i];
+}
+float target_point(ivec2 q) {
+    q=clamp(q,ivec2(0),ivec2(p.width,p.height)-1);
+    uint i=p.offset+uint(q.y)*p.width+uint(q.x);
+    return p.direction==0?previous_luma[i]:current_luma[i];
+}
+float target(vec2 q) {
+    ivec2 a=ivec2(floor(q)); vec2 f=fract(q);
+    return mix(mix(target_point(a),target_point(a+ivec2(1,0)),f.x),
+        mix(target_point(a+ivec2(0,1)),target_point(a+ivec2(1,1)),f.x),f.y);
+}
+float cost(ivec2 center,vec2 delta) {
+    vec2 t=vec2(center)+delta;
+    if(any(lessThan(t,vec2(0))) || any(greaterThan(t,vec2(p.width-1,p.height-1)))) return 1e10;
+    float sum=0;
+    for(int y=-3;y<=3;y++) for(int x=-3;x<=3;x++)
+        sum+=abs(source(center+ivec2(x,y))-target(vec2(center+ivec2(x,y))+delta));
+    return sum/49;
+}
+void main() {
+    uvec2 q=gl_GlobalInvocationID.xy;
+    uint gw=(p.width+1)/2, gh=(p.height+1)/2;
+    if(q.x>=gw || q.y>=gh) return;
+    uint i=p.grid_offset+q.y*gw+q.x;
+    ivec2 center=ivec2(min(q*2+1,uvec2(p.width,p.height)-1));
+    vec2 guess=vec2(0);
+    if(p.coarsest==0) {
+        ivec2 parent_size=ivec2((p.parent_width+1)/2,(p.parent_height+1)/2);
+        float seed_cost=cost(center,guess);
+        for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++) {
+            ivec2 parent=clamp(ivec2(q/2)+ivec2(x,y),ivec2(0),parent_size-1);
+            uint pi=p.parent_grid_offset+uint(parent.y)*uint(parent_size.x)+uint(parent.x);
+            vec2 seed=round((p.direction==0?forward_flow[pi].xy:backward_flow[pi].xy)*2);
+            float c=cost(center,seed);
+            if(c<seed_cost) { seed_cost=c;guess=seed; }
+        }
+    }
+    vec2 best=guess;
+    float best_cost=cost(center,best), second=1e10;
+    int radius=p.coarsest!=0?4:2;
+    for(int y=-radius;y<=radius;y++) for(int x=-radius;x<=radius;x++) {
+        vec2 candidate=guess+vec2(x,y);
+        if(all(equal(candidate,guess))) continue;
+        float c=cost(center,candidate);
+        if(c<best_cost-1e-7) { second=best_cost;best_cost=c;best=candidate; }
+        else second=min(second,c);
+    }
+    if(p.level==0) {
+        vec2 base=best;
+        for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++) {
+            vec2 candidate=base+vec2(x,y)*0.5;
+            float c=cost(center,candidate);
+            if(c<best_cost-1e-7) { best_cost=c;best=candidate; }
+        }
+    }
+    float ambiguity=clamp((second-best_cost)/max(second,1e-6)*4,0,1);
+    vec4 result=vec4(best,best_cost,ambiguity);
+    if(p.direction==0) forward_flow[i]=result; else backward_flow[i]=result;
+}
