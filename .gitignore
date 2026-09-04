@@ -1,5 +1,35 @@
-/target/
+# Rust/Cargo build output. `target` may also exist in nested example crates.
+target/
+*.rs.bk
+*.pdb
+*.dSYM/
+*.dll
+*.so
+*.dylib
+
+# Rust profiling and coverage artifacts.
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+lcov.info
+tarpaulin-report.html
+
+# Generated shader binaries
 **/*.spv
+
+# Runtime and diagnostic logs
 *.log
+
+# Native build directories and generated C/C++ metadata.
+/build/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# Editor metadata
 .idea/
 .vscode/
+
+# Keep Cargo.lock tracked: TuxScaling ships binaries and a Vulkan layer.
