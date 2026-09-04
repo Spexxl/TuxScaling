@@ -741,6 +741,7 @@ unsafe extern "system" fn get_device_proc_addr(
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "system" fn layer_vkGetInstanceProcAddr(
     instance: vk::Instance,
     name: *const i8,
@@ -749,6 +750,7 @@ pub unsafe extern "system" fn layer_vkGetInstanceProcAddr(
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "system" fn layer_vkGetDeviceProcAddr(
     device: vk::Device,
     name: *const i8,
@@ -757,6 +759,7 @@ pub unsafe extern "system" fn layer_vkGetDeviceProcAddr(
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "system" fn vkNegotiateLoaderLayerInterfaceVersion(
     version: *mut NegotiateLayerInterface,
 ) -> vk::Result {
