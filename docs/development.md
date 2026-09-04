@@ -20,9 +20,11 @@ cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo xtask check
+cargo xtask gpu-check
+cargo xtask smoke
 ```
 
-`cargo xtask check` is the preferred single command. It runs formatting checks, workspace tests, and Clippy with warnings treated as errors.
+`cargo xtask check` is the preferred host-only command. `gpu-check` runs ignored GPU tests. `smoke` exercises multiple swapchains, grouped presents, resize, capture, optical flow, and validation synchronization.
 
 ## Native boundary
 
@@ -40,7 +42,7 @@ The development manifest is located at `assets/vulkan-layer/tuxscaling.json`. Af
 
 Use `VK_LOADER_DEBUG=all` to inspect loader and layer discovery. Use `RUST_LOG=info` or `RUST_LOG=debug` for structured runtime diagnostics once the layer logging path is active.
 
-The initial layer is pass-through, so it should not be enabled for production games until capture and synchronization milestones are complete.
+The layer currently supports SDR swapchains with transfer and sampling usage. Unsupported formats, application-managed presentation fences, and unsupported present data use pass-through.
 
 ## Language and naming policy
 

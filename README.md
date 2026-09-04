@@ -6,7 +6,7 @@ The project targets native Vulkan applications and Windows games translated to V
 
 ## Current status
 
-The repository currently contains the initial compiling scaffold. The Vulkan layer is pass-through, configuration and overlay state have typed shells, and the backend boundary is vendor-neutral. Temporal capture, optical flow, reconstruction, interactive overlay rendering, and vendor SDK adapters are not implemented yet.
+The repository currently captures supported SDR swapchains, estimates optical flow on the GPU, tracks temporal history, and renders an egui diagnostic overlay. Upscaling backends, frame reconstruction, input estimation, and vendor SDK adapters remain future work.
 
 ## Design boundaries
 
@@ -30,4 +30,4 @@ xtask/        Workspace validation commands
 
 ## Development
 
-See [docs/development.md](docs/development.md) for toolchain setup and validation commands.
+See [docs/development.md](docs/development.md) for toolchain setup and validation commands. Run `cargo xtask gpu-check` for GPU motion tests and `cargo xtask smoke` for the multi-swapchain WSI test.

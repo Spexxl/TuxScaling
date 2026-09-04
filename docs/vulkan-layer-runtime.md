@@ -4,7 +4,7 @@
 
 The Vulkan layer injects work immediately before presentation while preserving the application's Vulkan device, queues, and swapchains. The layer must fail open: if TuxScaling cannot process a present, the original call is forwarded unchanged.
 
-The validated baseline renders the Egui smoke panel over `vkcube` on RADV. It is not yet suitable for game workloads because it uses a single command buffer and serializes the queue.
+The validated runtime captures supported SDR swapchains, computes estimated optical flow, and renders the Egui diagnostic panel over `vkcube` on RADV. It remains experimental until frame reconstruction and broader format coverage are added.
 
 ## Ownership
 
@@ -13,6 +13,7 @@ The validated baseline renders the Egui smoke panel over `vkcube` on RADV. It is
 `overlay-vulkan` owns overlay swapchain resources:
 
 - image views and framebuffers;
+- capture and motion resources for supported SDR formats;
 - render pass and Egui renderer;
 - one frame slot per swapchain image;
 - command buffers, fences, and render-complete semaphores;
@@ -26,8 +27,8 @@ For an intercepted present, the layer receives the application's wait semaphores
 
 1. Select the frame slot for that image.
 2. Reuse the slot only after its previous fence is complete.
-3. Record overlay commands for the selected image.
-4. Submit overlay commands waiting on the application's original semaphores.
+3. Record capture, motion, and overlay commands for the selected image.
+4. Submit commands waiting on the application's original semaphores.
 5. Signal the slot's render-complete semaphore and fence.
 6. Forward the present with only the render-complete semaphore as its wait semaphore.
 
@@ -58,7 +59,8 @@ The runtime milestone is complete only when all checks pass:
 - `cargo clippy --workspace --all-targets -- -D warnings`;
 - `vkcube` renders an Egui panel with the layer enabled;
 - validation layers report no synchronization or lifetime errors during create, resize, present, and destruction;
-- the layer handles at least one application with multiple swapchain images without global queue-idle stalls.
+- the WSI harness exercises two swapchains, grouped presents, resize, and resource destruction without global queue-idle stalls;
+- GPU tests cover known motion, scene cuts, occlusion confidence, and capture isolation.
 
 ## Scope boundary
 
