@@ -2,6 +2,53 @@ use egui::{ClippedPrimitive, Context, RawInput, Rect, TexturesDelta, vec2};
 
 pub const CRATE_NAME: &str = "tuxscaling-overlay";
 
+#[derive(Debug, Clone, Default)]
+pub struct FrameDiagnostics {
+    pub frame_id: u64,
+    pub state: String,
+    pub mode: String,
+    pub capture_ms: f32,
+    pub motion_ms: f32,
+    pub overlay_ms: f32,
+}
+
+pub fn render_diagnostics(
+    context: &Context,
+    size: [u32; 2],
+    diagnostics: &FrameDiagnostics,
+) -> OverlayFrame {
+    let output = context.run(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Default::default(),
+                vec2(size[0] as f32, size[1] as f32),
+            )),
+            ..Default::default()
+        },
+        |context| {
+            egui::Window::new("TuxScaling").show(context, |ui| {
+                ui.label(&diagnostics.state);
+                ui.label(format!(
+                    "{} x {} | Frame {}",
+                    size[0], size[1], diagnostics.frame_id
+                ));
+                ui.label(format!("View: {}", diagnostics.mode));
+                ui.label("Motion: current -> previous, pixels");
+                ui.label("Hue: direction | Brightness: magnitude");
+                ui.label(format!(
+                    "GPU ms: capture {:.2} | flow {:.2} | overlay {:.2}",
+                    diagnostics.capture_ms, diagnostics.motion_ms, diagnostics.overlay_ms
+                ));
+            });
+        },
+    );
+    OverlayFrame {
+        pixels_per_point: output.pixels_per_point,
+        primitives: context.tessellate(output.shapes, output.pixels_per_point),
+        textures_delta: output.textures_delta,
+    }
+}
+
 #[derive(Debug)]
 pub struct OverlayFrame {
     pub pixels_per_point: f32,

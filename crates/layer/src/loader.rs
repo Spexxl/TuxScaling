@@ -30,7 +30,7 @@ pub(crate) struct LayerCreateInfo {
 
 #[repr(C)]
 pub struct NegotiateLayerInterface {
-    pub(crate) s_type: vk::StructureType,
+    pub(crate) s_type: u32,
     pub(crate) p_next: *const c_void,
     pub(crate) interface_version: u32,
     pub(crate) get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,

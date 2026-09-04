@@ -10,3 +10,4 @@ ash.workspace = true
 egui.workspace = true
 egui-ash-renderer.workspace = true
 tuxscaling-overlay = { path = "../overlay" }
+tuxscaling-vulkan = { path = "../vulkan" }

@@ -677,6 +677,7 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 name = "tuxscaling-capture"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "tuxscaling-vulkan",
 ]
 
@@ -714,6 +715,7 @@ dependencies = [
  "ash",
  "parking_lot",
  "tracing",
+ "tuxscaling-capture",
  "tuxscaling-overlay-vulkan",
  "tuxscaling-runtime",
  "tuxscaling-vulkan",
@@ -723,6 +725,8 @@ dependencies = [
 name = "tuxscaling-motion"
 version = "0.1.0"
 dependencies = [
+ "ash",
+ "bytemuck",
  "tuxscaling-vulkan",
 ]
 
@@ -741,16 +745,24 @@ dependencies = [
  "egui",
  "egui-ash-renderer",
  "tuxscaling-overlay",
+ "tuxscaling-vulkan",
 ]
 
 [[package]]
 name = "tuxscaling-runtime"
 version = "0.1.0"
 dependencies = [
+ "ash",
+ "bytemuck",
  "tracing",
+ "tuxscaling-capture",
  "tuxscaling-config",
+ "tuxscaling-motion",
  "tuxscaling-overlay",
+ "tuxscaling-overlay-vulkan",
+ "tuxscaling-temporal",
  "tuxscaling-upscaler",
+ "tuxscaling-vulkan",
 ]
 
 [[package]]

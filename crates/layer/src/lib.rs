@@ -1,3 +1,4 @@
+mod handoff;
 mod hooks;
 mod loader;
 mod state;
@@ -38,9 +39,7 @@ unsafe fn negotiate_inner(version: *mut NegotiateLayerInterface) -> vk::Result {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
     let version = unsafe { &mut *version };
-    if version.s_type != vk::StructureType::LOADER_INSTANCE_CREATE_INFO
-        || version.interface_version < LOADER_INTERFACE_VERSION
-    {
+    if version.s_type != 1 || version.interface_version < LOADER_INTERFACE_VERSION {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
     version.interface_version = LOADER_INTERFACE_VERSION;

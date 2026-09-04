@@ -1,9 +1,9 @@
 use ash::vk;
 use std::{
     collections::HashMap,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
-use tuxscaling_overlay_vulkan::OverlaySwapchain;
+use tuxscaling_runtime::{SetLoaderData, SwapchainRuntime as OverlaySwapchain};
 
 pub(crate) struct SwapchainState {
     pub(crate) device: vk::Device,
@@ -14,10 +14,14 @@ pub(crate) struct SwapchainState {
 pub(crate) struct QueueState {
     pub(crate) device: vk::Device,
     pub(crate) family_index: u32,
+    pub(crate) processing_allowed: bool,
 }
 
 #[derive(Clone)]
 pub(crate) struct DeviceState {
+    pub(crate) overlay_supported: bool,
+    pub(crate) queue_families: Vec<vk::QueueFamilyProperties>,
+    pub(crate) set_loader_data: Option<SetLoaderData>,
     pub(crate) get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
     pub(crate) physical_device: vk::PhysicalDevice,
     pub(crate) instance: ash::Instance,
@@ -27,7 +31,8 @@ pub(crate) struct DeviceState {
 static INSTANCES: OnceLock<Mutex<HashMap<vk::Instance, ash::Instance>>> = OnceLock::new();
 static DEVICES: OnceLock<Mutex<HashMap<vk::Device, DeviceState>>> = OnceLock::new();
 static QUEUES: OnceLock<Mutex<HashMap<vk::Queue, QueueState>>> = OnceLock::new();
-static SWAPCHAINS: OnceLock<Mutex<HashMap<vk::SwapchainKHR, SwapchainState>>> = OnceLock::new();
+static SWAPCHAINS: OnceLock<Mutex<HashMap<vk::SwapchainKHR, Arc<Mutex<SwapchainState>>>>> =
+    OnceLock::new();
 
 pub(crate) fn instances() -> &'static Mutex<HashMap<vk::Instance, ash::Instance>> {
     INSTANCES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -41,6 +46,13 @@ pub(crate) fn queues() -> &'static Mutex<HashMap<vk::Queue, QueueState>> {
     QUEUES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(crate) fn swapchains() -> &'static Mutex<HashMap<vk::SwapchainKHR, SwapchainState>> {
+pub(crate) fn swapchains() -> &'static Mutex<HashMap<vk::SwapchainKHR, Arc<Mutex<SwapchainState>>>>
+{
     SWAPCHAINS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+pub(crate) fn instance_dispatch()
+-> &'static Mutex<HashMap<vk::Instance, vk::PFN_vkGetInstanceProcAddr>> {
+    static DISPATCH: OnceLock<Mutex<HashMap<vk::Instance, vk::PFN_vkGetInstanceProcAddr>>> =
+        OnceLock::new();
+    DISPATCH.get_or_init(|| Mutex::new(HashMap::new()))
 }
