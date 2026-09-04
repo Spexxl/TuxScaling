@@ -712,11 +712,9 @@ name = "tuxscaling-layer"
 version = "0.1.0"
 dependencies = [
  "ash",
- "egui",
- "egui-ash-renderer",
  "parking_lot",
  "tracing",
- "tuxscaling-overlay",
+ "tuxscaling-overlay-vulkan",
  "tuxscaling-runtime",
  "tuxscaling-vulkan",
 ]

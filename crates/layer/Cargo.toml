@@ -10,10 +10,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 ash.workspace = true
-egui.workspace = true
-egui-ash-renderer.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
-tuxscaling-overlay = { path = "../overlay" }
+tuxscaling-overlay-vulkan = { path = "../overlay-vulkan" }
 tuxscaling-runtime = { path = "../runtime" }
 tuxscaling-vulkan = { path = "../vulkan" }
