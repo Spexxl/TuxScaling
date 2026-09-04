@@ -45,4 +45,4 @@ Unsupported formats, unavailable backends, allocation failures, swapchain change
 
 ## Current milestone
 
-The current workspace is a pass-through scaffold. It provides typed boundaries, configuration, logging dependencies, the layer manifest, native ABI shell, shader directories, and baseline tests. Capture, optical flow, temporal reconstruction, interactive rendering, and vendor adapters are separate implementation milestones.
+The current workspace has a validated Egui smoke panel injected through `vkQueuePresentKHR` on RADV and `vkcube`. It provides typed boundaries, configuration, the layer manifest, native ABI shell, shader directories, and baseline tests. The present-hook runtime still requires lifecycle and synchronization hardening before capture, optical flow, temporal reconstruction, interactive rendering, and vendor adapters. See [Vulkan Layer Runtime](vulkan-layer-runtime.md) for its maintenance contract.
