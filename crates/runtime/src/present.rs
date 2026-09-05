@@ -2,7 +2,7 @@
 use ash::vk;
 use std::time::Instant;
 use tuxscaling_capture::Capture;
-use tuxscaling_motion::MotionEstimator;
+use tuxscaling_motion::{MotionEstimator, MotionQuality};
 use tuxscaling_overlay::FrameDiagnostics;
 use tuxscaling_overlay_vulkan::{OverlayRenderer, SwapchainInfo};
 use tuxscaling_temporal::History;
@@ -93,6 +93,12 @@ impl SwapchainRuntime {
             None
         };
         if let Some(motion) = &mut motion {
+            motion.set_quality(match config.motion_quality {
+                tuxscaling_config::MotionQuality::Ultra => MotionQuality::Ultra,
+                tuxscaling_config::MotionQuality::High => MotionQuality::High,
+                tuxscaling_config::MotionQuality::Balanced => MotionQuality::Balanced,
+                tuxscaling_config::MotionQuality::Performance => MotionQuality::Performance,
+            });
             motion.cut_thresholds = [
                 config.scene_distance_threshold,
                 config.scene_consistency_threshold,

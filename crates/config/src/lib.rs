@@ -10,8 +10,19 @@ pub struct Config {
     pub quality: String,
     pub toggle_key: String,
     pub debug_view: DebugView,
+    pub motion_quality: MotionQuality,
     pub scene_distance_threshold: f32,
     pub scene_consistency_threshold: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionQuality {
+    Ultra,
+    High,
+    #[default]
+    Balanced,
+    Performance,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -31,6 +42,7 @@ impl Default for Config {
             quality: "balanced".into(),
             toggle_key: "Insert".into(),
             debug_view: DebugView::Original,
+            motion_quality: MotionQuality::Balanced,
             scene_distance_threshold: 0.5,
             scene_consistency_threshold: 0.2,
         }
@@ -62,7 +74,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigError};
+    use super::{Config, ConfigError, MotionQuality};
 
     #[test]
     fn applies_defaults() {
@@ -86,5 +98,16 @@ mod tests {
             Config::parse("debug_view = 'motion'").unwrap().debug_view,
             super::DebugView::Motion
         );
+    }
+
+    #[test]
+    fn parses_motion_quality_presets() {
+        assert_eq!(
+            Config::parse("motion_quality = 'performance'")
+                .unwrap()
+                .motion_quality,
+            MotionQuality::Performance
+        );
+        assert_eq!(Config::default().motion_quality, MotionQuality::Balanced);
     }
 }

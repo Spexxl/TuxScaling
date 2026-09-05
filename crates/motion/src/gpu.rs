@@ -2,6 +2,58 @@
 use ash::vk;
 use tuxscaling_vulkan::{Buffer, Image, image_barrier, memory_barrier};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MotionQuality {
+    #[default]
+    Ultra,
+    High,
+    Balanced,
+    Performance,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MotionProfile {
+    pub levels: usize,
+    pub patch_radius: i32,
+    pub coarse_radius: i32,
+    pub fine_radius: i32,
+}
+
+impl MotionQuality {
+    pub fn profile(self, available_levels: usize) -> MotionProfile {
+        let profile = match self {
+            Self::Ultra => MotionProfile {
+                levels: 4,
+                patch_radius: 3,
+                coarse_radius: 4,
+                fine_radius: 2,
+            },
+            Self::High => MotionProfile {
+                levels: 4,
+                patch_radius: 2,
+                coarse_radius: 4,
+                fine_radius: 2,
+            },
+            Self::Balanced => MotionProfile {
+                levels: 3,
+                patch_radius: 2,
+                coarse_radius: 3,
+                fine_radius: 1,
+            },
+            Self::Performance => MotionProfile {
+                levels: 3,
+                patch_radius: 1,
+                coarse_radius: 2,
+                fine_radius: 1,
+            },
+        };
+        MotionProfile {
+            levels: profile.levels.min(available_levels),
+            ..profile
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Level {
     pub width: u32,
@@ -62,6 +114,7 @@ pub struct MotionEstimator {
     initialized: bool,
     decode_srgb: bool,
     pub cut_thresholds: [f32; 2],
+    quality: MotionQuality,
 }
 impl MotionEstimator {
     pub unsafe fn new(
@@ -115,6 +168,7 @@ impl MotionEstimator {
             initialized: false,
             decode_srgb,
             cut_thresholds: [0.5, 0.2],
+            quality: MotionQuality::Ultra,
         };
         result.sampler = unsafe {
             device.create_sampler(
@@ -287,7 +341,17 @@ impl MotionEstimator {
         }
         Ok(result)
     }
-    fn params(&self, index: usize, parent: usize, valid: bool, mode: u32) -> [u32; 16] {
+    pub fn set_quality(&mut self, quality: MotionQuality) {
+        self.quality = quality;
+    }
+    fn params(
+        &self,
+        index: usize,
+        parent: usize,
+        valid: bool,
+        mode: u32,
+        active_levels: usize,
+    ) -> [u32; 16] {
         let l = self.levels[index];
         let p = self.levels[parent];
         [
@@ -300,13 +364,13 @@ impl MotionEstimator {
             p.offset,
             p.grid_offset,
             index as u32,
-            u32::from(index + 1 == self.levels.len()),
+            u32::from(index + 1 == active_levels),
             u32::from(valid),
             u32::from(self.decode_srgb),
             mode,
             self.cut_thresholds[0].to_bits(),
             self.cut_thresholds[1].to_bits(),
-            0,
+            (self.quality as u32) << 8,
         ]
     }
     unsafe fn dispatch(
@@ -368,19 +432,26 @@ impl MotionEstimator {
                 &[self.sets[write]],
                 &[],
             );
-            for (i, l) in self.levels.iter().enumerate() {
+            let profile = self.quality.profile(self.levels.len());
+            for (i, l) in self.levels.iter().take(profile.levels).enumerate() {
                 self.dispatch(
                     command,
                     usize::from(i != 0),
-                    self.params(i, i.saturating_sub(1), valid, mode),
+                    self.params(i, i.saturating_sub(1), valid, mode, profile.levels),
                     l.width,
                     l.height,
                 );
             }
             for direction in 0..2 {
-                for (i, l) in self.levels.iter().enumerate().rev() {
-                    let mut p = self.params(i, (i + 1).min(self.levels.len() - 1), valid, mode);
-                    p[15] = direction;
+                for (i, l) in self.levels.iter().take(profile.levels).enumerate().rev() {
+                    let mut p = self.params(
+                        i,
+                        (i + 1).min(profile.levels - 1),
+                        valid,
+                        mode,
+                        profile.levels,
+                    );
+                    p[15] = direction | ((self.quality as u32) << 8);
                     self.dispatch(command, 2, p, l.width.div_ceil(2), l.height.div_ceil(2));
                 }
             }
@@ -388,21 +459,21 @@ impl MotionEstimator {
             self.dispatch(
                 command,
                 3,
-                self.params(0, 0, valid, mode),
+                self.params(0, 0, valid, mode, profile.levels),
                 grid.width,
                 grid.height,
             );
             self.dispatch(
                 command,
                 4,
-                self.params(self.levels.len() - 1, 0, valid, mode),
+                self.params(profile.levels - 1, 0, valid, mode, profile.levels),
                 1,
                 1,
             );
             self.dispatch(
                 command,
                 5,
-                self.params(0, 0, valid, mode),
+                self.params(0, 0, valid, mode, profile.levels),
                 grid.width,
                 grid.height,
             );
@@ -410,7 +481,7 @@ impl MotionEstimator {
                 self.dispatch(
                     command,
                     6,
-                    self.params(0, 0, valid, mode),
+                    self.params(0, 0, valid, mode, profile.levels),
                     self.visualization.extent.width,
                     self.visualization.extent.height,
                 );
@@ -437,6 +508,17 @@ impl Drop for MotionEstimator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quality_profiles_trade_precision_for_work() {
+        let ultra = MotionQuality::Ultra.profile(4);
+        let balanced = MotionQuality::Balanced.profile(4);
+        let performance = MotionQuality::Performance.profile(4);
+        assert_eq!(ultra.levels, 4);
+        assert!(balanced.levels < ultra.levels);
+        assert!(performance.patch_radius < balanced.patch_radius);
+        assert!(performance.coarse_radius < ultra.coarse_radius);
+    }
 
     #[test]
     fn skips_visualization_for_the_original_view() {

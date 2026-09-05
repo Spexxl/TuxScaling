@@ -4,12 +4,12 @@
 float source(ivec2 q) {
     q=clamp(q,ivec2(0),ivec2(p.width,p.height)-1);
     uint i=p.offset+uint(q.y)*p.width+uint(q.x);
-    return p.direction==0?current_luma[i]:previous_luma[i];
+    return (p.direction&1)==0?current_luma[i]:previous_luma[i];
 }
 float target_point(ivec2 q) {
     q=clamp(q,ivec2(0),ivec2(p.width,p.height)-1);
     uint i=p.offset+uint(q.y)*p.width+uint(q.x);
-    return p.direction==0?previous_luma[i]:current_luma[i];
+    return (p.direction&1)==0?previous_luma[i]:current_luma[i];
 }
 float target(vec2 q) {
     ivec2 a=ivec2(floor(q)); vec2 f=fract(q);
@@ -20,9 +20,14 @@ float cost(ivec2 center,vec2 delta) {
     vec2 t=vec2(center)+delta;
     if(any(lessThan(t,vec2(0))) || any(greaterThan(t,vec2(p.width-1,p.height-1)))) return 1e10;
     float sum=0;
-    for(int y=-3;y<=3;y++) for(int x=-3;x<=3;x++)
+    int quality = int(p.direction >> 8);
+    int radius = quality == 3 ? 1 : quality == 2 ? 2 : quality == 1 ? 2 : 3;
+    int samples = 0;
+    for(int y=-radius;y<=radius;y++) for(int x=-radius;x<=radius;x++) {
         sum+=abs(source(center+ivec2(x,y))-target(vec2(center+ivec2(x,y))+delta));
-    return sum/49;
+        samples++;
+    }
+    return sum/float(samples);
 }
 void main() {
     uvec2 q=gl_GlobalInvocationID.xy;
@@ -37,14 +42,16 @@ void main() {
         for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++) {
             ivec2 parent=clamp(ivec2(q/2)+ivec2(x,y),ivec2(0),parent_size-1);
             uint pi=p.parent_grid_offset+uint(parent.y)*uint(parent_size.x)+uint(parent.x);
-            vec2 seed=round((p.direction==0?forward_flow[pi].xy:backward_flow[pi].xy)*2);
+            vec2 seed=round(((p.direction&1)==0?forward_flow[pi].xy:backward_flow[pi].xy)*2);
             float c=cost(center,seed);
             if(c<seed_cost) { seed_cost=c;guess=seed; }
         }
     }
     vec2 best=guess;
     float best_cost=cost(center,best), second=1e10;
-    int radius=p.coarsest!=0?4:2;
+    int quality = int(p.direction >> 8);
+    int radius = p.coarsest!=0 ? (quality==3 ? 2 : quality==2 ? 3 : 4) :
+        (quality==3 ? 1 : quality==2 ? 1 : 2);
     for(int y=-radius;y<=radius;y++) for(int x=-radius;x<=radius;x++) {
         vec2 candidate=guess+vec2(x,y);
         if(all(equal(candidate,guess))) continue;
@@ -62,5 +69,5 @@ void main() {
     }
     float ambiguity=clamp((second-best_cost)/max(second,1e-6)*4,0,1);
     vec4 result=vec4(best,best_cost,ambiguity);
-    if(p.direction==0) forward_flow[i]=result; else backward_flow[i]=result;
+    if((p.direction&1)==0) forward_flow[i]=result; else backward_flow[i]=result;
 }
