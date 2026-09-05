@@ -8,6 +8,7 @@
 - CMake 3.20 or newer and a C compiler.
 - Vulkan loader and Vulkan headers.
 - Mesa RADV for the primary validation target.
+- X11/XWayland runtime libraries for interactive overlay input; native Wayland input is not enabled yet.
 
 On Fedora, the system packages normally used for local development are `cmake`, `gcc`, `vulkan-loader`, `vulkan-headers`, `mesa-vulkan-drivers`, and `pkgconf-pkg-config`. The exact package names may vary by Fedora release.
 
@@ -43,6 +44,16 @@ The development manifest is located at `assets/vulkan-layer/tuxscaling.json`. Af
 Use `VK_LOADER_DEBUG=all` to inspect loader and layer discovery. Use `RUST_LOG=info` or `RUST_LOG=debug` for structured runtime diagnostics once the layer logging path is active.
 
 The layer currently supports SDR swapchains with transfer and sampling usage. Unsupported formats, application-managed presentation fences, and unsupported present data use pass-through.
+
+The default profile is equivalent to:
+
+```toml
+motion_quality = "balanced"
+render_scale = 0.67
+debug_view = "original"
+```
+
+The fixed quality targets are Ultra (12 ms), High (8 ms), Balanced (4 ms), and Performance (2.5 ms) for temporal work at 1080p. The overlay reports a warning when measured work exceeds the selected target; it never changes the preset automatically.
 
 ## Language and naming policy
 

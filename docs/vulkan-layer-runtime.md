@@ -4,7 +4,7 @@
 
 The Vulkan layer injects work immediately before presentation while preserving the application's Vulkan device, queues, and swapchains. The layer must fail open: if TuxScaling cannot process a present, the original call is forwarded unchanged.
 
-The validated runtime captures supported SDR swapchains, computes estimated optical flow, and renders the Egui diagnostic panel over `vkcube` on RADV. It remains experimental until frame reconstruction and broader format coverage are added.
+The runtime captures supported swapchains, computes estimated optical flow and frame guidance, runs the reference reconstruction when the format supports storage images, and renders the Egui diagnostic panel over `vkcube` on RADV. Unsupported formats and allocation failures bypass reconstruction while preserving presentation.
 
 ## Ownership
 
@@ -13,7 +13,7 @@ The validated runtime captures supported SDR swapchains, computes estimated opti
 `overlay-vulkan` owns overlay swapchain resources:
 
 - image views and framebuffers;
-- capture and motion resources for supported SDR formats;
+- capture, previous-frame, motion, guidance, and reconstruction resources for supported formats;
 - render pass and Egui renderer;
 - one frame slot per swapchain image;
 - command buffers, fences, and render-complete semaphores;
@@ -27,7 +27,7 @@ For an intercepted present, the layer receives the application's wait semaphores
 
 1. Select the frame slot for that image.
 2. Reuse the slot only after its previous fence is complete.
-3. Record capture, motion, and overlay commands for the selected image.
+3. Record capture, motion, guidance, optional reconstruction, and overlay commands for the selected image in one command buffer.
 4. Submit commands waiting on the application's original semaphores.
 5. Signal the slot's render-complete semaphore and fence.
 6. Forward the present with only the render-complete semaphore as its wait semaphore.
@@ -64,4 +64,4 @@ The runtime milestone is complete only when all checks pass:
 
 ## Scope boundary
 
-This milestone only makes the injection runtime safe and maintainable. Frame capture, optical flow, temporal history, and upscaling remain separate milestones.
+The remaining runtime milestone is broader WSI and format coverage. Vendor-specific backends, native Wayland interaction, and neural depth are intentionally separate milestones.

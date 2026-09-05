@@ -8,8 +8,9 @@ TuxScaling is a Linux-only Vulkan implicit layer for temporal upscaling in games
 Vulkan present
   -> color capture
   -> optical-flow estimation
-  -> synthetic temporal inputs and history
-  -> selected upscaler backend
+  -> guidance validation and estimated masks/exposure/depth
+  -> low-resolution simulation
+  -> reference temporal reconstruction
   -> egui overlay
   -> downstream presentation
 ```
@@ -27,7 +28,7 @@ Inputs are always estimated from captured color frames. TuxScaling does not inte
 - `upscaler`: vendor-neutral backend contract and runtime registry.
 - `overlay`: `egui` state and widgets without graphics dependencies.
 - `overlay-vulkan`: custom `egui` renderer over `ash`.
-- `input`: X11 and Wayland input translation.
+- `input`: X11/XWayland input translation; native Wayland is configuration-only for now.
 - `config`: validated versioned TOML profiles.
 - `cli`: diagnostics and benchmarks outside the injected library.
 
@@ -45,4 +46,4 @@ Unsupported formats, unavailable backends, allocation failures, swapchain change
 
 ## Current milestone
 
-The current workspace captures supported SDR swapchains, computes estimated optical flow and confidence on RADV, tracks temporal history, and injects an egui diagnostic panel. `vkcube` and the WSI harness validate grouped presents, resize, and synchronization. Upscaling reconstruction, estimated depth/exposure/masks, input translation, and vendor adapters remain separate milestones. See [Vulkan Layer Runtime](vulkan-layer-runtime.md) for its maintenance contract.
+The current workspace captures supported swapchains, computes estimated optical flow and guidance on RADV, tracks temporal history, simulates a low-resolution input, runs a reference reconstruction, and injects an egui diagnostic panel with X11/XWayland input. `vkcube` and the WSI harness validate grouped presents, resize, and synchronization. Vendor SDK adapters and production FSR/DLSS/XeSS integrations remain separate milestones. See [Vulkan Layer Runtime](vulkan-layer-runtime.md) for its maintenance contract.
