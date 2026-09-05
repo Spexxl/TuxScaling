@@ -10,4 +10,5 @@ ash.workspace = true
 egui.workspace = true
 egui-ash-renderer.workspace = true
 tuxscaling-overlay = { path = "../overlay" }
+tuxscaling-input = { path = "../input" }
 tuxscaling-vulkan = { path = "../vulkan" }

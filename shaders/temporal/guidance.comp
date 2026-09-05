@@ -1,0 +1,51 @@
+#version 450
+layout(local_size_x=8, local_size_y=8) in;
+layout(binding=0) uniform sampler2D current_frame;
+layout(binding=1) uniform sampler2D previous_frame;
+layout(r8,binding=2) uniform readonly image2D confidence_image;
+layout(r8,binding=3) uniform image2D reactive_image;
+layout(r8,binding=4) uniform image2D disocclusion_image;
+layout(r32f,binding=5) uniform image2D exposure_image;
+layout(r32f,binding=6) uniform image2D depth_image;
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint valid;
+    uint mode;
+} p;
+
+float luminance(vec3 color) {
+    return dot(clamp(color, 0.0, 1.0), vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    uvec2 q = gl_GlobalInvocationID.xy;
+    if (p.mode == 1) {
+        if (q.x != 0 || q.y != 0) return;
+        float sum = 0.0;
+        uint count = 0;
+        for (uint y = 0; y < p.height; y += 4) {
+            for (uint x = 0; x < p.width; x += 4) {
+                sum += log2(max(luminance(texelFetch(current_frame, ivec2(x, y), 0).rgb), 1e-4));
+                count++;
+            }
+        }
+        float average = sum / float(max(count, 1));
+        imageStore(exposure_image, ivec2(0), vec4(exp2(-average)));
+        return;
+    }
+    if (q.x >= p.width || q.y >= p.height) return;
+    ivec2 pixel = ivec2(q);
+    ivec2 confidence_pixel = min(pixel / 4, imageSize(confidence_image) - 1);
+    float confidence = imageLoad(confidence_image, confidence_pixel).r;
+    float disocclusion = 1.0 - confidence;
+    float reactive = 1.0;
+    if (p.valid != 0) {
+        vec3 current = texelFetch(current_frame, pixel, 0).rgb;
+        vec3 previous = texelFetch(previous_frame, pixel, 0).rgb;
+        reactive = clamp(length(current - previous) * 4.0 + disocclusion * 0.35, 0.0, 1.0);
+    }
+    imageStore(reactive_image, pixel, vec4(reactive));
+    imageStore(disocclusion_image, pixel, vec4(disocclusion));
+    imageStore(depth_image, pixel, vec4(1.0));
+}

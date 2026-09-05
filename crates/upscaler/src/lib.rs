@@ -1,6 +1,9 @@
 use ash::vk;
 use thiserror::Error;
 
+mod reference;
+pub use reference::{ReferenceUpscaler, scaled_extent};
+
 pub const CRATE_NAME: &str = "tuxscaling-upscaler";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

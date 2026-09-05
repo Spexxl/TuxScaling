@@ -1,6 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 use ash::vk;
 use egui_ash_renderer::{Options, Renderer};
+use tuxscaling_input::X11Input;
 use tuxscaling_overlay::{FrameDiagnostics, OverlayFrame};
 
 pub const CRATE_NAME: &str = "tuxscaling-overlay-vulkan";
@@ -24,6 +25,8 @@ pub struct OverlayRenderer {
     info: SwapchainInfo,
     render_pass: vk::RenderPass,
     slots: Vec<Slot>,
+    input: Option<X11Input>,
+    visible: bool,
 }
 
 pub fn is_srgb_framebuffer(format: vk::Format) -> bool {
@@ -46,6 +49,10 @@ impl OverlayRenderer {
             info,
             render_pass: vk::RenderPass::null(),
             slots: Vec::new(),
+            input: X11Input::connect()
+                .map_err(|error| eprintln!("TuxScaling input: {error}"))
+                .ok(),
+            visible: true,
         };
         let attachments = [vk::AttachmentDescription::default()
             .format(info.format)
@@ -122,7 +129,7 @@ impl OverlayRenderer {
         queue: vk::Queue,
         pool: vk::CommandPool,
         index: usize,
-        diagnostics: &FrameDiagnostics,
+        diagnostics: &mut FrameDiagnostics,
     ) -> Result<OverlayFrame, vk::Result> {
         let slot = self
             .slots
@@ -136,10 +143,19 @@ impl OverlayRenderer {
             .free_textures(&slot.free)
             .map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?;
         slot.free.clear();
+        let input = self
+            .input
+            .as_mut()
+            .map_or_else(Default::default, |input| input.poll());
+        if input.toggle_overlay {
+            self.visible = !self.visible;
+        }
         let frame = tuxscaling_overlay::render_diagnostics(
             &slot.context,
             [self.info.extent.width, self.info.extent.height],
             diagnostics,
+            &input.events,
+            self.visible,
         );
         if !frame.textures_delta.set.is_empty() {
             renderer

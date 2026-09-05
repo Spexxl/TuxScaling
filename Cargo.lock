@@ -706,6 +706,8 @@ name = "tuxscaling-input"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "libloading",
+ "thiserror",
 ]
 
 [[package]]
@@ -735,6 +737,7 @@ name = "tuxscaling-overlay"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "tuxscaling-config",
 ]
 
 [[package]]
@@ -744,6 +747,7 @@ dependencies = [
  "ash",
  "egui",
  "egui-ash-renderer",
+ "tuxscaling-input",
  "tuxscaling-overlay",
  "tuxscaling-vulkan",
 ]
@@ -770,7 +774,9 @@ name = "tuxscaling-temporal"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "bytemuck",
  "tuxscaling-motion",
+ "tuxscaling-vulkan",
 ]
 
 [[package]]
@@ -778,7 +784,10 @@ name = "tuxscaling-upscaler"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "bytemuck",
  "thiserror",
+ "tuxscaling-temporal",
+ "tuxscaling-vulkan",
 ]
 
 [[package]]

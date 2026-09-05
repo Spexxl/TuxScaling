@@ -84,7 +84,7 @@ pub fn pyramid(width: u32, height: u32) -> Vec<Level> {
 }
 
 fn visualization_needed(mode: u32) -> bool {
-    mode != 0
+    (1..=3).contains(&mode)
 }
 
 pub struct MotionField {
@@ -157,8 +157,8 @@ impl MotionEstimator {
             backward: buffer(vectors as u64 * 16)?,
             metadata: buffer(16)?,
             visualization: image(extent, vk::Format::R8G8B8A8_UNORM)?,
-            vectors: image(grid, vk::Format::R32G32_SFLOAT)?,
-            confidence: image(grid, vk::Format::R32_SFLOAT)?,
+            vectors: image(grid, vk::Format::R16G16_SFLOAT)?,
+            confidence: image(grid, vk::Format::R8_UNORM)?,
             sampler: vk::Sampler::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
@@ -526,6 +526,7 @@ mod tests {
         assert!(visualization_needed(1));
         assert!(visualization_needed(2));
         assert!(visualization_needed(3));
+        assert!(!visualization_needed(4));
     }
 
     #[test]

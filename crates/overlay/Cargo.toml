@@ -7,3 +7,4 @@ rust-version.workspace = true
 
 [dependencies]
 egui.workspace = true
+tuxscaling-config = { path = "../config" }

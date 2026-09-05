@@ -11,6 +11,7 @@ pub struct Config {
     pub toggle_key: String,
     pub debug_view: DebugView,
     pub motion_quality: MotionQuality,
+    pub render_scale: f32,
     pub scene_distance_threshold: f32,
     pub scene_consistency_threshold: f32,
 }
@@ -33,6 +34,10 @@ pub enum DebugView {
     Luminance,
     Motion,
     Confidence,
+    Reconstructed,
+    History,
+    Reactive,
+    Disocclusion,
 }
 
 impl Default for Config {
@@ -43,6 +48,7 @@ impl Default for Config {
             toggle_key: "Insert".into(),
             debug_view: DebugView::Original,
             motion_quality: MotionQuality::Balanced,
+            render_scale: 0.67,
             scene_distance_threshold: 0.5,
             scene_consistency_threshold: 0.2,
         }
@@ -53,14 +59,16 @@ impl Default for Config {
 pub enum ConfigError {
     #[error("configuration file is invalid: {0}")]
     Parse(#[from] toml::de::Error),
-    #[error("scene thresholds must be finite: distance in (0, 2], consistency in [0, 1]")]
+    #[error("render scale must be finite in [0.5, 1.0] and scene thresholds must be valid")]
     InvalidThresholds,
 }
 
 impl Config {
     pub fn parse(source: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(source)?;
-        if !config.scene_distance_threshold.is_finite()
+        if !config.render_scale.is_finite()
+            || !(0.5..=1.0).contains(&config.render_scale)
+            || !config.scene_distance_threshold.is_finite()
             || config.scene_distance_threshold <= 0.0
             || config.scene_distance_threshold > 2.0
             || !config.scene_consistency_threshold.is_finite()
@@ -109,5 +117,11 @@ mod tests {
             MotionQuality::Performance
         );
         assert_eq!(Config::default().motion_quality, MotionQuality::Balanced);
+    }
+
+    #[test]
+    fn validates_render_scale() {
+        assert!(Config::parse("render_scale = 0.75").is_ok());
+        assert!(Config::parse("render_scale = 0.25").is_err());
     }
 }

@@ -59,6 +59,7 @@ pub enum GuidanceReset {
     CaptureInterrupted,
     Presentation,
     LongPause,
+    PresetChanged,
     ProviderFailure,
 }
 
@@ -154,6 +155,7 @@ mod tests {
         };
         assert!(!GuidanceMetadata::zero(1, extent, GuidanceReset::None).requires_history_reset);
         assert!(GuidanceMetadata::zero(1, extent, GuidanceReset::Resize).requires_history_reset);
+        assert!(GuidanceMetadata::zero(1, extent, GuidanceReset::PresetChanged).requires_history_reset);
     }
 
     #[test]

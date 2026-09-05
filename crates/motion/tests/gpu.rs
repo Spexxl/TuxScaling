@@ -166,12 +166,26 @@ unsafe fn pair(
     }
     let mut bytes = vec![0; (count * 12 + 16) as usize];
     unsafe { download.read(&mut bytes) }.unwrap();
-    let f = |offset: usize| f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+    let half = |offset: usize| {
+        let bits = u16::from_ne_bytes(bytes[offset..offset + 2].try_into().unwrap());
+        let sign = f32::from((bits >> 15) & 1);
+        let exponent = ((bits >> 10) & 0x1f) as i32;
+        let fraction = f32::from(bits & 0x3ff);
+        if exponent == 0 {
+            (if sign == 0.0 { 1.0 } else { -1.0 }) * (fraction / 1024.0) * 2f32.powi(-14)
+        } else if exponent == 31 {
+            f32::NAN
+        } else {
+            (if sign == 0.0 { 1.0 } else { -1.0 })
+                * (1.0 + fraction / 1024.0)
+                * 2f32.powi(exponent - 15)
+        }
+    };
     let vectors = (0..count as usize)
-        .map(|i| [f(i * 8), f(i * 8 + 4)])
+        .map(|i| [half(i * 4), half(i * 4 + 2)])
         .collect();
     let confidence = (0..count as usize)
-        .map(|i| f(count as usize * 8 + i * 4))
+        .map(|i| f32::from(bytes[count as usize * 8 + i]) / 255.0)
         .collect();
     let cut = u32::from_ne_bytes(
         bytes[count as usize * 12..count as usize * 12 + 4]

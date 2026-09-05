@@ -24,6 +24,7 @@ pub fn supported_format(format: vk::Format, space: vk::ColorSpaceKHR) -> bool {
 }
 pub struct Capture {
     pub color: Image,
+    pub previous: Image,
     initialized: bool,
 }
 impl Capture {
@@ -33,18 +34,12 @@ impl Capture {
         extent: vk::Extent2D,
         format: vk::Format,
     ) -> Result<Self, vk::Result> {
+        let usage = vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::SAMPLED;
         Ok(Self {
-            color: unsafe {
-                Image::new(
-                    device,
-                    memory,
-                    extent,
-                    format,
-                    vk::ImageUsageFlags::TRANSFER_SRC
-                        | vk::ImageUsageFlags::TRANSFER_DST
-                        | vk::ImageUsageFlags::SAMPLED,
-                )
-            }?,
+            color: unsafe { Image::new(device, memory, extent, format, usage) }?,
+            previous: unsafe { Image::new(device, memory, extent, format, usage) }?,
             initialized: false,
         })
     }
@@ -67,6 +62,54 @@ impl Capture {
         layout: vk::ImageLayout,
     ) {
         unsafe {
+            if self.initialized {
+                image_barrier(
+                    device,
+                    command,
+                    self.color.handle,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                );
+                image_barrier(
+                    device,
+                    command,
+                    self.previous.handle,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                );
+                let layers = vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1);
+                device.cmd_copy_image(
+                    command,
+                    self.color.handle,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    self.previous.handle,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::ImageCopy::default()
+                        .src_subresource(layers)
+                        .dst_subresource(layers)
+                        .extent(vk::Extent3D {
+                            width: self.color.extent.width,
+                            height: self.color.extent.height,
+                            depth: 1,
+                        })],
+                );
+                image_barrier(
+                    device,
+                    command,
+                    self.color.handle,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                );
+                image_barrier(
+                    device,
+                    command,
+                    self.previous.handle,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                );
+            }
             image_barrier(
                 device,
                 command,
