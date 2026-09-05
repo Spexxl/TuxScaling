@@ -6,4 +6,5 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ash.workspace = true
 tuxscaling-motion = { path = "../motion" }
