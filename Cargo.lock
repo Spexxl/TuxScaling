@@ -769,6 +769,7 @@ dependencies = [
 name = "tuxscaling-temporal"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "tuxscaling-motion",
 ]
 
