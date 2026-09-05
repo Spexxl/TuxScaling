@@ -121,8 +121,18 @@ pub struct GuidanceView {
 }
 
 impl GuidanceView {
+    pub fn has_expected_formats(self) -> bool {
+        self.motion.format == vk::Format::R16G16_SFLOAT
+            && self.confidence.format == vk::Format::R8_UNORM
+            && self.disocclusion.format == vk::Format::R8_UNORM
+            && self.reactive.format == vk::Format::R8_UNORM
+            && self.exposure.format == vk::Format::R32_SFLOAT
+            && self.depth.format == vk::Format::R32_SFLOAT
+    }
+
     pub fn is_valid_for(self, frame_id: u64, extent: FrameExtent) -> bool {
-        self.motion.is_valid_for(frame_id, extent)
+        self.has_expected_formats()
+            && self.motion.is_valid_for(frame_id, extent)
             && self.confidence.is_valid_for(frame_id, extent)
             && self.disocclusion.is_valid_for(frame_id, extent)
             && self.reactive.is_valid_for(frame_id, extent)
@@ -138,11 +148,11 @@ mod tests {
     use super::*;
     use ash::vk::Handle;
 
-    fn resource(metadata: GuidanceMetadata) -> GuidanceResource {
+    fn resource(metadata: GuidanceMetadata, format: vk::Format) -> GuidanceResource {
         GuidanceResource {
             image: vk::Image::from_raw(1),
             view: vk::ImageView::from_raw(2),
-            format: vk::Format::R8_UNORM,
+            format,
             metadata,
         }
     }
@@ -168,17 +178,22 @@ mod tests {
         };
         let metadata = GuidanceMetadata::zero(7, extent, GuidanceReset::None);
         let view = GuidanceView {
-            motion: resource(metadata),
-            confidence: resource(metadata),
-            disocclusion: resource(metadata),
-            reactive: resource(metadata),
-            exposure: resource(metadata),
-            depth: resource(metadata),
+            motion: resource(metadata, vk::Format::R16G16_SFLOAT),
+            confidence: resource(metadata, vk::Format::R8_UNORM),
+            disocclusion: resource(metadata, vk::Format::R8_UNORM),
+            reactive: resource(metadata, vk::Format::R8_UNORM),
+            exposure: resource(metadata, vk::Format::R32_SFLOAT),
+            depth: resource(metadata, vk::Format::R32_SFLOAT),
             direction: MotionDirection::CurrentToPrevious,
             units: MotionUnits::SourcePixels,
             requires_history_reset: false,
         };
         assert!(view.is_valid_for(7, extent));
+        assert!(view.has_expected_formats());
         assert!(!view.is_valid_for(8, extent));
+
+        let mut wrong = view;
+        wrong.motion.format = vk::Format::R32G32_SFLOAT;
+        assert!(!wrong.is_valid_for(7, extent));
     }
 }

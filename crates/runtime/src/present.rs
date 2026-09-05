@@ -5,7 +5,7 @@ use tuxscaling_capture::Capture;
 use tuxscaling_motion::{MotionEstimator, MotionQuality};
 use tuxscaling_overlay::FrameDiagnostics;
 use tuxscaling_overlay_vulkan::{OverlayRenderer, SwapchainInfo};
-use tuxscaling_temporal::{GuidanceEstimator, GuidanceReset, History};
+use tuxscaling_temporal::{FrameExtent, GuidanceEstimator, GuidanceReset, History};
 use tuxscaling_upscaler::ReferenceUpscaler;
 use tuxscaling_vulkan::{image_barrier, memory_barrier};
 
@@ -432,6 +432,18 @@ impl SwapchainRuntime {
             )),
             _ => None,
         };
+        let guidance_view = guidance_view.and_then(|view| {
+            let frame_extent = FrameExtent {
+                width: self.info.extent.width,
+                height: self.info.extent.height,
+            };
+            if view.is_valid_for(self.history.frame_id + 1, frame_extent) {
+                Some(view)
+            } else {
+                eprintln!("TuxScaling: invalid guidance metadata; reconstruction bypassed");
+                None
+            }
+        });
         let frame = self.overlay.as_mut().unwrap().prepare(
             queue,
             self.pool,
