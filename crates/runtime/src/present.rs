@@ -176,7 +176,9 @@ impl SwapchainRuntime {
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE
                 | vk::FormatFeatureFlags::BLIT_SRC
                 | vk::FormatFeatureFlags::BLIT_DST;
-            if features.contains(required) && device_features.shader_storage_image_write_without_format != 0 {
+            if features.contains(required)
+                && device_features.shader_storage_image_write_without_format != 0
+            {
                 let view = guidance.view(motion, 0, info.extent, false, GuidanceReset::Initialize);
                 match unsafe {
                     ReferenceUpscaler::new(
