@@ -39,7 +39,7 @@ unsafe fn pair(
     height: u32,
     previous: &[u8],
     current: &[u8],
-) -> (Vec<[f32; 2]>, Vec<f32>, u32) {
+) -> (Vec<[f32; 2]>, Vec<f32>, u32, f32) {
     let gpu = unsafe { Gpu::new() };
     let d = &gpu.device;
     let extent = vk::Extent2D { width, height };
@@ -70,7 +70,7 @@ unsafe fn pair(
         Buffer::new(
             d,
             &gpu.memory,
-            count as u64 * 12 + 16,
+            count as u64 * 12 + 32,
             vk::BufferUsageFlags::TRANSFER_DST,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )
@@ -158,13 +158,13 @@ unsafe fn pair(
                 &[vk::BufferCopy {
                     src_offset: 0,
                     dst_offset: count as u64 * 12,
-                    size: 16,
+                    size: 32,
                 }],
             );
             memory_barrier(d, command);
         });
     }
-    let mut bytes = vec![0; (count * 12 + 16) as usize];
+    let mut bytes = vec![0; (count * 12 + 32) as usize];
     unsafe { download.read(&mut bytes) }.unwrap();
     let half = |offset: usize| {
         let bits = u16::from_ne_bytes(bytes[offset..offset + 2].try_into().unwrap());
@@ -192,7 +192,12 @@ unsafe fn pair(
             .try_into()
             .unwrap(),
     );
-    (vectors, confidence, cut)
+    let exposure = f32::from_ne_bytes(
+        bytes[count as usize * 12 + 16..count as usize * 12 + 20]
+            .try_into()
+            .unwrap(),
+    );
+    (vectors, confidence, cut, exposure)
 }
 #[test]
 #[ignore = "requires a Vulkan GPU"]
@@ -205,7 +210,7 @@ fn known_motion_and_scene_cut() {
     ] {
         let previous = pattern(width, height, 0, 0);
         let current = pattern(width, height, dx, dy);
-        let (vectors, _, cut) = unsafe { pair(width, height, &previous, &current) };
+        let (vectors, _, cut, _) = unsafe { pair(width, height, &previous, &current) };
         let gw = width.div_ceil(4);
         let gh = height.div_ceil(4);
         let mut sum = 0.0;
@@ -227,9 +232,52 @@ fn known_motion_and_scene_cut() {
     }
     let black = vec![0; 128 * 96 * 4];
     let white = vec![255; 128 * 96 * 4];
-    let (_, confidence, cut) = unsafe { pair(128, 96, &black, &white) };
+    let (_, confidence, cut, exposure) = unsafe { pair(128, 96, &black, &white) };
     assert_eq!(cut, 1);
     assert!(confidence.iter().all(|c| c.is_finite() && *c <= 0.01));
+    assert!(exposure.is_finite() && exposure > 0.0);
+}
+
+fn expected_exposure(pixels: &[u8], width: u32, height: u32) -> f32 {
+    let (pixels, _) = pixels.as_chunks::<4>();
+    let sum = pixels
+        .iter()
+        .map(|pixel| {
+            let luma = (f32::from(pixel[0]) * 0.2126
+                + f32::from(pixel[1]) * 0.7152
+                + f32::from(pixel[2]) * 0.0722)
+                / 255.0;
+            luma.max(1e-4).log2()
+        })
+        .sum::<f32>();
+    2.0_f32.powf(-sum / (width * height) as f32)
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn parallel_exposure_is_finite_and_accurate_for_uniform_and_gradient_frames() {
+    let width = 128;
+    let height = 96;
+    let uniform = vec![128; (width * height * 4) as usize];
+    let (_, _, cut, exposure) = unsafe { pair(width, height, &uniform, &uniform) };
+    let expected = expected_exposure(&uniform, width, height);
+    assert_eq!(cut, 0);
+    assert!(exposure.is_finite() && exposure > 0.0);
+    assert!((exposure.log2() - expected.log2()).abs() <= 0.15);
+
+    let gradient = (0..height)
+        .flat_map(|y| {
+            (0..width).flat_map(move |x| {
+                let value = ((x + y) * 255 / (width + height - 2)) as u8;
+                [value, value, value, 255]
+            })
+        })
+        .collect::<Vec<_>>();
+    let (_, _, cut, exposure) = unsafe { pair(width, height, &gradient, &gradient) };
+    let expected = expected_exposure(&gradient, width, height);
+    assert_eq!(cut, 0);
+    assert!(exposure.is_finite() && exposure > 0.0);
+    assert!((exposure.log2() - expected.log2()).abs() <= 0.15);
 }
 
 #[test]
@@ -243,7 +291,7 @@ fn occlusion_reduces_confidence() {
             current[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
         }
     }
-    let (_, confidence, _) = unsafe { pair(128, 96, &previous, &current) };
+    let (_, confidence, _, _) = unsafe { pair(128, 96, &previous, &current) };
     let mut inside = Vec::new();
     let mut outside = Vec::new();
     for y in 4..20 {

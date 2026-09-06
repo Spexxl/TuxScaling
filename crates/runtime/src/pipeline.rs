@@ -3,7 +3,7 @@ use ash::vk;
 use std::time::{Duration, Instant};
 use tuxscaling_config::Config;
 use tuxscaling_motion::{MotionEstimator, MotionQuality};
-use tuxscaling_temporal::{GuidanceEstimator, GuidanceReset, History};
+use tuxscaling_temporal::{FrameTiming, GuidanceEstimator, GuidanceReset, History};
 use tuxscaling_upscaler::{ReferenceUpscaler, ResolutionPlan};
 
 pub struct TemporalPipelineDescriptor<'a> {
@@ -17,6 +17,73 @@ pub struct TemporalPipelineDescriptor<'a> {
     pub image_count: usize,
 }
 
+/// Host-side frame clock validation shared by presentation and guidance.
+///
+/// The input is an elapsed monotonic timestamp, rather than wall-clock time,
+/// so the state is deterministic and straightforward to exercise without a
+/// Vulkan device.  Invalid deltas keep the last validated sample while a long
+/// pause additionally requests a history reset.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameTimingState {
+    last_timestamp: Option<Duration>,
+    last_valid: Duration,
+    smoothed: Duration,
+}
+
+impl Default for FrameTimingState {
+    fn default() -> Self {
+        let nominal = Duration::from_micros(16_667);
+        Self {
+            last_timestamp: None,
+            last_valid: nominal,
+            smoothed: nominal,
+        }
+    }
+}
+
+impl FrameTimingState {
+    pub const NOMINAL: Duration = Duration::from_micros(16_667);
+    pub const MIN_VALID: Duration = Duration::from_micros(250);
+    pub const MAX_VALID: Duration = Duration::from_millis(250);
+
+    /// Consume a monotonic timestamp and return validated timing plus a reset,
+    /// if the timestamp indicates a pause beyond the supported history gap.
+    pub fn sample(
+        &mut self,
+        timestamp: Duration,
+    ) -> (tuxscaling_temporal::FrameTiming, Option<GuidanceReset>) {
+        let raw = self
+            .last_timestamp
+            .map_or(Self::NOMINAL, |last| timestamp.saturating_sub(last));
+        self.last_timestamp = Some(timestamp);
+        let reset = (raw > Self::MAX_VALID).then_some(GuidanceReset::LongPause);
+        let validated = if (Self::MIN_VALID..=Self::MAX_VALID).contains(&raw) {
+            self.last_valid = raw;
+            raw
+        } else {
+            self.last_valid
+        };
+        self.smoothed = ema(self.smoothed, validated);
+        (
+            tuxscaling_temporal::FrameTiming {
+                raw,
+                validated,
+                smoothed: self.smoothed,
+            },
+            reset,
+        )
+    }
+}
+
+/// Stable alias for callers that prefer the shorter state name.
+pub type TimingState = FrameTimingState;
+
+fn ema(previous: Duration, sample: Duration) -> Duration {
+    let previous = previous.as_nanos();
+    let sample = sample.as_nanos();
+    Duration::from_nanos((((previous * 9) + sample) / 10) as u64)
+}
+
 pub struct TemporalPipeline {
     pub(crate) resolution: ResolutionPlan,
     pub(crate) capture: Option<Capture>,
@@ -25,8 +92,9 @@ pub struct TemporalPipeline {
     pub(crate) upscaler: Option<ReferenceUpscaler>,
     pub(crate) history: History,
     pub(crate) start: Instant,
-    pub(crate) last_time: Option<Duration>,
     pub(crate) pending_time: Duration,
+    pub(crate) timing: FrameTimingState,
+    pub(crate) pending_timing: FrameTiming,
     pub(crate) reset_reason: GuidanceReset,
     pub(crate) pending_quality: Option<MotionQuality>,
     pub(crate) pending_processing_scale: Option<f32>,
@@ -90,6 +158,7 @@ impl TemporalPipeline {
                     capture.color.view,
                     capture.previous.view,
                     motion.confidence.view,
+                    motion.metadata.handle,
                 )
             } {
                 Ok(value) => Some(value),
@@ -119,6 +188,7 @@ impl TemporalPipeline {
                     0,
                     resolution.processing_extent,
                     false,
+                    FrameTiming::default(),
                     GuidanceReset::Initialize,
                 );
                 match unsafe {
@@ -158,8 +228,9 @@ impl TemporalPipeline {
             upscaler,
             history: History::default(),
             start: Instant::now(),
-            last_time: None,
             pending_time: Duration::ZERO,
+            timing: FrameTimingState::default(),
+            pending_timing: FrameTiming::default(),
             reset_reason: GuidanceReset::Initialize,
             pending_quality: None,
             pending_processing_scale: None,
@@ -195,8 +266,9 @@ impl TemporalPipeline {
             upscaler: None,
             history: History::default(),
             start: Instant::now(),
-            last_time: None,
             pending_time: Duration::ZERO,
+            timing: FrameTimingState::default(),
+            pending_timing: FrameTiming::default(),
             reset_reason: GuidanceReset::Initialize,
             pending_quality: None,
             pending_processing_scale: None,
@@ -215,5 +287,78 @@ fn motion_quality(quality: tuxscaling_config::MotionQuality) -> MotionQuality {
         tuxscaling_config::MotionQuality::High => MotionQuality::High,
         tuxscaling_config::MotionQuality::Balanced => MotionQuality::Balanced,
         tuxscaling_config::MotionQuality::Performance => MotionQuality::Performance,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameTimingState;
+    use std::time::Duration;
+    use tuxscaling_temporal::{FrameTiming, GuidanceReset};
+
+    #[test]
+    fn timing_uses_nominal_first_sample() {
+        let mut state = FrameTimingState::default();
+
+        let (timing, reset) = state.sample(Duration::from_millis(10));
+
+        assert_eq!(timing, FrameTiming::default());
+        assert_eq!(reset, None);
+    }
+
+    #[test]
+    fn timing_accepts_normal_sample_and_applies_ema() {
+        let mut state = FrameTimingState::default();
+        state.sample(Duration::from_millis(10));
+
+        let (timing, reset) = state.sample(Duration::from_micros(30_000));
+
+        assert_eq!(timing.raw, Duration::from_micros(20_000));
+        assert_eq!(timing.validated, Duration::from_micros(20_000));
+        assert_eq!(reset, None);
+        assert!(timing.smoothed > Duration::from_micros(16_667));
+        assert!(timing.smoothed < Duration::from_micros(20_000));
+    }
+
+    #[test]
+    fn timing_reuses_last_valid_delta_for_invalid_sample() {
+        let mut state = FrameTimingState::default();
+        state.sample(Duration::from_millis(10));
+        state.sample(Duration::from_micros(30_000));
+
+        let (timing, reset) = state.sample(Duration::from_micros(30_100));
+
+        assert_eq!(timing.raw, Duration::from_micros(100));
+        assert_eq!(timing.validated, Duration::from_micros(20_000));
+        assert_eq!(reset, None);
+    }
+
+    #[test]
+    fn timing_reports_long_pause_and_reuses_last_valid_delta() {
+        let mut state = FrameTimingState::default();
+        state.sample(Duration::from_millis(10));
+        state.sample(Duration::from_micros(30_000));
+
+        let (timing, reset) = state.sample(Duration::from_micros(330_000));
+
+        assert_eq!(timing.raw, Duration::from_micros(300_000));
+        assert_eq!(timing.validated, Duration::from_micros(20_000));
+        assert_eq!(reset, Some(GuidanceReset::LongPause));
+    }
+
+    #[test]
+    fn timing_accepts_both_validity_boundaries() {
+        let mut state = FrameTimingState::default();
+        state.sample(Duration::ZERO);
+
+        let (minimum, minimum_reset) = state.sample(Duration::from_micros(250));
+        assert_eq!(minimum.raw, Duration::from_micros(250));
+        assert_eq!(minimum.validated, Duration::from_micros(250));
+        assert_eq!(minimum_reset, None);
+
+        let (maximum, maximum_reset) = state.sample(Duration::from_millis(250) + minimum.raw);
+        assert_eq!(maximum.raw, Duration::from_millis(250));
+        assert_eq!(maximum.validated, Duration::from_millis(250));
+        assert_eq!(maximum_reset, None);
     }
 }

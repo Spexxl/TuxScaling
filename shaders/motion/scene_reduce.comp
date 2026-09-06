@@ -1,0 +1,70 @@
+#version 450
+layout(local_size_x=32, local_size_y=1, local_size_z=1) in;
+layout(std430,binding=5) buffer Metadata {
+    uint scene_cut;
+    uint consistent;
+    float distance_l1;
+    uint reserved;
+    float exposure;
+} metadata;
+layout(std430,binding=9) buffer Statistics { uint partials[]; };
+layout(push_constant) uniform Params {
+    uint width; uint height; uint offset; uint grid_offset;
+    uint parent_width; uint parent_height; uint parent_offset; uint parent_grid_offset;
+    uint level; uint coarsest; uint valid; uint decode_srgb;
+    uint mode; float scene_distance_threshold; float scene_consistency_threshold; uint direction;
+} p;
+shared uint current_total[32];
+shared uint previous_total[32];
+shared uint total_good;
+shared uint total_samples;
+shared float total_current_log;
+
+void main() {
+    uint bin = gl_LocalInvocationIndex;
+    uint partial_count = p.width * p.height;
+    uint current = 0;
+    uint previous = 0;
+    for (uint i = 0; i < partial_count; ++i) {
+        uint base = i * 68u;
+        current += partials[base + bin];
+        previous += partials[base + 32u + bin];
+    }
+    current_total[bin] = current;
+    previous_total[bin] = previous;
+    if (bin == 0) {
+        uint good = 0;
+        uint samples = 0;
+        float current_log = 0.0;
+        for (uint i = 0; i < partial_count; ++i) {
+            uint base = i * 68u;
+            good += partials[base + 64u];
+            samples += partials[base + 65u];
+            current_log += uintBitsToFloat(partials[base + 66u]);
+        }
+        total_good = good;
+        total_samples = samples;
+        total_current_log = current_log;
+    }
+    barrier();
+
+    if (bin == 0) {
+        uint current_count = 0;
+        uint previous_count = 0;
+        float distance = 0.0;
+        for (uint i = 0; i < 32; ++i) {
+            current_count += current_total[i];
+            previous_count += previous_total[i];
+            distance += abs(float(current_total[i]) - float(previous_total[i]));
+        }
+        float count = float(max(current_count, 1u));
+        float average_log = total_current_log / count;
+        metadata.distance_l1 = distance / count;
+        metadata.consistent = total_good;
+        metadata.reserved = 0u;
+        metadata.exposure = p.valid != 0 ? exp2(-average_log) : 1.0;
+        metadata.scene_cut = (p.valid == 0 ||
+            (metadata.distance_l1 > p.scene_distance_threshold &&
+             float(total_good) / float(max(total_samples, 1u)) < p.scene_consistency_threshold)) ? 1u : 0u;
+    }
+}

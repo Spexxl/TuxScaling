@@ -1,24 +1,70 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
+
+// Each workgroup scans a small tile of the existing level-0 luminance
+// pyramid. Only compact partial records leave shared memory.
+shared uint current_bins[32];
+shared uint previous_bins[32];
+shared uint good_count;
+shared uint sample_count;
+shared float current_logs[64];
+shared float previous_logs[64];
+
+uint log_bin(float value) {
+    return uint(clamp((log2(max(value, 1e-4)) + 12.0) * (32.0 / 16.0), 0.0, 31.0));
+}
+
 void main() {
-    if(any(notEqual(gl_GlobalInvocationID,uvec3(0)))) return;
-    float a[32],b[32];
-    for(int i=0;i<32;i++) { a[i]=0;b[i]=0; }
-    uint count=p.width*p.height;
-    for(uint i=0;i<count;i++) {
-        a[min(uint(clamp(current_luma[p.offset+i],0,1)*31),31)]+=1;
-        b[min(uint(clamp(previous_luma[p.offset+i],0,1)*31),31)]+=1;
+    uint local = gl_LocalInvocationIndex;
+    for (uint bin = local; bin < 32; bin += 64) {
+        current_bins[bin] = 0;
+        previous_bins[bin] = 0;
     }
-    float distance=0;
-    for(int i=0;i<32;i++) distance+=abs(a[i]-b[i])/float(count);
-    ivec2 size=imageSize(confidence_image);
-    uint good=0, samples=0;
-    for(int y=0;y<size.y;y+=4) for(int x=0;x<size.x;x+=4) {
-        if(imageLoad(confidence_image,ivec2(x,y)).r>0.2) good++;
-        samples++;
+    if (local == 0) {
+        good_count = 0;
+        sample_count = 0;
     }
-    consistent=good;
-    distance_l1=distance;
-    scene_cut=(p.valid==0 || (distance>p.scene_distance_threshold && float(good)/float(max(samples,1))<p.scene_consistency_threshold))?1:0;
+    current_logs[local] = 0.0;
+    previous_logs[local] = 0.0;
+    barrier();
+
+    uvec2 q = gl_GlobalInvocationID.xy;
+    if (q.x < p.width && q.y < p.height) {
+        uint source = p.offset + q.y * p.width + q.x;
+        float current = clamp(current_luma[source], 0.0, 1.0);
+        float previous = clamp(previous_luma[source], 0.0, 1.0);
+        float current_log = log2(max(current, 1e-4));
+        float previous_log = log2(max(previous, 1e-4));
+        current_logs[local] = current_log;
+        previous_logs[local] = previous_log;
+        atomicAdd(current_bins[log_bin(current)], 1);
+        atomicAdd(previous_bins[log_bin(previous)], 1);
+        ivec2 confidence_size = imageSize(confidence_image);
+        ivec2 confidence_coord = min(ivec2(q / 2u), confidence_size - 1);
+        if (imageLoad(confidence_image, confidence_coord).r > 0.2) {
+            atomicAdd(good_count, 1);
+        }
+        atomicAdd(sample_count, 1);
+    }
+    barrier();
+
+    if (local == 0) {
+        uint partial = gl_WorkGroupID.y * p.parent_width + gl_WorkGroupID.x;
+        uint base = partial * 68u;
+        for (uint bin = 0; bin < 32; ++bin) {
+            partials[base + bin] = current_bins[bin];
+            partials[base + 32u + bin] = previous_bins[bin];
+        }
+        float current_sum = 0.0;
+        float previous_sum = 0.0;
+        for (uint i = 0; i < 64; ++i) {
+            current_sum += current_logs[i];
+            previous_sum += previous_logs[i];
+        }
+        partials[base + 64u] = good_count;
+        partials[base + 65u] = sample_count;
+        partials[base + 66u] = floatBitsToUint(current_sum);
+        partials[base + 67u] = floatBitsToUint(previous_sum);
+    }
 }

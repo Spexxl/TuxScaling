@@ -95,6 +95,9 @@ pub struct MotionField {
     pub previous_id: u64,
     pub current_id: u64,
 }
+
+const STATS_WORDS: u64 = 68;
+
 pub struct MotionEstimator {
     device: ash::Device,
     pub levels: Vec<Level>,
@@ -102,6 +105,7 @@ pub struct MotionEstimator {
     pub forward: Buffer,
     pub backward: Buffer,
     pub metadata: Buffer,
+    pub stats: Buffer,
     pub visualization: Image,
     pub vectors: Image,
     pub confidence: Image,
@@ -115,6 +119,7 @@ pub struct MotionEstimator {
     decode_srgb: bool,
     pub cut_thresholds: [f32; 2],
     quality: MotionQuality,
+    stats_grid: vk::Extent2D,
 }
 impl MotionEstimator {
     pub unsafe fn new(
@@ -128,6 +133,11 @@ impl MotionEstimator {
         let last = levels.last().unwrap();
         let floats = last.offset + last.width * last.height;
         let vectors = last.grid_offset + last.width.div_ceil(2) * last.height.div_ceil(2);
+        let stats_grid = vk::Extent2D {
+            width: levels[0].width.div_ceil(8),
+            height: levels[0].height.div_ceil(8),
+        };
+        let stats_size = stats_grid.width as u64 * stats_grid.height as u64 * STATS_WORDS * 4;
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST;
@@ -155,7 +165,8 @@ impl MotionEstimator {
             luma: vec![buffer(floats as u64 * 4)?, buffer(floats as u64 * 4)?],
             forward: buffer(vectors as u64 * 16)?,
             backward: buffer(vectors as u64 * 16)?,
-            metadata: buffer(16)?,
+            metadata: buffer(32)?,
+            stats: buffer(stats_size)?,
             visualization: image(extent, vk::Format::R8G8B8A8_UNORM)?,
             vectors: image(grid, vk::Format::R16G16_SFLOAT)?,
             confidence: image(grid, vk::Format::R8_UNORM)?,
@@ -169,6 +180,7 @@ impl MotionEstimator {
             decode_srgb,
             cut_thresholds: [0.5, 0.2],
             quality: MotionQuality::Ultra,
+            stats_grid,
         };
         result.sampler = unsafe {
             device.create_sampler(
@@ -180,14 +192,15 @@ impl MotionEstimator {
                 None,
             )
         }?;
-        let bindings = (0..9)
+        let bindings = (0..=9)
             .map(|binding| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(binding)
                     .descriptor_type(match binding {
                         0 => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                        1..=5 => vk::DescriptorType::STORAGE_BUFFER,
-                        _ => vk::DescriptorType::STORAGE_IMAGE,
+                        1..=5 | 9 => vk::DescriptorType::STORAGE_BUFFER,
+                        6..=8 => vk::DescriptorType::STORAGE_IMAGE,
+                        _ => unreachable!(),
                     })
                     .descriptor_count(1)
                     .stage_flags(vk::ShaderStageFlags::COMPUTE)
@@ -206,7 +219,7 @@ impl MotionEstimator {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 10,
+                descriptor_count: 12,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
@@ -283,6 +296,19 @@ impl MotionEstimator {
                     );
                 }
             }
+            let data = [vk::DescriptorBufferInfo::default()
+                .buffer(result.stats.handle)
+                .range(result.stats.size)];
+            unsafe {
+                device.update_descriptor_sets(
+                    &[vk::WriteDescriptorSet::default()
+                        .dst_set(*set)
+                        .dst_binding(9)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&data)],
+                    &[],
+                );
+            }
         }
         result.layout = unsafe {
             device.create_pipeline_layout(
@@ -302,6 +328,7 @@ impl MotionEstimator {
             include_bytes!(concat!(env!("OUT_DIR"), "/flow.spv")).as_slice(),
             include_bytes!(concat!(env!("OUT_DIR"), "/confidence.spv")).as_slice(),
             include_bytes!(concat!(env!("OUT_DIR"), "/scene.spv")).as_slice(),
+            include_bytes!(concat!(env!("OUT_DIR"), "/scene_reduce.spv")).as_slice(),
             include_bytes!(concat!(env!("OUT_DIR"), "/invalidate.spv")).as_slice(),
             include_bytes!(concat!(env!("OUT_DIR"), "/visualize.spv")).as_slice(),
         ] {
@@ -528,13 +555,14 @@ impl MotionEstimator {
                     query_base + 5,
                 );
             }
-            self.dispatch(
-                command,
-                4,
-                self.params(profile.levels - 1, 0, valid, mode, profile.levels),
-                1,
-                1,
-            );
+            // Statistics are collected from the level-0 luminance pyramid in
+            // one workgroup per tile, then reduced over the compact partial
+            // buffer.  This replaces the old invocation-0 full-frame loops.
+            let level = self.levels[0];
+            let mut stats_params = self.params(0, 0, valid, mode, profile.levels);
+            stats_params[4] = self.stats_grid.width;
+            stats_params[5] = self.stats_grid.height;
+            self.dispatch(command, 4, stats_params, level.width, level.height);
             if let Some((query_pool, query_base)) = timestamps {
                 self.device.cmd_write_timestamp(
                     command,
@@ -543,13 +571,10 @@ impl MotionEstimator {
                     query_base + 6,
                 );
             }
-            self.dispatch(
-                command,
-                5,
-                self.params(0, 0, valid, mode, profile.levels),
-                grid.width,
-                grid.height,
-            );
+            let mut reduce_params = self.params(0, 0, valid, mode, profile.levels);
+            reduce_params[0] = self.stats_grid.width;
+            reduce_params[1] = self.stats_grid.height;
+            self.dispatch(command, 5, reduce_params, 8, 8);
             if let Some((query_pool, query_base)) = timestamps {
                 self.device.cmd_write_timestamp(
                     command,
@@ -558,10 +583,17 @@ impl MotionEstimator {
                     query_base + 7,
                 );
             }
+            self.dispatch(
+                command,
+                6,
+                self.params(0, 0, valid, mode, profile.levels),
+                grid.width,
+                grid.height,
+            );
             if visualization_needed(mode) {
                 self.dispatch(
                     command,
-                    6,
+                    7,
                     self.params(0, 0, valid, mode, profile.levels),
                     self.visualization.extent.width,
                     self.visualization.extent.height,

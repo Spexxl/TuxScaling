@@ -33,6 +33,7 @@ impl GuidanceEstimator {
         current_view: vk::ImageView,
         previous_view: vk::ImageView,
         confidence_view: vk::ImageView,
+        statistics_buffer: vk::Buffer,
     ) -> Result<Self, vk::Result> {
         let storage = vk::ImageUsageFlags::STORAGE
             | vk::ImageUsageFlags::SAMPLED
@@ -79,12 +80,14 @@ impl GuidanceEstimator {
                 None,
             )
         }?;
-        let bindings = (0..7)
+        let bindings = (0..8)
             .map(|binding| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(binding)
                     .descriptor_type(if binding < 2 {
                         vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                    } else if binding == 7 {
+                        vk::DescriptorType::STORAGE_BUFFER
                     } else {
                         vk::DescriptorType::STORAGE_IMAGE
                     })
@@ -110,6 +113,10 @@ impl GuidanceEstimator {
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_IMAGE,
                             descriptor_count: 5,
+                        },
+                        vk::DescriptorPoolSize {
+                            ty: vk::DescriptorType::STORAGE_BUFFER,
+                            descriptor_count: 1,
                         },
                     ]),
                 None,
@@ -169,6 +176,20 @@ impl GuidanceEstimator {
                     &[],
                 );
             }
+        }
+        let stats = [vk::DescriptorBufferInfo::default()
+            .buffer(statistics_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        unsafe {
+            device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(result.descriptor_set)
+                    .dst_binding(7)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&stats)],
+                &[],
+            );
         }
         result.layout = unsafe {
             device.create_pipeline_layout(
@@ -330,6 +351,7 @@ impl GuidanceEstimator {
         frame_id: u64,
         extent: vk::Extent2D,
         valid: bool,
+        timing: FrameTiming,
         reset: GuidanceReset,
     ) -> GuidanceView {
         let extent = FrameExtent {
@@ -407,7 +429,7 @@ impl GuidanceEstimator {
                 SignalState::ConstantFallback,
             ),
             pre_exposure: 1.0,
-            timing: FrameTiming::default(),
+            timing,
             jitter: JitterSample::default(),
             depth_semantics: DepthSemantics::FlatFallback,
             direction: MotionDirection::CurrentToPrevious,

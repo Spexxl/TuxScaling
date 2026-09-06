@@ -13,6 +13,7 @@ fn main() {
         "flow",
         "confidence",
         "scene",
+        "scene_reduce",
         "invalidate",
         "visualize",
     ] {

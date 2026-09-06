@@ -10,7 +10,7 @@ use tuxscaling_vulkan::{image_barrier, memory_barrier};
 
 #[path = "pipeline.rs"]
 mod pipeline;
-pub use pipeline::{TemporalPipeline, TemporalPipelineDescriptor};
+pub use pipeline::{FrameTimingState, TemporalPipeline, TemporalPipelineDescriptor, TimingState};
 
 pub type SetLoaderData = unsafe extern "system" fn(vk::Device, *mut std::ffi::c_void) -> vk::Result;
 
@@ -55,8 +55,8 @@ struct Slot {
     fence: vk::Fence,
     semaphore: vk::Semaphore,
 }
-const GPU_PHASES: usize = 12;
-const GPU_TIMESTAMPS: usize = 15;
+const GPU_PHASES: usize = 13;
+const GPU_TIMESTAMPS: usize = 16;
 
 fn mode_name(mode: u32) -> &'static str {
     [
@@ -609,10 +609,11 @@ impl SwapchainRuntime {
                     elapsed(6, 7),
                     elapsed(7, 8),
                     elapsed(8, 9),
-                    elapsed(10, 11),
+                    elapsed(9, 10),
                     elapsed(11, 12),
                     elapsed(12, 13),
                     elapsed(13, 14),
+                    elapsed(14, 15),
                 ];
                 self.diagnostics.capture_ms = ms[0];
                 self.diagnostics.luma_ms = ms[1];
@@ -620,14 +621,14 @@ impl SwapchainRuntime {
                 self.diagnostics.forward_flow_ms = ms[3];
                 self.diagnostics.backward_flow_ms = ms[4];
                 self.diagnostics.confidence_ms = ms[5];
-                self.diagnostics.scene_ms = ms[6];
-                self.diagnostics.invalidate_ms = ms[7];
-                self.diagnostics.motion_ms = ms[1..8].iter().sum();
-                self.diagnostics.reactive_ms = ms[8];
-                self.diagnostics.exposure_ms = ms[9];
-                self.diagnostics.guidance_ms = ms[8] + ms[9];
-                self.diagnostics.reconstruction_ms = ms[10];
-                self.diagnostics.overlay_ms = ms[11];
+                self.diagnostics.scene_ms = ms[7];
+                self.diagnostics.invalidate_ms = ms[8];
+                self.diagnostics.motion_ms = ms[1..9].iter().sum();
+                self.diagnostics.reactive_ms = ms[9];
+                self.diagnostics.exposure_ms = ms[10];
+                self.diagnostics.guidance_ms = ms[9] + ms[10];
+                self.diagnostics.reconstruction_ms = ms[11];
+                self.diagnostics.overlay_ms = ms[12];
                 let temporal_ms = self.diagnostics.motion_ms
                     + self.diagnostics.guidance_ms
                     + self.diagnostics.reconstruction_ms;
@@ -642,7 +643,7 @@ impl SwapchainRuntime {
                         .temporal
                         .timings
                         .iter()
-                        .map(|timing| timing[1..11].iter().sum::<f32>())
+                        .map(|timing| timing[1..12].iter().sum::<f32>())
                         .collect::<Vec<_>>();
                     totals.sort_by(f32::total_cmp);
                     self.diagnostics.p95_ms = totals[(totals.len() - 1) * 95 / 100];
@@ -652,15 +653,10 @@ impl SwapchainRuntime {
             }
         }
         self.temporal.pending_time = self.temporal.start.elapsed();
-        let frame_delta = self
-            .temporal
-            .last_time
-            .map_or(std::time::Duration::ZERO, |last| {
-                self.temporal.pending_time.saturating_sub(last)
-            });
-        self.temporal.last_time = Some(self.temporal.pending_time);
-        self.diagnostics.frame_delta_ms = frame_delta.as_secs_f32() * 1_000.0;
-        if frame_delta > std::time::Duration::from_millis(250) {
+        let (timing, timing_reset) = self.temporal.timing.sample(self.temporal.pending_time);
+        self.temporal.pending_timing = timing;
+        self.diagnostics.frame_delta_ms = timing.raw.as_secs_f32() * 1_000.0;
+        if timing_reset.is_some() {
             self.temporal.reset_reason = GuidanceReset::LongPause;
             self.temporal.history.reset();
         }
@@ -679,6 +675,7 @@ impl SwapchainRuntime {
                 self.temporal.history.frame_id + 1,
                 self.temporal.resolution.processing_extent,
                 valid,
+                self.temporal.pending_timing,
                 if valid {
                     GuidanceReset::None
                 } else {
@@ -783,7 +780,7 @@ impl SwapchainRuntime {
                 }
                 memory_barrier(&self.device, slot.command);
             } else if self.temporal.queries != vk::QueryPool::null() {
-                for offset in 2..=9 {
+                for offset in 2..=10 {
                     self.device.cmd_write_timestamp(
                         slot.command,
                         vk::PipelineStageFlags::ALL_COMMANDS,
@@ -797,21 +794,21 @@ impl SwapchainRuntime {
                     self.device.cmd_reset_query_pool(
                         slot.command,
                         self.temporal.queries,
-                        index as u32 * GPU_TIMESTAMPS as u32 + 10,
+                        index as u32 * GPU_TIMESTAMPS as u32 + 11,
                         3,
                     );
                     guidance.record_timed(
                         slot.command,
                         valid,
                         self.temporal.queries,
-                        index as u32 * GPU_TIMESTAMPS as u32 + 10,
+                        index as u32 * GPU_TIMESTAMPS as u32 + 11,
                     );
                 } else {
                     guidance.record(slot.command, valid);
                 }
                 memory_barrier(&self.device, slot.command);
             } else if self.temporal.queries != vk::QueryPool::null() {
-                for offset in 10..=12 {
+                for offset in 11..=13 {
                     self.device.cmd_write_timestamp(
                         slot.command,
                         vk::PipelineStageFlags::ALL_COMMANDS,
@@ -936,7 +933,7 @@ impl SwapchainRuntime {
                     slot.command,
                     vk::PipelineStageFlags::ALL_COMMANDS,
                     self.temporal.queries,
-                    index as u32 * GPU_TIMESTAMPS as u32 + 13,
+                    index as u32 * GPU_TIMESTAMPS as u32 + 14,
                 );
             }
             self.overlay
@@ -955,7 +952,7 @@ impl SwapchainRuntime {
                     slot.command,
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     self.temporal.queries,
-                    index as u32 * GPU_TIMESTAMPS as u32 + 14,
+                    index as u32 * GPU_TIMESTAMPS as u32 + 15,
                 );
             }
             self.device.end_command_buffer(slot.command)?;
@@ -1090,6 +1087,7 @@ impl Drop for SwapchainRuntime {
                 "forward",
                 "backward",
                 "confidence",
+                "stats_partial",
                 "scene",
                 "invalidate",
                 "reactive",

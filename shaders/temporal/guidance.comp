@@ -7,6 +7,13 @@ layout(r8,binding=3) uniform image2D reactive_image;
 layout(r8,binding=4) uniform image2D disocclusion_image;
 layout(r32f,binding=5) uniform image2D exposure_image;
 layout(r32f,binding=6) uniform image2D depth_image;
+layout(std430,binding=7) readonly buffer MotionStats {
+    uint scene_cut;
+    uint consistent;
+    float distance_l1;
+    uint reserved;
+    float exposure;
+};
 layout(push_constant) uniform Params {
     uint width;
     uint height;
@@ -22,16 +29,7 @@ void main() {
     uvec2 q = gl_GlobalInvocationID.xy;
     if (p.mode == 1) {
         if (q.x != 0 || q.y != 0) return;
-        float sum = 0.0;
-        uint count = 0;
-        for (uint y = 0; y < p.height; y += 4) {
-            for (uint x = 0; x < p.width; x += 4) {
-                sum += log2(max(luminance(texelFetch(current_frame, ivec2(x, y), 0).rgb), 1e-4));
-                count++;
-            }
-        }
-        float average = sum / float(max(count, 1));
-        imageStore(exposure_image, ivec2(0), vec4(exp2(-average)));
+        imageStore(exposure_image, ivec2(0), vec4(exposure));
         return;
     }
     if (q.x >= p.width || q.y >= p.height) return;
