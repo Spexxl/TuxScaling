@@ -95,6 +95,6 @@ void main() {
         ? clamp(0.08 + confidence * 0.82, 0.08, 0.9)
             * (1.0 - reactive) * (1.0 - disocclusion) * clamp(depth, 0.0, 1.0)
         : 0.0;
-    vec3 resolved = mix(current.rgb * exposure, history * exposure, history_weight) / exposure;
+    vec3 resolved = mix(current.rgb * exposure, history, history_weight);
     imageStore(output_image, pixel, vec4(max(resolved, vec3(0.0)), current.a));
 }
