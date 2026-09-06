@@ -38,14 +38,13 @@ fn virtual_output_extent(
         .get(&surface)
         .copied()?;
     let display = tuxscaling_display::X11Display::connect().ok()?;
-    let monitor = display.monitor_for_window(surface.window).ok()?;
-    let window = display.window_rect(surface.window).ok()?;
-    if !display.is_fullscreen(surface.window) && window != monitor.rect {
+    let target_info = display.target_for_window(surface.window).ok()?;
+    if !target_info.window.fullscreen && target_info.window.rect != target_info.monitor.rect {
         return None;
     }
     let target = target.unwrap_or(vk::Extent2D {
-        width: monitor.rect.width,
-        height: monitor.rect.height,
+        width: target_info.monitor.rect.width,
+        height: target_info.monitor.rect.height,
     });
     if target == game_extent || target.width == 0 || target.height == 0 {
         return None;
@@ -54,8 +53,8 @@ fn virtual_output_extent(
         .resize_window(
             surface.window,
             tuxscaling_display::Monitor::new(tuxscaling_display::Rect::new(
-                monitor.rect.x,
-                monitor.rect.y,
+                target_info.monitor.rect.x,
+                target_info.monitor.rect.y,
                 target.width,
                 target.height,
             )),
@@ -65,7 +64,7 @@ fn virtual_output_extent(
         target,
         ResizedWindow {
             window: surface.window,
-            original: window,
+            original: target_info.window.rect,
         },
     ))
 }

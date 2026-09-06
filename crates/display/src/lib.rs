@@ -1,6 +1,14 @@
-use libloading::Library;
-use std::os::raw::{c_char, c_int, c_long, c_uchar, c_uint, c_ulong};
+use std::fmt::Display as FmtDisplay;
+
 use thiserror::Error;
+use x11rb::{
+    connection::Connection,
+    protocol::{
+        randr::ConnectionExt as RandrConnectionExt,
+        xproto::{AtomEnum, ConfigureWindowAux, ConnectionExt as XprotoConnectionExt, Window},
+    },
+    rust_connection::RustConnection,
+};
 
 pub const CRATE_NAME: &str = "tuxscaling-display";
 
@@ -42,6 +50,39 @@ impl Monitor {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct X11Window {
+    pub id: u64,
+    pub rect: Rect,
+    pub fullscreen: bool,
+}
+
+impl X11Window {
+    pub const fn new(id: u64) -> Self {
+        Self {
+            id,
+            rect: Rect::new(0, 0, 0, 0),
+            fullscreen: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayTarget {
+    pub window: X11Window,
+    pub monitor: Monitor,
+}
+
+impl DisplayTarget {
+    pub const fn new(window: X11Window, monitor: Monitor) -> Self {
+        Self { window, monitor }
+    }
+
+    pub const fn output_extent(self) -> [u32; 2] {
+        [self.monitor.rect.width, self.monitor.rect.height]
+    }
+}
+
 pub fn select_monitor(window: Rect, monitors: &[Monitor]) -> Option<Monitor> {
     monitors
         .iter()
@@ -50,231 +91,148 @@ pub fn select_monitor(window: Rect, monitors: &[Monitor]) -> Option<Monitor> {
         .filter(|monitor| window.intersection_area(monitor.rect) > 0)
 }
 
-#[repr(C)]
-struct Display;
-
-#[repr(C)]
-struct XrrMonitorInfo {
-    _name: c_ulong,
-    _primary: c_int,
-    _automatic: c_int,
-    _output_count: c_int,
-    x: c_int,
-    y: c_int,
-    width: c_int,
-    height: c_int,
-    _physical_width: c_int,
-    _physical_height: c_int,
-    _outputs: *mut c_ulong,
-}
-
-type OpenDisplay = unsafe extern "C" fn(*const c_char) -> *mut Display;
-type CloseDisplay = unsafe extern "C" fn(*mut Display) -> c_int;
-type GetGeometry = unsafe extern "C" fn(
-    *mut Display,
-    c_ulong,
-    *mut c_ulong,
-    *mut c_int,
-    *mut c_int,
-    *mut c_uint,
-    *mut c_uint,
-    *mut c_uint,
-    *mut c_uint,
-) -> c_int;
-type ResizeWindow = unsafe extern "C" fn(*mut Display, c_ulong, c_uint, c_uint) -> c_int;
-type Sync = unsafe extern "C" fn(*mut Display, c_int) -> c_int;
-type InternAtom = unsafe extern "C" fn(*mut Display, *const c_char, c_int) -> c_ulong;
-type GetWindowProperty = unsafe extern "C" fn(
-    *mut Display,
-    c_ulong,
-    c_ulong,
-    c_long,
-    c_long,
-    c_int,
-    c_ulong,
-    *mut c_ulong,
-    *mut c_int,
-    *mut c_ulong,
-    *mut c_ulong,
-    *mut *mut c_uchar,
-) -> c_int;
-type Free = unsafe extern "C" fn(*mut std::ffi::c_void) -> c_int;
-type GetMonitors =
-    unsafe extern "C" fn(*mut Display, c_ulong, c_int, *mut c_int) -> *mut XrrMonitorInfo;
-type FreeMonitors = unsafe extern "C" fn(*mut XrrMonitorInfo);
-
 #[derive(Debug, Error)]
 pub enum DisplayError {
-    #[error("X11 runtime is unavailable")]
-    Library(#[from] libloading::Error),
-    #[error("XOpenDisplay failed")]
-    Unavailable,
+    #[error("X11 operation failed: {0}")]
+    Operation(String),
     #[error("X11 window geometry is unavailable")]
     Geometry,
     #[error("X11 monitor discovery is unavailable")]
     Monitor,
 }
 
+fn operation<E: FmtDisplay>(error: E) -> DisplayError {
+    DisplayError::Operation(error.to_string())
+}
+
 pub struct X11Display {
-    _x11: Library,
-    _randr: Library,
-    display: *mut Display,
-    close_display: CloseDisplay,
-    get_geometry: GetGeometry,
-    resize_window: ResizeWindow,
-    sync: Sync,
-    intern_atom: InternAtom,
-    get_window_property: GetWindowProperty,
-    free: Free,
-    get_monitors: GetMonitors,
-    free_monitors: FreeMonitors,
+    connection: RustConnection,
+    root: Window,
 }
 
 impl X11Display {
     pub fn connect() -> Result<Self, DisplayError> {
-        let x11 = unsafe { Library::new("libX11.so.6") }?;
-        let randr = unsafe { Library::new("libXrandr.so.2") }?;
-        let open_display = load::<OpenDisplay>(&x11, b"XOpenDisplay\0")?;
-        let display = unsafe { open_display(std::ptr::null()) };
-        if display.is_null() {
-            return Err(DisplayError::Unavailable);
-        }
-        Ok(Self {
-            close_display: load::<CloseDisplay>(&x11, b"XCloseDisplay\0")?,
-            get_geometry: load::<GetGeometry>(&x11, b"XGetGeometry\0")?,
-            resize_window: load::<ResizeWindow>(&x11, b"XResizeWindow\0")?,
-            sync: load::<Sync>(&x11, b"XSync\0")?,
-            intern_atom: load::<InternAtom>(&x11, b"XInternAtom\0")?,
-            get_window_property: load::<GetWindowProperty>(&x11, b"XGetWindowProperty\0")?,
-            free: load::<Free>(&x11, b"XFree\0")?,
-            get_monitors: load::<GetMonitors>(&randr, b"XRRGetMonitors\0")?,
-            free_monitors: load::<FreeMonitors>(&randr, b"XRRFreeMonitors\0")?,
-            _x11: x11,
-            _randr: randr,
-            display,
+        let (connection, screen) = x11rb::connect(None).map_err(operation)?;
+        let root = connection
+            .setup()
+            .roots
+            .get(screen)
+            .ok_or(DisplayError::Monitor)?
+            .root;
+        Ok(Self { connection, root })
+    }
+
+    pub fn describe_window(&self, window: u64) -> Result<X11Window, DisplayError> {
+        Ok(X11Window {
+            id: window,
+            rect: self.window_rect(window)?,
+            fullscreen: self.is_fullscreen(window),
         })
     }
 
+    pub fn target_for_window(&self, window: u64) -> Result<DisplayTarget, DisplayError> {
+        let window = self.describe_window(window)?;
+        let monitor = self.monitor_for_window(window.id)?;
+        Ok(DisplayTarget::new(window, monitor))
+    }
+
     pub fn window_rect(&self, window: u64) -> Result<Rect, DisplayError> {
-        let mut root = 0;
-        let mut x = 0;
-        let mut y = 0;
-        let mut width = 0;
-        let mut height = 0;
-        let mut border = 0;
-        let mut depth = 0;
-        let status = unsafe {
-            (self.get_geometry)(
-                self.display,
-                window as c_ulong,
-                &mut root,
-                &mut x,
-                &mut y,
-                &mut width,
-                &mut height,
-                &mut border,
-                &mut depth,
-            )
-        };
-        if status == 0 {
-            return Err(DisplayError::Geometry);
-        }
-        Ok(Rect::new(x, y, width, height))
+        let window = window as Window;
+        let geometry = self
+            .connection
+            .get_geometry(window)
+            .map_err(operation)?
+            .reply()
+            .map_err(operation)?;
+        let translated = self
+            .connection
+            .translate_coordinates(window, self.root, 0, 0)
+            .map_err(operation)?
+            .reply()
+            .map_err(operation)?;
+        Ok(Rect::new(
+            translated.dst_x.into(),
+            translated.dst_y.into(),
+            geometry.width.into(),
+            geometry.height.into(),
+        ))
     }
 
     pub fn monitor_for_window(&self, window: u64) -> Result<Monitor, DisplayError> {
         let window_rect = self.window_rect(window)?;
-        let mut count = 0;
-        let monitors =
-            unsafe { (self.get_monitors)(self.display, window as c_ulong, 1, &mut count) };
-        if monitors.is_null() || count <= 0 {
-            return Err(DisplayError::Monitor);
-        }
-        let result = unsafe {
-            let monitors = std::slice::from_raw_parts(monitors, count as usize)
-                .iter()
-                .map(|monitor| {
-                    Monitor::new(Rect::new(
-                        monitor.x,
-                        monitor.y,
-                        monitor.width.max(0) as u32,
-                        monitor.height.max(0) as u32,
-                    ))
-                })
-                .collect::<Vec<_>>();
-            select_monitor(window_rect, &monitors).ok_or(DisplayError::Monitor)
-        };
-        unsafe { (self.free_monitors)(monitors) };
-        result
+        let reply = self
+            .connection
+            .randr_get_monitors(window as Window, true)
+            .map_err(operation)?
+            .reply()
+            .map_err(operation)?;
+        let monitors = reply
+            .monitors
+            .iter()
+            .map(|monitor| {
+                Monitor::new(Rect::new(
+                    monitor.x.into(),
+                    monitor.y.into(),
+                    monitor.width.into(),
+                    monitor.height.into(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        select_monitor(window_rect, &monitors).ok_or(DisplayError::Monitor)
     }
 
     pub fn is_fullscreen(&self, window: u64) -> bool {
-        let state = unsafe { (self.intern_atom)(self.display, c"_NET_WM_STATE".as_ptr(), 0) };
-        let fullscreen =
-            unsafe { (self.intern_atom)(self.display, c"_NET_WM_STATE_FULLSCREEN".as_ptr(), 0) };
-        if state == 0 || fullscreen == 0 {
+        let state = self
+            .connection
+            .intern_atom(false, b"_NET_WM_STATE")
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|reply| reply.atom);
+        let fullscreen = self
+            .connection
+            .intern_atom(false, b"_NET_WM_STATE_FULLSCREEN")
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|reply| reply.atom);
+        let (Some(state), Some(fullscreen)) = (state, fullscreen) else {
             return false;
-        }
-        let mut actual_type = 0;
-        let mut actual_format = 0;
-        let mut item_count = 0;
-        let mut bytes_after = 0;
-        let mut data = std::ptr::null_mut();
-        let status = unsafe {
-            (self.get_window_property)(
-                self.display,
-                window as c_ulong,
-                state,
-                0,
-                1024,
-                0,
-                4,
-                &mut actual_type,
-                &mut actual_format,
-                &mut item_count,
-                &mut bytes_after,
-                &mut data,
-            )
         };
-        if status != 0 || data.is_null() || actual_format != 32 {
+        let Ok(cookie) =
+            self.connection
+                .get_property(false, window as Window, state, AtomEnum::ATOM, 0, 1024)
+        else {
             return false;
-        }
-        let atoms =
-            unsafe { std::slice::from_raw_parts(data.cast::<c_ulong>(), item_count as usize) };
-        let found = atoms.contains(&fullscreen);
-        unsafe { (self.free)(data.cast()) };
-        found
+        };
+        let Ok(property) = cookie.reply() else {
+            return false;
+        };
+        property
+            .value32()
+            .is_some_and(|mut atoms| atoms.any(|atom| atom == fullscreen))
     }
 
     pub fn resize_window(&self, window: u64, monitor: Monitor) -> Result<(), DisplayError> {
-        let width = monitor.rect.width;
-        let height = monitor.rect.height;
-        if width == 0 || height == 0 {
+        let rect = monitor.rect;
+        if rect.width == 0 || rect.height == 0 {
             return Err(DisplayError::Monitor);
         }
-        unsafe {
-            (self.resize_window)(self.display, window as c_ulong, width, height);
-            (self.sync)(self.display, 0);
-        }
-        Ok(())
+        self.connection
+            .configure_window(
+                window as Window,
+                &ConfigureWindowAux::new()
+                    .x(rect.x)
+                    .y(rect.y)
+                    .width(rect.width)
+                    .height(rect.height),
+            )
+            .map_err(operation)?;
+        self.connection.flush().map_err(operation)
     }
-}
-
-impl Drop for X11Display {
-    fn drop(&mut self) {
-        if !self.display.is_null() {
-            unsafe { (self.close_display)(self.display) };
-        }
-    }
-}
-
-fn load<T: Copy>(library: &Library, name: &[u8]) -> Result<T, libloading::Error> {
-    Ok(*unsafe { library.get::<T>(name) }?)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Monitor, Rect, select_monitor};
+    use super::{DisplayTarget, Monitor, Rect, X11Window, select_monitor};
 
     #[test]
     fn selects_the_monitor_with_the_largest_window_intersection() {
@@ -285,5 +243,15 @@ mod tests {
         let window = Rect::new(1800, 100, 1200, 800);
 
         assert_eq!(select_monitor(window, &monitors), Some(monitors[1]));
+    }
+
+    #[test]
+    fn domain_types_keep_window_and_output_target_explicit() {
+        let window = X11Window::new(42);
+        let monitor = Monitor::new(Rect::new(0, 0, 1920, 1080));
+        let target = DisplayTarget::new(window, monitor);
+
+        assert_eq!(target.window.id, 42);
+        assert_eq!(target.output_extent(), [1920, 1080]);
     }
 }

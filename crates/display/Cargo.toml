@@ -6,5 +6,5 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-libloading.workspace = true
 thiserror.workspace = true
+x11rb.workspace = true
