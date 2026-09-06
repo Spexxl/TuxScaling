@@ -201,16 +201,117 @@ fn quality_metrics_report_expected_values() {
     );
 
     let fixture = translation(16, 12);
-    let mut estimated = fixture.motion.clone();
-    estimated[0] = [100.0, 100.0];
+    let estimated = vec![[-5.0, 3.0]; fixture.len()];
     assert_eq!(
         endpoint_error_masked(&estimated, &fixture.motion, &fixture.valid),
         0.0
     );
-    let parallax = layered_parallax(16, 12);
-    assert_eq!(depth_order(&parallax.depth, &parallax.depth), 1.0);
-    let occluded = occlusion(16, 12);
-    assert_eq!(f1(&occluded.occlusion, &occluded.occlusion), 1.0);
-    assert_eq!(auroc(&[1.0, 0.0], &[true, false]), 1.0);
-    assert!(ev_error(flash(16, 12).exposure_ev, 0.0) > 0.0);
+}
+
+fn rectangle_mask(
+    width: u32,
+    height: u32,
+    x: std::ops::Range<u32>,
+    y: std::ops::Range<u32>,
+) -> Vec<bool> {
+    let mut mask = vec![false; (width * height) as usize];
+    for row in y {
+        for column in x.clone() {
+            mask[row as usize * width as usize + column as usize] = true;
+        }
+    }
+    mask
+}
+
+fn reproject(previous: &[[f32; 4]], width: u32, height: u32, dx: i32, dy: i32) -> Vec<[f32; 4]> {
+    (0..height)
+        .flat_map(|y| {
+            (0..width).map(move |x| {
+                let source_x = (x as i32 - dx).clamp(0, width.saturating_sub(1) as i32) as usize;
+                let source_y = (y as i32 - dy).clamp(0, height.saturating_sub(1) as i32) as usize;
+                previous[source_y * width as usize + source_x]
+            })
+        })
+        .collect()
+}
+
+fn luma(pixel: [f32; 4]) -> f32 {
+    pixel[0] * 0.2126 + pixel[1] * 0.7152 + pixel[2] * 0.0722
+}
+
+#[test]
+fn independent_fixture_estimates_pass_and_corruptions_fail() {
+    let width = 64;
+    let height = 48;
+
+    let parallax = layered_parallax(width, height);
+    let mut estimated_depth = vec![0.35; parallax.len()];
+    for y in 12..36 {
+        for x in 16..48 {
+            estimated_depth[y * width as usize + x] = 1.0;
+        }
+    }
+    assert!(depth_order(&estimated_depth, &parallax.depth) > 0.99);
+    let mut corrupted_depth = estimated_depth.clone();
+    for y in 12..36 {
+        for x in 16..48 {
+            corrupted_depth[y * width as usize + x] = 0.35;
+        }
+    }
+    assert!(depth_order(&corrupted_depth, &parallax.depth) < 0.65);
+
+    let occluded = occlusion(width, height);
+    let occlusion_scores: Vec<f32> = occluded
+        .current
+        .iter()
+        .map(|pixel| (pixel[0] + pixel[1] + pixel[2]) / 3.0)
+        .collect();
+    let estimated_occlusion: Vec<bool> = occlusion_scores
+        .iter()
+        .map(|score| *score > 0.999)
+        .collect();
+    assert!(f1(&estimated_occlusion, &occluded.occlusion) > 0.95);
+    assert!(auroc(&occlusion_scores, &occluded.occlusion) > 0.95);
+    let mut corrupted_occlusion = estimated_occlusion.clone();
+    corrupted_occlusion.fill(false);
+    assert!(f1(&corrupted_occlusion, &occluded.occlusion) < 0.65);
+    let corrupted_scores: Vec<f32> = occlusion_scores.iter().map(|score| 1.0 - score).collect();
+    assert!(auroc(&corrupted_scores, &occluded.occlusion) < 0.65);
+
+    let transparent = transparency(width, height);
+    let estimated_transparency = rectangle_mask(width, height, 16..32, 12..36);
+    assert!(f1(&estimated_transparency, &transparent.transparency) > 0.95);
+    let corrupted_transparency = rectangle_mask(width, height, 40..56, 12..36);
+    assert!(f1(&corrupted_transparency, &transparent.transparency) < 0.65);
+
+    let flash_fixture = flash(width, height);
+    let ratios: Vec<f32> = flash_fixture
+        .previous
+        .iter()
+        .zip(flash_fixture.current.iter())
+        .filter_map(|(previous, current)| {
+            let previous_luma = luma(*previous);
+            let current_luma = luma(*current);
+            (previous_luma > 0.05
+                && previous[0] < 0.6
+                && previous[1] < 0.6
+                && previous[2] < 0.6
+                && current_luma < 0.99)
+                .then_some(current_luma / previous_luma)
+        })
+        .collect();
+    let estimated_ev = percentile(&ratios, 0.5).log2();
+    assert!(ev_error(estimated_ev, flash_fixture.exposure_ev) < 0.05);
+    assert!(ev_error(estimated_ev + 1.0, flash_fixture.exposure_ev) > 0.15);
+
+    let translated = translation(16, 12);
+    let estimated_image = reproject(&translated.previous, 16, 12, 5, -3);
+    assert!(image_error(&estimated_image, &translated.current) < 1e-6);
+    let mut corrupted_image = estimated_image.clone();
+    for y in 4..8 {
+        for x in 4..8 {
+            corrupted_image[y * 16 + x] = [0.0; 4];
+        }
+    }
+    assert!(image_error(&corrupted_image, &translated.current) > 0.01);
 }
