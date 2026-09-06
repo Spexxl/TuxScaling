@@ -62,6 +62,7 @@ pub(super) fn restore_surface_window(surface: vk::SurfaceKHR) {
         .and_then(|state| {
             let original = state.original_window.take()?;
             state.logical_extent = None;
+            state.logical_capabilities = None;
             Some((state.window, original))
         })
     else {

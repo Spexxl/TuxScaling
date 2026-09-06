@@ -10,6 +10,7 @@ use tuxscaling_vulkan::Image;
 pub(crate) struct X11Surface {
     pub(crate) window: u64,
     pub(crate) logical_extent: Option<vk::Extent2D>,
+    pub(crate) logical_capabilities: Option<vk::SurfaceCapabilitiesKHR>,
     pub(crate) original_window: Option<tuxscaling_display::Rect>,
 }
 

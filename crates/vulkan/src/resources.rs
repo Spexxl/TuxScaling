@@ -29,6 +29,17 @@ impl Image {
         format: vk::Format,
         usage: vk::ImageUsageFlags,
     ) -> Result<Self, vk::Result> {
+        unsafe { Self::with_sharing(device, memory, extent, format, usage, &[]) }
+    }
+
+    pub unsafe fn with_sharing(
+        device: &ash::Device,
+        memory: &vk::PhysicalDeviceMemoryProperties,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        queue_families: &[u32],
+    ) -> Result<Self, vk::Result> {
         let mut image = Self {
             device: device.clone(),
             handle: vk::Image::null(),
@@ -50,7 +61,12 @@ impl Image {
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            .sharing_mode(if queue_families.is_empty() {
+                vk::SharingMode::EXCLUSIVE
+            } else {
+                vk::SharingMode::CONCURRENT
+            })
+            .queue_family_indices(queue_families);
         image.handle = unsafe { device.create_image(&info, None) }?;
         let r = unsafe { device.get_image_memory_requirements(image.handle) };
         image.memory = unsafe {

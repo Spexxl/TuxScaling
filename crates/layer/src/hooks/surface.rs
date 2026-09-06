@@ -20,6 +20,7 @@ unsafe fn create_xlib_surface_inner(
                 X11Surface {
                     window: unsafe { (*create_info).window },
                     logical_extent: None,
+                    logical_capabilities: None,
                     original_window: None,
                 },
             );
@@ -59,6 +60,7 @@ unsafe fn create_xcb_surface_inner(
                 X11Surface {
                     window: unsafe { (*create_info).window as u64 },
                     logical_extent: None,
+                    logical_capabilities: None,
                     original_window: None,
                 },
             );
@@ -81,6 +83,14 @@ fn logical_extent(surface: vk::SurfaceKHR) -> Option<vk::Extent2D> {
         .unwrap_or_else(|error| error.into_inner())
         .get(&surface)
         .and_then(|surface| surface.logical_extent)
+}
+
+fn saved_capabilities(surface: vk::SurfaceKHR) -> Option<vk::SurfaceCapabilitiesKHR> {
+    surfaces()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&surface)
+        .and_then(|surface| surface.logical_capabilities)
 }
 
 unsafe fn instance_for_physical_device(
@@ -122,7 +132,11 @@ unsafe fn get_surface_capabilities_inner(
     if result == vk::Result::SUCCESS
         && let Some(extent) = logical_extent(surface)
     {
-        apply_logical_extent(unsafe { &mut *capabilities }, extent);
+        if let Some(saved) = saved_capabilities(surface) {
+            unsafe { *capabilities = saved };
+        } else {
+            apply_logical_extent(unsafe { &mut *capabilities }, extent);
+        }
     }
     result
 }
@@ -163,7 +177,11 @@ unsafe fn get_surface_capabilities2_inner(
     if result == vk::Result::SUCCESS
         && let Some(extent) = logical_extent(unsafe { (*surface_info).surface })
     {
-        apply_logical_extent(unsafe { &mut (*capabilities).surface_capabilities }, extent);
+        if let Some(saved) = saved_capabilities(unsafe { (*surface_info).surface }) {
+            unsafe { (*capabilities).surface_capabilities = saved };
+        } else {
+            apply_logical_extent(unsafe { &mut (*capabilities).surface_capabilities }, extent);
+        }
     }
     result
 }

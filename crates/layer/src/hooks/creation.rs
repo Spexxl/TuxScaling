@@ -9,8 +9,8 @@ struct ResizedWindow {
 fn virtual_swapchain_supported(info: &vk::SwapchainCreateInfoKHR<'_>) -> bool {
     if !info.flags.is_empty()
         || info.image_array_layers != 1
-        || info.image_sharing_mode != vk::SharingMode::EXCLUSIVE
-        || info.queue_family_index_count != 0
+        || (info.image_sharing_mode == vk::SharingMode::CONCURRENT
+            && (info.queue_family_index_count < 2 || info.p_queue_family_indices.is_null()))
     {
         return false;
     }
@@ -32,6 +32,7 @@ fn clear_surface_virtualization(surface: vk::SurfaceKHR) {
         .get_mut(&surface)
     {
         state.logical_extent = None;
+        state.logical_capabilities = None;
         state.original_window = None;
     }
 }
@@ -170,6 +171,12 @@ fn virtual_output_extent(
         height: target_info.monitor.rect.height,
     });
     if target == game_extent || target.width == 0 || target.height == 0 {
+        return None;
+    }
+    if cfg!(debug_assertions)
+        && std::env::var("TUXSCALING_TEST_FORCE_RESIZE_FAILURE").as_deref() == Ok("1")
+    {
+        eprintln!("TuxScaling: injected fullscreen resize failure; using direct presentation");
         return None;
     }
     display
@@ -574,6 +581,16 @@ unsafe fn create_swapchain_inner(
         release_previous_virtual_swapchain(original.old_swapchain, original.surface);
     }
     let mut modified = *original;
+    let logical_capabilities = state.as_ref().and_then(|state| unsafe {
+        let get: vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR =
+            std::mem::transmute(downstream(
+                state.instance.handle(),
+                c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+            )?);
+        let mut caps = vk::SurfaceCapabilitiesKHR::default();
+        (get(state.physical_device, original.surface, &mut caps) == vk::Result::SUCCESS)
+            .then_some(caps)
+    });
     let mut resized = virtual_output_extent(original.surface, original.image_extent);
     if let Some((extent, _)) = resized {
         modified.image_extent = extent;
@@ -609,6 +626,16 @@ unsafe fn create_swapchain_inner(
         if unsafe { get(state.physical_device, original.surface, &mut caps) } == vk::Result::SUCCESS
             && caps.supported_usage_flags.contains(needed)
         {
+            if let Some((extent, _)) = resized
+                && (extent.width < caps.min_image_extent.width
+                    || extent.height < caps.min_image_extent.height
+                    || extent.width > caps.max_image_extent.width
+                    || extent.height > caps.max_image_extent.height)
+            {
+                resized.take().unwrap().1.restore();
+                modified = *original;
+                eprintln!("TuxScaling: physical output extent rejected; using direct presentation");
+            }
             let features = unsafe {
                 state.instance.get_physical_device_format_properties(
                     state.physical_device,
@@ -721,12 +748,20 @@ unsafe fn create_swapchain_inner(
                 output_images
                     .iter()
                     .map(|_| unsafe {
-                        tuxscaling_vulkan::Image::new(
+                        tuxscaling_vulkan::Image::with_sharing(
                             &device_state.device,
                             &memory,
                             original.image_extent,
                             original.image_format,
                             usage,
+                            if original.image_sharing_mode == vk::SharingMode::CONCURRENT {
+                                std::slice::from_raw_parts(
+                                    original.p_queue_family_indices,
+                                    original.queue_family_index_count as usize,
+                                )
+                            } else {
+                                &[]
+                            },
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()
@@ -741,6 +776,7 @@ unsafe fn create_swapchain_inner(
                         .entry(original.surface)
                         .and_modify(|surface| {
                             surface.logical_extent = Some(original.image_extent);
+                            surface.logical_capabilities = logical_capabilities;
                             if surface.original_window.is_none() {
                                 surface.original_window = Some(resized_window.original);
                             }
@@ -795,6 +831,14 @@ unsafe fn create_swapchain_inner(
                     },
                     capture_enabled,
                     window,
+                    fullscreen: window
+                        .and_then(|window| {
+                            tuxscaling_display::X11Display::connect()
+                                .ok()?
+                                .target_for_window(window)
+                                .ok()
+                        })
+                        .is_some_and(|target| target.is_fullscreen()),
                 },
                 device_state.set_loader_data,
             )
