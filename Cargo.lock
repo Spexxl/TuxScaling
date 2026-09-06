@@ -755,6 +755,7 @@ dependencies = [
  "egui",
  "libloading",
  "thiserror",
+ "x11rb",
 ]
 
 [[package]]
@@ -770,6 +771,7 @@ dependencies = [
  "tuxscaling-overlay-vulkan",
  "tuxscaling-runtime",
  "tuxscaling-vulkan",
+ "x11rb",
 ]
 
 [[package]]

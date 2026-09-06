@@ -18,3 +18,6 @@ tuxscaling-runtime = { path = "../runtime" }
 tuxscaling-vulkan = { path = "../vulkan" }
 tuxscaling-config = { path = "../config" }
 tuxscaling-display = { path = "../display" }
+
+[dev-dependencies]
+x11rb = { workspace = true }
