@@ -2,7 +2,7 @@
 
 TuxScaling is a Linux-only Vulkan layer for experimenting with temporal upscaling in games that do not provide a native temporal-upscaling integration.
 
-The project targets native Vulkan applications and Windows games translated to Vulkan through Proton. The first hardware validation target is an AMD Radeon RX 9060 XT with Mesa RADV.
+The project targets native Vulkan applications games translated to Vulkan through Proton.
 
 ## Current status
 
