@@ -11,7 +11,8 @@ const BUTTON_PRESS: c_int = 4;
 const BUTTON_RELEASE: c_int = 5;
 const MOTION_NOTIFY: c_int = 6;
 const INSERT_KEYSYM: c_ulong = 0xff63;
-const POINTER_EVENT_MASK: c_ulong = (1 << 2) | (1 << 3) | (1 << 6);
+const POINTER_GRAB_MASK: c_ulong = (1 << 2) | (1 << 3) | (1 << 6);
+const PASSIVE_EVENT_MASK: c_long = 1 | 2 | (1 << 6);
 
 #[repr(C)]
 struct Display;
@@ -110,8 +111,6 @@ type Flush = unsafe extern "C" fn(*mut Display) -> c_int;
 type CloseDisplay = unsafe extern "C" fn(*mut Display) -> c_int;
 type Sync = unsafe extern "C" fn(*mut Display, c_int) -> c_int;
 type SelectInput = unsafe extern "C" fn(*mut Display, c_ulong, c_long) -> c_int;
-type GrabKey =
-    unsafe extern "C" fn(*mut Display, c_int, c_uint, c_ulong, c_int, c_int, c_int) -> c_int;
 
 #[derive(Debug, Error)]
 pub enum InputError {
@@ -167,22 +166,12 @@ impl X11Input {
         let screen = unsafe { default_screen(display) };
         let root = unsafe { root_window(display, screen) };
         let insert_keycode = unsafe { keysym_to_keycode(display, INSERT_KEYSYM) };
-        let grab_key = load::<GrabKey>(&library, b"XGrabKey\0")?;
         let select_input = load::<SelectInput>(&library, b"XSelectInput\0")?;
         unsafe {
             select_input(
                 display,
                 if window == 0 { root } else { window as c_ulong },
-                3 | POINTER_EVENT_MASK as c_long,
-            );
-            grab_key(
-                display,
-                insert_keycode.into(),
-                1 << 15,
-                if window == 0 { root } else { window as c_ulong },
-                0,
-                1,
-                1,
+                PASSIVE_EVENT_MASK,
             );
         }
         let input = Self {
@@ -277,7 +266,7 @@ impl X11Input {
                     self.display,
                     self.window,
                     0,
-                    POINTER_EVENT_MASK,
+                    POINTER_GRAB_MASK,
                     1,
                     1,
                     0,
