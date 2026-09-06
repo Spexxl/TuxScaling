@@ -295,12 +295,16 @@ unsafe fn run() {
         let mut frame = 0u32;
         let mut grouped = 0;
         let mut resizes = 0;
+        let resize_interval = std::env::var("TUXSCALING_TEST_RESIZE_INTERVAL")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(4);
         let present_proc = entry
             .get_instance_proc_addr(instance.handle(), c"vkQueuePresentKHR".as_ptr())
             .unwrap();
         let present: vk::PFN_vkQueuePresentKHR = std::mem::transmute(present_proc);
         while start.elapsed() < Duration::from_secs(seconds) {
-            if frame > 0 && frame.is_multiple_of(4) {
+            if resize_interval > 0 && frame > 0 && frame.is_multiple_of(resize_interval) {
                 let extent = if resizes % 2 == 0 {
                     vk::Extent2D {
                         width: 480,
@@ -455,6 +459,9 @@ unsafe fn run() {
         eprintln!(
             "WSI test complete: frames={frame}, grouped presents={grouped}, resize cycles={resizes}, queues={n}"
         );
-        assert!(grouped > 0 && resizes > 0);
+        assert!(grouped > 0);
+        if resize_interval > 0 {
+            assert!(resizes > 0);
+        }
     }
 }

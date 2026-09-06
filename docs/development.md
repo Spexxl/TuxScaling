@@ -31,6 +31,8 @@ The debug WSI harness sets `TUXSCALING_TEST_FORCE_VIRTUAL=1` so it can validate 
 
 Set `TUXSCALING_TEST_FORCE_TEMPORAL_FAILURE=1` in a debug run to exercise the mandatory spatial bilinear fallback used when temporal recording fails after virtual output has started.
 
+Set `TUXSCALING_TEST_RESIZE_INTERVAL=0` only for a warmed-up timing run; the default interval is four frames and keeps resize coverage enabled.
+
 ## Native boundary
 
 The native boundary is intentionally SDK-free in the initial milestone:
