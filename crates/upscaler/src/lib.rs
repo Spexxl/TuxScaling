@@ -40,6 +40,47 @@ pub struct ImageResource {
     pub resolution: InputResolution,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolutionPlan {
+    pub game_extent: vk::Extent2D,
+    pub processing_extent: vk::Extent2D,
+    pub output_extent: vk::Extent2D,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContentViewport {
+    pub offset: [f32; 2],
+    pub size: [f32; 2],
+}
+
+pub fn content_viewport(input: vk::Extent2D, output: vk::Extent2D) -> ContentViewport {
+    let input_aspect = input.width as f32 / input.height as f32;
+    let output_aspect = output.width as f32 / output.height as f32;
+    let size = if output_aspect > input_aspect {
+        [input_aspect / output_aspect, 1.0]
+    } else {
+        [1.0, output_aspect / input_aspect]
+    };
+    ContentViewport {
+        offset: [(1.0 - size[0]) * 0.5, (1.0 - size[1]) * 0.5],
+        size,
+    }
+}
+
+impl ResolutionPlan {
+    pub fn new(
+        game_extent: vk::Extent2D,
+        output_extent: vk::Extent2D,
+        processing_scale: f32,
+    ) -> Self {
+        Self {
+            game_extent,
+            processing_extent: scaled_extent(game_extent, processing_scale),
+            output_extent,
+        }
+    }
+}
+
 pub trait UpscalerBackend {
     fn id(&self) -> BackendId;
     fn capabilities(&self) -> BackendCapabilities;
@@ -53,7 +94,12 @@ pub trait UpscalerBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendCapabilities, BackendError, BackendId, InputResolution, UpscalerBackend};
+    use super::content_viewport;
+    use super::{
+        BackendCapabilities, BackendError, BackendId, InputResolution, ResolutionPlan,
+        UpscalerBackend,
+    };
+    use ash::vk;
 
     struct Dummy;
 
@@ -93,5 +139,65 @@ mod tests {
             )
             .unwrap();
         backend.reset().unwrap();
+    }
+
+    #[test]
+    fn resolution_plan_keeps_game_input_at_full_processing_scale() {
+        let plan = ResolutionPlan::new(
+            vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            },
+            1.0,
+        );
+
+        assert_eq!(plan.game_extent, plan.processing_extent);
+        assert_eq!(plan.output_extent.width, 1920);
+    }
+
+    #[test]
+    fn resolution_plan_scales_only_processing_input() {
+        let plan = ResolutionPlan::new(
+            vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            },
+            0.75,
+        );
+
+        assert_eq!(
+            plan.processing_extent,
+            vk::Extent2D {
+                width: 960,
+                height: 540,
+            }
+        );
+    }
+
+    #[test]
+    fn content_viewport_preserves_the_input_aspect_ratio() {
+        let viewport = content_viewport(
+            vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            vk::Extent2D {
+                width: 1920,
+                height: 1200,
+            },
+        );
+
+        assert!((viewport.offset[0] - 0.0).abs() < 0.0001);
+        assert!((viewport.offset[1] - 0.05).abs() < 0.0001);
+        assert!((viewport.size[0] - 1.0).abs() < 0.0001);
+        assert!((viewport.size[1] - 0.9).abs() < 0.0001);
     }
 }

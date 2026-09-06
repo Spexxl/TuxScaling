@@ -22,6 +22,11 @@ pub fn supported_format(format: vk::Format, space: vk::ColorSpaceKHR) -> bool {
                 | vk::Format::R16G16B16A16_SFLOAT
         )
 }
+
+pub fn requires_scaling(source: vk::Extent2D, destination: vk::Extent2D) -> bool {
+    source != destination
+}
+
 pub struct Capture {
     pub color: Image,
     pub previous: Image,
@@ -60,6 +65,28 @@ impl Capture {
         command: vk::CommandBuffer,
         source: vk::Image,
         layout: vk::ImageLayout,
+    ) {
+        let extent = self.color.extent;
+        unsafe {
+            self.record_scaled_from(
+                device,
+                command,
+                source,
+                extent,
+                layout,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            );
+        }
+    }
+
+    pub unsafe fn record_scaled_from(
+        &mut self,
+        device: &ash::Device,
+        command: vk::CommandBuffer,
+        source: vk::Image,
+        source_extent: vk::Extent2D,
+        layout: vk::ImageLayout,
+        final_layout: vk::ImageLayout,
     ) {
         unsafe {
             if self.initialized {
@@ -131,22 +158,52 @@ impl Capture {
             let layers = vk::ImageSubresourceLayers::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                 .layer_count(1);
-            let region = vk::ImageCopy::default()
-                .src_subresource(layers)
-                .dst_subresource(layers)
-                .extent(vk::Extent3D {
-                    width: self.color.extent.width,
-                    height: self.color.extent.height,
-                    depth: 1,
-                });
-            device.cmd_copy_image(
-                command,
-                source,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                self.color.handle,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region],
-            );
+            if requires_scaling(source_extent, self.color.extent) {
+                device.cmd_blit_image(
+                    command,
+                    source,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    self.color.handle,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::ImageBlit::default()
+                        .src_subresource(layers)
+                        .dst_subresource(layers)
+                        .src_offsets([
+                            vk::Offset3D::default(),
+                            vk::Offset3D {
+                                x: source_extent.width as i32,
+                                y: source_extent.height as i32,
+                                z: 1,
+                            },
+                        ])
+                        .dst_offsets([
+                            vk::Offset3D::default(),
+                            vk::Offset3D {
+                                x: self.color.extent.width as i32,
+                                y: self.color.extent.height as i32,
+                                z: 1,
+                            },
+                        ])],
+                    vk::Filter::LINEAR,
+                );
+            } else {
+                let region = vk::ImageCopy::default()
+                    .src_subresource(layers)
+                    .dst_subresource(layers)
+                    .extent(vk::Extent3D {
+                        width: self.color.extent.width,
+                        height: self.color.extent.height,
+                        depth: 1,
+                    });
+                device.cmd_copy_image(
+                    command,
+                    source,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    self.color.handle,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+            }
             image_barrier(
                 device,
                 command,
@@ -159,7 +216,7 @@ impl Capture {
                 command,
                 source,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                final_layout,
             );
         }
         self.initialized = true;
@@ -168,6 +225,23 @@ impl Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identifies_when_capture_requires_scaling() {
+        let source = vk::Extent2D {
+            width: 1280,
+            height: 720,
+        };
+
+        assert!(!requires_scaling(source, source));
+        assert!(requires_scaling(
+            source,
+            vk::Extent2D {
+                width: 960,
+                height: 540,
+            }
+        ));
+    }
     #[test]
     fn rejects_hdr_and_accepts_sdr() {
         assert!(supported_format(

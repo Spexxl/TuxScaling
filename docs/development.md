@@ -43,15 +43,18 @@ The development manifest is located at `assets/vulkan-layer/tuxscaling.json`. Af
 
 Use `VK_LOADER_DEBUG=all` to inspect loader and layer discovery. Use `RUST_LOG=info` or `RUST_LOG=debug` for structured runtime diagnostics once the layer logging path is active.
 
-The layer currently supports SDR swapchains with transfer and sampling usage. Unsupported formats, application-managed presentation fences, and unsupported present data use pass-through.
+The layer currently supports SDR swapchains with transfer and sampling usage. On fullscreen X11/XWayland, `output_resolution = "native"` uses the active monitor mode as the output while preserving the game's requested swapchain extent as its logical input; `swapchain` disables this virtual output path, and `WIDTHxHEIGHT` selects a fixed output extent. Native Wayland remains direct presentation. Unsupported formats, application-managed presentation fences, and unsupported present data use pass-through.
 
 The default profile is equivalent to:
 
 ```toml
 motion_quality = "balanced"
-render_scale = 0.67
+output_resolution = "native"
+processing_scale = 1.0
 debug_view = "original"
 ```
+
+`processing_scale` is optional internal work reduction after capture. It does not change the game resolution or the output resolution; its default is `1.0`. The legacy `render_scale` key is accepted during the migration.
 
 The fixed quality targets are Ultra (12 ms), High (8 ms), Balanced (4 ms), and Performance (2.5 ms) for temporal work at 1080p. The overlay reports a warning when measured work exceeds the selected target; it never changes the preset automatically.
 

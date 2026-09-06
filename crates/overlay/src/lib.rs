@@ -10,7 +10,10 @@ pub struct FrameDiagnostics {
     pub mode: String,
     pub quality: MotionQuality,
     pub requested_quality: Option<MotionQuality>,
-    pub render_scale: f32,
+    pub processing_scale: f32,
+    pub game_extent: [u32; 2],
+    pub processing_extent: [u32; 2],
+    pub output_extent: [u32; 2],
     pub frame_delta_ms: f32,
     pub capture_ms: f32,
     pub motion_ms: f32,
@@ -19,6 +22,14 @@ pub struct FrameDiagnostics {
     pub overlay_ms: f32,
     pub p95_ms: f32,
     pub budget_warning: bool,
+}
+
+pub fn resolution_mode(game_extent: [u32; 2], output_extent: [u32; 2]) -> &'static str {
+    if game_extent == output_extent {
+        "Native AA"
+    } else {
+        "Virtual upscale"
+    }
 }
 
 pub fn render_diagnostics(
@@ -68,7 +79,25 @@ pub fn render_diagnostics(
                                 }
                             }
                         });
-                    ui.label(format!("Render scale: {:.0}%", diagnostics.render_scale * 100.0));
+                    ui.label(format!(
+                        "Processing scale: {:.0}%",
+                        diagnostics.processing_scale * 100.0
+                    ));
+                    if diagnostics.game_extent[0] > 0 && diagnostics.output_extent[0] > 0 {
+                        ui.label(format!(
+                            "Game: {} x {} | Processing: {} x {} | Output: {} x {}",
+                            diagnostics.game_extent[0],
+                            diagnostics.game_extent[1],
+                            diagnostics.processing_extent[0],
+                            diagnostics.processing_extent[1],
+                            diagnostics.output_extent[0],
+                            diagnostics.output_extent[1],
+                        ));
+                        ui.label(resolution_mode(
+                            diagnostics.game_extent,
+                            diagnostics.output_extent,
+                        ));
+                    }
                     ui.label(format!("Frame delta: {:.2} ms", diagnostics.frame_delta_ms));
                     if diagnostics.budget_warning {
                         ui.colored_label(
@@ -178,7 +207,7 @@ impl Default for OverlayState {
 
 #[cfg(test)]
 mod tests {
-    use super::{OverlayState, render_smoke_frame};
+    use super::{OverlayState, render_smoke_frame, resolution_mode};
 
     #[test]
     fn starts_hidden() {
@@ -196,6 +225,15 @@ mod tests {
                 .primitives
                 .iter()
                 .any(|primitive| matches!(primitive.primitive, egui::epaint::Primitive::Mesh(_)))
+        );
+    }
+
+    #[test]
+    fn labels_equal_input_and_output_as_native_aa() {
+        assert_eq!(resolution_mode([1920, 1080], [1920, 1080]), "Native AA");
+        assert_eq!(
+            resolution_mode([1280, 720], [1920, 1080]),
+            "Virtual upscale"
         );
     }
 }
