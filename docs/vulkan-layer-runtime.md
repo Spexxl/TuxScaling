@@ -4,7 +4,7 @@
 
 The Vulkan layer injects work immediately before presentation while preserving the application's Vulkan device, queues, and swapchains. The layer must fail open: if TuxScaling cannot process a present, the original call is forwarded unchanged.
 
-The runtime captures supported swapchains, computes estimated optical flow and frame guidance, runs the reference reconstruction when the format supports storage images, and renders the Egui diagnostic panel over `vkcube` on RADV. In fullscreen X11/XWayland virtual-output mode, game-owned layer images remain at the requested game extent while the real swapchain images use the configured output extent. Unsupported formats and allocation failures bypass reconstruction while preserving presentation.
+The runtime captures supported swapchains, computes estimated optical flow and frame guidance, runs the reference reconstruction when the format supports storage images, and renders the Egui diagnostic panel over `vkcube` on RADV. In fullscreen X11/XWayland virtual-output mode, game-owned layer images remain at the requested game extent while the real swapchain images use the configured output extent. Unsupported formats and allocation failures bypass reconstruction while preserving presentation. If temporal recording fails after virtualization has started, the runtime attempts a spatial bilinear blit into the real output before presenting.
 
 ## Ownership
 
@@ -47,7 +47,7 @@ Swapchain recreation creates a new overlay state. Old state is released through 
 
 ## Failure and ABI policy
 
-Unknown queues, unsupported swapchain formats, allocation failures, renderer failures, and invalid present data must bypass processing and preserve downstream behavior.
+Unknown queues, unsupported swapchain formats, allocation failures, renderer failures, and invalid present data must bypass processing and preserve downstream behavior. A temporal failure on a virtual swapchain first uses the spatial fallback so the acquired game image is still visible in the physical output; only a fallback failure disables processing.
 
 Every exported Vulkan function catches Rust panics at the ABI boundary. A panic returns a Vulkan error only when forwarding safely is impossible; otherwise the original downstream command is called.
 

@@ -29,6 +29,8 @@ cargo xtask smoke
 
 The debug WSI harness sets `TUXSCALING_TEST_FORCE_VIRTUAL=1` so it can validate small logical game images against the discovered monitor output without depending on a window manager fullscreen transition. Release builds ignore this test-only override.
 
+Set `TUXSCALING_TEST_FORCE_TEMPORAL_FAILURE=1` in a debug run to exercise the mandatory spatial bilinear fallback used when temporal recording fails after virtual output has started.
+
 ## Native boundary
 
 The native boundary is intentionally SDK-free in the initial milestone:

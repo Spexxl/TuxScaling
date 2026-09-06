@@ -67,19 +67,24 @@ fn main() -> ExitCode {
             let libraries = std::iter::once(root.join("target/debug"))
                 .chain(std::env::split_paths(&inherited))
                 .collect::<Vec<_>>();
-            report(
-                validation(&mut Command::new(root.join("target/debug/examples/wsi")))
+            let run_wsi = |force_temporal_failure| {
+                let mut command = Command::new(root.join("target/debug/examples/wsi"));
+                validation(&mut command)
                     .env("VK_ADD_LAYER_PATH", root.join("assets/vulkan-layer"))
-                    .env("LD_LIBRARY_PATH", std::env::join_paths(libraries).unwrap())
+                    .env("LD_LIBRARY_PATH", std::env::join_paths(&libraries).unwrap())
                     .env(
                         "VK_INSTANCE_LAYERS",
                         "VK_LAYER_TUXSCALING_overlay:VK_LAYER_KHRONOS_validation",
                     )
                     .env("TUXSCALING_VIEW", "motion")
                     .env("TUXSCALING_TEST_FORCE_VIRTUAL", "1")
-                    .env("TUXSCALING_TEST_SECONDS", "12")
-                    .output(),
-            )
+                    .env("TUXSCALING_TEST_SECONDS", "12");
+                if force_temporal_failure {
+                    command.env("TUXSCALING_TEST_FORCE_TEMPORAL_FAILURE", "1");
+                }
+                report(command.output())
+            };
+            run_wsi(false) && run_wsi(true)
         }
         "check" => {
             run("cargo", &["fmt", "--all", "--", "--check"])
