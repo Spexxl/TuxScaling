@@ -142,9 +142,35 @@ unsafe fn record_spatial_fallback(
     command: vk::CommandBuffer,
     source: &Capture,
     output: vk::Image,
+    output_layout: vk::ImageLayout,
     output_extent: vk::Extent2D,
 ) {
-    let viewport = content_viewport(source.color.extent, output_extent);
+    unsafe {
+        record_spatial_blit(
+            device,
+            command,
+            source.color.handle,
+            source.color.extent,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            output,
+            output_layout,
+            output_extent,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn record_spatial_blit(
+    device: &ash::Device,
+    command: vk::CommandBuffer,
+    source: vk::Image,
+    source_extent: vk::Extent2D,
+    source_layout: vk::ImageLayout,
+    output: vk::Image,
+    output_layout: vk::ImageLayout,
+    output_extent: vk::Extent2D,
+) {
+    let viewport = content_viewport(source_extent, output_extent);
     let left = (viewport.offset[0] * output_extent.width as f32).round() as i32;
     let top = (viewport.offset[1] * output_extent.height as f32).round() as i32;
     let right =
@@ -158,15 +184,15 @@ unsafe fn record_spatial_fallback(
         image_barrier(
             device,
             command,
-            source.color.handle,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            source,
+            source_layout,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
         );
         image_barrier(
             device,
             command,
             output,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            output_layout,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         );
         device.cmd_clear_color_image(
@@ -180,7 +206,7 @@ unsafe fn record_spatial_fallback(
         );
         device.cmd_blit_image(
             command,
-            source.color.handle,
+            source,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             output,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -190,8 +216,8 @@ unsafe fn record_spatial_fallback(
                 .src_offsets([
                     vk::Offset3D::default(),
                     vk::Offset3D {
-                        x: source.color.extent.width as i32,
-                        y: source.color.extent.height as i32,
+                        x: source_extent.width as i32,
+                        y: source_extent.height as i32,
                         z: 1,
                     },
                 ])
@@ -212,9 +238,9 @@ unsafe fn record_spatial_fallback(
         image_barrier(
             device,
             command,
-            source.color.handle,
+            source,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            source_layout,
         );
         image_barrier(
             device,
@@ -489,6 +515,14 @@ impl SwapchainRuntime {
     ) -> Result<FrameSubmission, vk::Result> {
         if !self.enabled {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        if cfg!(debug_assertions)
+            && std::env::var("TUXSCALING_TEST_FORCE_TEMPORAL_FAILURE")
+                .ok()
+                .as_deref()
+                == Some("1")
+        {
+            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
         unsafe { self.initialize(queue, family) }?;
         unsafe { self.apply_pending_processing_scale() }?;
@@ -781,6 +815,7 @@ impl SwapchainRuntime {
                     slot.command,
                     capture,
                     self.output_images[index],
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                     self.temporal.resolution.output_extent,
                 );
             }
@@ -896,6 +931,100 @@ impl SwapchainRuntime {
             render_complete: slot.semaphore,
         })
     }
+
+    pub unsafe fn prepare_spatial_fallback(
+        &mut self,
+        queue: vk::Queue,
+        family: u32,
+        index: u32,
+        reason: vk::Result,
+    ) -> Result<FrameSubmission, vk::Result> {
+        if !self.enabled {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        unsafe { self.initialize(queue, family) }?;
+        unsafe { self.apply_pending_processing_scale() }?;
+        let index = index as usize;
+        let output_layout = if self.output_presented[index] {
+            vk::ImageLayout::PRESENT_SRC_KHR
+        } else {
+            vk::ImageLayout::UNDEFINED
+        };
+        let slot = self
+            .slots
+            .get(index)
+            .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
+        unsafe { self.device.wait_for_fences(&[slot.fence], true, u64::MAX) }?;
+        eprintln!("TuxScaling: temporal processing failed ({reason:?}); using spatial fallback");
+        self.temporal.history.reset();
+        self.temporal.reset_reason = GuidanceReset::ProviderFailure;
+        if let Some(upscaler) = &mut self.temporal.upscaler {
+            upscaler.reset();
+        }
+        self.diagnostics.state = "Temporal failure; spatial fallback".into();
+        let frame = self
+            .overlay
+            .as_mut()
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
+            .prepare(queue, self.pool, index, &mut self.diagnostics)?;
+        if let Some(quality) = frame.requested_quality {
+            self.temporal.pending_quality = Some(motion_quality(quality));
+        }
+        if let Some(scale) = frame.requested_processing_scale {
+            self.temporal.pending_processing_scale = Some(scale);
+        }
+        unsafe {
+            self.device
+                .reset_command_buffer(slot.command, vk::CommandBufferResetFlags::empty())?;
+            self.device.begin_command_buffer(
+                slot.command,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            if self.game_images[index] != self.output_images[index] {
+                record_spatial_blit(
+                    &self.device,
+                    slot.command,
+                    self.game_images[index],
+                    self.temporal.resolution.game_extent,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    self.output_images[index],
+                    output_layout,
+                    self.temporal.resolution.output_extent,
+                );
+            } else {
+                image_barrier(
+                    &self.device,
+                    slot.command,
+                    self.output_images[index],
+                    output_layout,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                );
+            }
+            self.overlay
+                .as_mut()
+                .unwrap()
+                .record(slot.command, index, &frame)?;
+            image_barrier(
+                &self.device,
+                slot.command,
+                self.output_images[index],
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+            );
+            self.device.end_command_buffer(slot.command)?;
+        }
+        if self.game_images[index] != self.output_images[index] {
+            self.pending_output = Some(index);
+        }
+        self.temporal.query_ready[index] = false;
+        Ok(FrameSubmission {
+            command_buffer: slot.command,
+            fence: slot.fence,
+            render_complete: slot.semaphore,
+        })
+    }
+
     pub fn submitted(&mut self) {
         self.temporal.history.commit(self.temporal.pending_time);
         if let Some(index) = self.pending_output.take() {

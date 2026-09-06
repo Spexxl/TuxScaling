@@ -89,9 +89,22 @@ unsafe fn submit_overlay(
             )
         } {
             Ok(frame) => prepared.push((state.clone(), frame)),
-            Err(_) => {
-                swapchain_state.overlay.disable();
-            }
+            Err(error) => match unsafe {
+                swapchain_state.overlay.prepare_spatial_fallback(
+                    queue,
+                    queue_state.family_index,
+                    image_index,
+                    error,
+                )
+            } {
+                Ok(frame) => prepared.push((state.clone(), frame)),
+                Err(fallback_error) => {
+                    eprintln!(
+                        "TuxScaling: spatial fallback failed ({fallback_error:?}); bypassing overlay"
+                    );
+                    swapchain_state.overlay.disable();
+                }
+            },
         }
     }
     if prepared.is_empty() {
