@@ -35,7 +35,17 @@ unsafe fn destroy_swapchain_inner(
             }));
         }
         if let Some(surface) = restore_surface {
-            restore_surface_window(surface);
+            let another_virtual_swapchain = swapchains()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .any(|state| {
+                    let state = state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.surface == surface && state.virtual_images.is_some()
+                });
+            if !another_virtual_swapchain {
+                restore_surface_window(surface);
+            }
         }
     }));
     if let Some(proc) = destroy {
