@@ -47,6 +47,7 @@ fn release_previous_virtual_swapchain(old_swapchain: vk::SwapchainKHR, surface: 
         });
     if should_restore {
         super::lifetime::restore_surface_window(surface);
+        clear_surface_virtualization(surface);
     }
 }
 

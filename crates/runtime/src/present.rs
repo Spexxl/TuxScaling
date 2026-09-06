@@ -204,6 +204,7 @@ unsafe fn record_spatial_blit(
             },
             &[tuxscaling_vulkan::color_range()],
         );
+        memory_barrier(device, command);
         device.cmd_blit_image(
             command,
             source,
@@ -855,8 +856,8 @@ impl SwapchainRuntime {
                     .src_offsets([
                         vk::Offset3D::default(),
                         vk::Offset3D {
-                            x: self.info.extent.width as i32,
-                            y: self.info.extent.height as i32,
+                            x: motion.visualization.extent.width as i32,
+                            y: motion.visualization.extent.height as i32,
                             z: 1,
                         },
                     ])
