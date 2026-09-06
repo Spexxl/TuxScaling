@@ -1,5 +1,5 @@
 use egui::{ClippedPrimitive, Context, RawInput, Rect, TexturesDelta, vec2};
-use tuxscaling_config::MotionQuality;
+use tuxscaling_config::{DebugView, MotionQuality};
 
 pub const CRATE_NAME: &str = "tuxscaling-overlay";
 
@@ -40,6 +40,22 @@ pub fn resolution_mode(game_extent: [u32; 2], output_extent: [u32; 2]) -> &'stat
         "Native AA"
     } else {
         "Virtual upscale"
+    }
+}
+
+pub fn debug_view_label(view: DebugView) -> &'static str {
+    match view {
+        DebugView::Original => "Original",
+        DebugView::Luminance => "Luminance",
+        DebugView::Motion => "Motion",
+        DebugView::Confidence => "Confidence",
+        DebugView::Reconstructed => "Reconstructed",
+        DebugView::History => "History",
+        DebugView::Reactive => "Reactive",
+        DebugView::Disocclusion => "Disocclusion",
+        DebugView::Depth => "Depth",
+        DebugView::Composition => "Composition",
+        DebugView::Exposure => "Exposure",
     }
 }
 
@@ -259,7 +275,11 @@ impl Default for OverlayState {
 
 #[cfg(test)]
 mod tests {
-    use super::{OverlayState, processing_scale_request, render_smoke_frame, resolution_mode};
+    use super::{
+        OverlayState, debug_view_label, processing_scale_request, render_smoke_frame,
+        resolution_mode,
+    };
+    use tuxscaling_config::DebugView;
 
     #[test]
     fn starts_hidden() {
@@ -295,5 +315,12 @@ mod tests {
         assert_eq!(processing_scale_request(0.49), None);
         assert_eq!(processing_scale_request(1.01), None);
         assert_eq!(processing_scale_request(f32::NAN), None);
+    }
+
+    #[test]
+    fn labels_new_guidance_debug_views() {
+        assert_eq!(debug_view_label(DebugView::Depth), "Depth");
+        assert_eq!(debug_view_label(DebugView::Composition), "Composition");
+        assert_eq!(debug_view_label(DebugView::Exposure), "Exposure");
     }
 }

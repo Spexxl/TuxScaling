@@ -4,8 +4,8 @@ use tuxscaling_motion::MotionEstimator;
 use tuxscaling_vulkan::{Image, image_barrier, memory_barrier};
 
 use crate::{
-    FrameExtent, GuidanceMetadata, GuidanceReset, GuidanceResource, GuidanceView, MotionDirection,
-    MotionUnits, ValidRegion,
+    DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResource,
+    GuidanceView, JitterSample, MotionDirection, MotionUnits, SignalState, ValidRegion,
 };
 
 pub struct GuidanceEstimator {
@@ -14,6 +14,7 @@ pub struct GuidanceEstimator {
     pub disocclusion: Image,
     pub exposure: Image,
     pub depth: Image,
+    pub transparency: Image,
     sampler: vk::Sampler,
     layout: vk::PipelineLayout,
     descriptor_layout: vk::DescriptorSetLayout,
@@ -56,6 +57,9 @@ impl GuidanceEstimator {
                 )
             }?,
             depth: unsafe { Image::new(device, memory, extent, vk::Format::R32_SFLOAT, storage) }?,
+            transparency: unsafe {
+                Image::new(device, memory, extent, vk::Format::R8_UNORM, storage)
+            }?,
             sampler: vk::Sampler::null(),
             layout: vk::PipelineLayout::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
@@ -232,6 +236,7 @@ impl GuidanceEstimator {
                     &self.disocclusion,
                     &self.exposure,
                     &self.depth,
+                    &self.transparency,
                 ] {
                     image_barrier(
                         &self.device,
@@ -241,6 +246,18 @@ impl GuidanceEstimator {
                         vk::ImageLayout::GENERAL,
                     );
                 }
+                self.device.cmd_clear_color_image(
+                    command,
+                    self.transparency.handle,
+                    vk::ImageLayout::GENERAL,
+                    &vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 0.0],
+                    },
+                    &[vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1)],
+                );
                 memory_barrier(&self.device, command);
             }
             self.device
@@ -329,39 +346,70 @@ impl GuidanceEstimator {
             requires_history_reset: !valid || !matches!(reset, GuidanceReset::None),
         };
         let resource =
-            |image: vk::Image, view: vk::ImageView, format: vk::Format| GuidanceResource {
-                image,
-                view,
-                format,
-                metadata,
+            |image: vk::Image, view: vk::ImageView, format: vk::Format, state: SignalState| {
+                GuidanceResource {
+                    image,
+                    view,
+                    format,
+                    metadata,
+                    state,
+                }
             };
         GuidanceView {
             motion: resource(
                 motion.vectors.handle,
                 motion.vectors.view,
                 vk::Format::R16G16_SFLOAT,
+                if valid {
+                    SignalState::Estimated
+                } else {
+                    SignalState::ConstantFallback
+                },
             ),
             confidence: resource(
                 motion.confidence.handle,
                 motion.confidence.view,
                 vk::Format::R8_UNORM,
+                if valid {
+                    SignalState::Estimated
+                } else {
+                    SignalState::ConstantFallback
+                },
             ),
             disocclusion: resource(
                 self.disocclusion.handle,
                 self.disocclusion.view,
                 vk::Format::R8_UNORM,
+                SignalState::ConstantFallback,
             ),
             reactive: resource(
                 self.reactive.handle,
                 self.reactive.view,
                 vk::Format::R8_UNORM,
+                SignalState::ConstantFallback,
             ),
             exposure: resource(
                 self.exposure.handle,
                 self.exposure.view,
                 vk::Format::R32_SFLOAT,
+                SignalState::ConstantFallback,
             ),
-            depth: resource(self.depth.handle, self.depth.view, vk::Format::R32_SFLOAT),
+            depth: resource(
+                self.depth.handle,
+                self.depth.view,
+                vk::Format::R32_SFLOAT,
+                SignalState::ConstantFallback,
+            ),
+            transparency_composition: resource(
+                self.transparency.handle,
+                self.transparency.view,
+                vk::Format::R8_UNORM,
+                SignalState::ConstantFallback,
+            ),
+            pre_exposure: 1.0,
+            timing: FrameTiming::default(),
+            jitter: JitterSample::default(),
+            depth_semantics: DepthSemantics::FlatFallback,
             direction: MotionDirection::CurrentToPrevious,
             units: MotionUnits::SourcePixels,
             requires_history_reset: metadata.requires_history_reset,

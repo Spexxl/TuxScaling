@@ -10,6 +10,7 @@ pub struct Config {
     pub quality: String,
     pub toggle_key: String,
     pub debug_view: DebugView,
+    pub jitter_mode: JitterMode,
     pub motion_quality: MotionQuality,
     pub output_resolution: OutputResolution,
     #[serde(alias = "render_scale")]
@@ -30,6 +31,14 @@ pub enum MotionQuality {
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum JitterMode {
+    #[default]
+    Off,
+    ExperimentalHalton8,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DebugView {
     #[default]
     Original,
@@ -40,6 +49,9 @@ pub enum DebugView {
     History,
     Reactive,
     Disocclusion,
+    Depth,
+    Composition,
+    Exposure,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -88,6 +100,7 @@ impl Default for Config {
             quality: "balanced".into(),
             toggle_key: "Insert".into(),
             debug_view: DebugView::Original,
+            jitter_mode: JitterMode::Off,
             motion_quality: MotionQuality::Balanced,
             output_resolution: OutputResolution::Native,
             processing_scale: 1.0,
@@ -124,7 +137,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigError, MotionQuality, OutputResolution};
+    use super::{Config, ConfigError, DebugView, JitterMode, MotionQuality, OutputResolution};
 
     #[test]
     fn applies_defaults() {
@@ -173,6 +186,31 @@ mod tests {
 
         assert_eq!(config.output_resolution, OutputResolution::Native);
         assert_eq!(config.processing_scale, 1.0);
+    }
+
+    #[test]
+    fn defaults_jitter_off_and_parses_experimental_halton_mode() {
+        assert_eq!(Config::default().jitter_mode, JitterMode::Off);
+        assert_eq!(
+            Config::parse("jitter_mode = 'experimental_halton8'")
+                .unwrap()
+                .jitter_mode,
+            JitterMode::ExperimentalHalton8
+        );
+        assert_eq!(
+            Config::parse("debug_view = 'depth'").unwrap().debug_view,
+            DebugView::Depth
+        );
+        assert_eq!(
+            Config::parse("debug_view = 'composition'")
+                .unwrap()
+                .debug_view,
+            DebugView::Composition
+        );
+        assert_eq!(
+            Config::parse("debug_view = 'exposure'").unwrap().debug_view,
+            DebugView::Exposure
+        );
     }
 
     #[test]

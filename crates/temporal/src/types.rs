@@ -1,4 +1,88 @@
+use std::time::Duration;
+
 use ash::vk;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SignalState {
+    Estimated,
+    ConstantFallback,
+    #[default]
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DepthSemantics {
+    RelativeNearIsOne,
+    #[default]
+    FlatFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameTiming {
+    pub raw: Duration,
+    pub validated: Duration,
+    pub smoothed: Duration,
+}
+
+impl Default for FrameTiming {
+    fn default() -> Self {
+        let nominal = Duration::from_micros(16_667);
+        Self {
+            raw: nominal,
+            validated: nominal,
+            smoothed: nominal,
+        }
+    }
+}
+
+impl FrameTiming {
+    pub const fn is_finite(self) -> bool {
+        // Duration stores an integer number of nanoseconds, so every value is
+        // finite.  Keeping this predicate on the contract makes validation
+        // explicit and leaves room for a future representation change.
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JitterSample {
+    pub current: [f32; 2],
+    pub previous: [f32; 2],
+    pub phase: u32,
+}
+
+impl Default for JitterSample {
+    fn default() -> Self {
+        Self {
+            current: [0.0, 0.0],
+            previous: [0.0, 0.0],
+            phase: 0,
+        }
+    }
+}
+
+impl JitterSample {
+    pub const fn is_finite(self) -> bool {
+        self.current[0].is_finite()
+            && self.current[1].is_finite()
+            && self.previous[0].is_finite()
+            && self.previous[1].is_finite()
+    }
+
+    pub const fn signal_state(self) -> SignalState {
+        if self.is_finite()
+            && !(self.current[0] == 0.0
+                && self.current[1] == 0.0
+                && self.previous[0] == 0.0
+                && self.previous[1] == 0.0
+                && self.phase == 0)
+        {
+            SignalState::Estimated
+        } else {
+            SignalState::Unavailable
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameExtent {
@@ -94,6 +178,7 @@ pub struct GuidanceResource {
     pub view: vk::ImageView,
     pub format: vk::Format,
     pub metadata: GuidanceMetadata,
+    pub state: SignalState,
 }
 
 impl GuidanceResource {
@@ -115,6 +200,11 @@ pub struct GuidanceView {
     pub reactive: GuidanceResource,
     pub exposure: GuidanceResource,
     pub depth: GuidanceResource,
+    pub transparency_composition: GuidanceResource,
+    pub pre_exposure: f32,
+    pub timing: FrameTiming,
+    pub jitter: JitterSample,
+    pub depth_semantics: DepthSemantics,
     pub direction: MotionDirection,
     pub units: MotionUnits,
     pub requires_history_reset: bool,
@@ -128,6 +218,7 @@ impl GuidanceView {
             && self.reactive.format == vk::Format::R8_UNORM
             && self.exposure.format == vk::Format::R32_SFLOAT
             && self.depth.format == vk::Format::R32_SFLOAT
+            && self.transparency_composition.format == vk::Format::R8_UNORM
     }
 
     pub fn is_valid_for(self, frame_id: u64, extent: FrameExtent) -> bool {
@@ -138,8 +229,13 @@ impl GuidanceView {
             && self.reactive.is_valid_for(frame_id, extent)
             && self.exposure.is_valid_for(frame_id, extent)
             && self.depth.is_valid_for(frame_id, extent)
+            && self.transparency_composition.is_valid_for(frame_id, extent)
             && matches!(self.direction, MotionDirection::CurrentToPrevious)
             && matches!(self.units, MotionUnits::SourcePixels)
+            && self.timing.is_finite()
+            && self.pre_exposure.is_finite()
+            && self.pre_exposure > 0.0
+            && self.jitter.is_finite()
     }
 }
 
@@ -154,6 +250,7 @@ mod tests {
             view: vk::ImageView::from_raw(2),
             format,
             metadata,
+            state: SignalState::ConstantFallback,
         }
     }
 
@@ -184,6 +281,11 @@ mod tests {
             reactive: resource(metadata, vk::Format::R8_UNORM),
             exposure: resource(metadata, vk::Format::R32_SFLOAT),
             depth: resource(metadata, vk::Format::R32_SFLOAT),
+            transparency_composition: resource(metadata, vk::Format::R8_UNORM),
+            pre_exposure: 1.0,
+            timing: FrameTiming::default(),
+            jitter: JitterSample::default(),
+            depth_semantics: DepthSemantics::FlatFallback,
             direction: MotionDirection::CurrentToPrevious,
             units: MotionUnits::SourcePixels,
             requires_history_reset: false,
