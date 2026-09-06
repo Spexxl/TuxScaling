@@ -91,6 +91,52 @@ fn quality_budget(quality: tuxscaling_config::MotionQuality) -> f32 {
     }
 }
 
+pub fn map_damage_rect(
+    game_extent: vk::Extent2D,
+    output_extent: vk::Extent2D,
+    rect: vk::Rect2D,
+) -> vk::Rect2D {
+    if game_extent == output_extent || game_extent.width == 0 || game_extent.height == 0 {
+        return rect;
+    }
+    let viewport = content_viewport(game_extent, output_extent);
+    let left = (viewport.offset[0] * output_extent.width as f32).round() as i32;
+    let top = (viewport.offset[1] * output_extent.height as f32).round() as i32;
+    let width = (viewport.size[0] * output_extent.width as f32).round() as i32;
+    let height = (viewport.size[1] * output_extent.height as f32).round() as i32;
+    let right = left.saturating_add(width.max(0));
+    let bottom = top.saturating_add(height.max(0));
+    let source_right = rect.offset.x.saturating_add(rect.extent.width as i32);
+    let source_bottom = rect.offset.y.saturating_add(rect.extent.height as i32);
+    let x0 = left
+        .saturating_add(
+            (rect.offset.x as f64 * width as f64 / game_extent.width as f64).floor() as i32,
+        )
+        .clamp(left, right);
+    let y0 = top
+        .saturating_add(
+            (rect.offset.y as f64 * height as f64 / game_extent.height as f64).floor() as i32,
+        )
+        .clamp(top, bottom);
+    let x1 = left
+        .saturating_add(
+            (source_right as f64 * width as f64 / game_extent.width as f64).ceil() as i32,
+        )
+        .clamp(left, right);
+    let y1 = top
+        .saturating_add(
+            (source_bottom as f64 * height as f64 / game_extent.height as f64).ceil() as i32,
+        )
+        .clamp(top, bottom);
+    vk::Rect2D {
+        offset: vk::Offset2D { x: x0, y: y0 },
+        extent: vk::Extent2D {
+            width: x1.saturating_sub(x0) as u32,
+            height: y1.saturating_sub(y0) as u32,
+        },
+    }
+}
+
 unsafe fn record_spatial_fallback(
     device: &ash::Device,
     command: vk::CommandBuffer,
@@ -317,6 +363,13 @@ impl SwapchainRuntime {
     }
     pub fn disable(&mut self) {
         self.enabled = false;
+    }
+    pub fn map_damage_rect(&self, rect: vk::Rect2D) -> vk::Rect2D {
+        map_damage_rect(
+            self.temporal.resolution.game_extent,
+            self.temporal.resolution.output_extent,
+            rect,
+        )
     }
     unsafe fn initialize(&mut self, queue: vk::Queue, family: u32) -> Result<(), vk::Result> {
         if let Some(selected) = self.queue {

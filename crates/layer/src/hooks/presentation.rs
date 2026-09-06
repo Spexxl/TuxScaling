@@ -175,10 +175,92 @@ unsafe fn queue_present_inner(
         let mut modified = *info;
         modified.wait_semaphore_count = 1;
         modified.p_wait_semaphores = &render_complete;
+        let mut mapped_rectangles = Vec::<Vec<vk::RectLayerKHR>>::new();
+        let mapped_regions: Vec<vk::PresentRegionKHR<'_>>;
+        let mut mapped_present_regions = vk::PresentRegionsKHR::default();
         if unsafe { uses_virtual_output(info) }
             && unsafe { has_only_incremental_present(info.p_next) }
         {
-            modified.p_next = std::ptr::null();
+            let source = unsafe { &*info.p_next.cast::<vk::PresentRegionsKHR<'_>>() };
+            let valid = source.swapchain_count == info.swapchain_count
+                && (source.swapchain_count == 0 || !source.p_regions.is_null());
+            if valid {
+                let source_regions = unsafe {
+                    std::slice::from_raw_parts(source.p_regions, source.swapchain_count as usize)
+                };
+                let presented = unsafe {
+                    std::slice::from_raw_parts(info.p_swapchains, info.swapchain_count as usize)
+                };
+                let states = swapchains()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                for (swapchain, region) in presented.iter().zip(source_regions) {
+                    let state = states.get(swapchain).cloned();
+                    let virtual_output = state.as_ref().is_some_and(|state| {
+                        state
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .virtual_images
+                            .is_some()
+                    });
+                    let region_rectangles = if region.rectangle_count == 0 {
+                        Vec::new()
+                    } else if region.p_rectangles.is_null() {
+                        mapped_rectangles.clear();
+                        break;
+                    } else {
+                        let rectangles = unsafe {
+                            std::slice::from_raw_parts(
+                                region.p_rectangles,
+                                region.rectangle_count as usize,
+                            )
+                        };
+                        rectangles
+                            .iter()
+                            .map(|rectangle| {
+                                if virtual_output {
+                                    state.as_ref().and_then(|state| state.lock().ok()).map_or(
+                                        *rectangle,
+                                        |state| {
+                                            let mapped =
+                                                state.overlay.map_damage_rect(vk::Rect2D {
+                                                    offset: rectangle.offset,
+                                                    extent: rectangle.extent,
+                                                });
+                                            vk::RectLayerKHR {
+                                                offset: mapped.offset,
+                                                extent: mapped.extent,
+                                                layer: rectangle.layer,
+                                            }
+                                        },
+                                    )
+                                } else {
+                                    *rectangle
+                                }
+                            })
+                            .collect()
+                    };
+                    mapped_rectangles.push(region_rectangles);
+                }
+                if mapped_rectangles.len() == info.swapchain_count as usize {
+                    mapped_regions = mapped_rectangles
+                        .iter()
+                        .map(|rectangles| vk::PresentRegionKHR {
+                            rectangle_count: rectangles.len() as u32,
+                            p_rectangles: rectangles.as_ptr(),
+                            _marker: std::marker::PhantomData,
+                        })
+                        .collect();
+                    mapped_present_regions.swapchain_count = mapped_regions.len() as u32;
+                    mapped_present_regions.p_regions = mapped_regions.as_ptr();
+                    modified.p_next =
+                        (&mapped_present_regions as *const vk::PresentRegionsKHR<'_>).cast();
+                } else {
+                    modified.p_next = std::ptr::null();
+                }
+            } else {
+                modified.p_next = std::ptr::null();
+            }
         }
         let result = unsafe { present(queue, &modified) };
         if result != vk::Result::SUCCESS && !info.p_swapchains.is_null() {

@@ -43,7 +43,9 @@ impl Default for Runtime {
 
 #[cfg(test)]
 mod tests {
-    use super::{PresentDecision, Runtime, RuntimeState, SwapchainImages, TemporalPipeline};
+    use super::{
+        PresentDecision, Runtime, RuntimeState, SwapchainImages, TemporalPipeline, map_damage_rect,
+    };
     use ash::vk;
     use tuxscaling_upscaler::ResolutionPlan;
 
@@ -86,5 +88,65 @@ mod tests {
         let pipeline = TemporalPipeline::for_test(plan);
 
         assert_eq!(pipeline.resolution, plan);
+    }
+
+    #[test]
+    fn maps_incremental_damage_into_the_aspect_fit_viewport() {
+        let mapped = map_damage_rect(
+            vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            vk::Extent2D {
+                width: 1920,
+                height: 1200,
+            },
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 640, y: 360 },
+                extent: vk::Extent2D {
+                    width: 640,
+                    height: 360,
+                },
+            },
+        );
+
+        assert_eq!(mapped.offset, vk::Offset2D { x: 960, y: 600 });
+        assert_eq!(
+            mapped.extent,
+            vk::Extent2D {
+                width: 960,
+                height: 540
+            }
+        );
+    }
+
+    #[test]
+    fn clips_damage_to_the_content_viewport() {
+        let mapped = map_damage_rect(
+            vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            vk::Extent2D {
+                width: 1920,
+                height: 1200,
+            },
+            vk::Rect2D {
+                offset: vk::Offset2D { x: -50, y: -20 },
+                extent: vk::Extent2D {
+                    width: 100,
+                    height: 50,
+                },
+            },
+        );
+
+        assert_eq!(mapped.offset, vk::Offset2D { x: 0, y: 60 });
+        assert_eq!(
+            mapped.extent,
+            vk::Extent2D {
+                width: 75,
+                height: 45
+            }
+        );
     }
 }
