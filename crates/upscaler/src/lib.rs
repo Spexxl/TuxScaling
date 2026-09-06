@@ -45,6 +45,13 @@ pub struct ResolutionPlan {
     pub game_extent: vk::Extent2D,
     pub processing_extent: vk::Extent2D,
     pub output_extent: vk::Extent2D,
+    pub presentation: PresentationMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentationMode {
+    Direct,
+    Virtual,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -77,6 +84,11 @@ impl ResolutionPlan {
             game_extent,
             processing_extent: scaled_extent(game_extent, processing_scale),
             output_extent,
+            presentation: if game_extent == output_extent {
+                PresentationMode::Direct
+            } else {
+                PresentationMode::Virtual
+            },
         }
     }
 }
@@ -96,8 +108,8 @@ pub trait UpscalerBackend {
 mod tests {
     use super::content_viewport;
     use super::{
-        BackendCapabilities, BackendError, BackendId, InputResolution, ResolutionPlan,
-        UpscalerBackend,
+        BackendCapabilities, BackendError, BackendId, InputResolution, PresentationMode,
+        ResolutionPlan, UpscalerBackend,
     };
     use ash::vk;
 
@@ -157,6 +169,7 @@ mod tests {
 
         assert_eq!(plan.game_extent, plan.processing_extent);
         assert_eq!(plan.output_extent.width, 1920);
+        assert_eq!(plan.presentation, PresentationMode::Virtual);
     }
 
     #[test]
@@ -180,6 +193,24 @@ mod tests {
                 height: 540,
             }
         );
+        assert_eq!(plan.presentation, PresentationMode::Virtual);
+    }
+
+    #[test]
+    fn equal_game_and_output_extents_use_native_aa_mode() {
+        let plan = ResolutionPlan::new(
+            vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            },
+            vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            },
+            1.0,
+        );
+
+        assert_eq!(plan.presentation, PresentationMode::Direct);
     }
 
     #[test]
