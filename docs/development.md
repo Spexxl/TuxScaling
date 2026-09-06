@@ -25,7 +25,7 @@ cargo xtask gpu-check
 cargo xtask smoke
 ```
 
-`cargo xtask check` is the preferred host-only command. `gpu-check` runs ignored GPU tests. `smoke` exercises multiple swapchains, grouped presents, resize, capture, optical flow, and validation synchronization.
+`cargo xtask check` is the preferred host-only command. `gpu-check` runs ignored GPU tests. `smoke` exercises multiple swapchains, grouped presents, resize, capture, optical flow, virtual-output fallback, and validation synchronization.
 
 ## Native boundary
 
@@ -56,7 +56,7 @@ debug_view = "original"
 
 `processing_scale` is optional internal work reduction after capture. It does not change the game resolution or the output resolution; its default is `1.0`. The legacy `render_scale` key is accepted during the migration.
 
-The fixed quality targets are Ultra (12 ms), High (8 ms), Balanced (4 ms), and Performance (2.5 ms) for temporal work at 1080p. The overlay reports a warning when measured work exceeds the selected target; it never changes the preset automatically.
+The fixed quality targets are Ultra (12 ms), High (8 ms), Balanced (4 ms), and Performance (2.5 ms) for temporal work at 1080p. The overlay reports capture, luma, pyramid, forward/backward flow, confidence, scene, invalidate, reactive, exposure, reconstruction, and overlay timings. It warns when measured work exceeds the selected target; it never changes the preset automatically.
 
 ## Language and naming policy
 

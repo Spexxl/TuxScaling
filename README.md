@@ -14,8 +14,8 @@ The repository captures supported swapchains, estimates optical flow and tempora
 - Native C or C++ code is isolated behind a small C ABI for optional SDK adapters.
 - Inputs are always estimated from captured color frames; game-native temporal inputs are not intercepted.
 - Guidance includes source-pixel current-to-previous motion, confidence, temporal reactive and disocclusion masks, log-luminance exposure, and a flat depth fallback. Jitter is always zero.
-- The default `Balanced` preset is fixed for the session. `Ultra`, `High`, and `Performance` trade optical-flow work for precision; the overlay applies changes at a frame boundary and reports capture, flow, guidance, reconstruction, and overlay timings.
-- The reference backend uses a configurable 50–100% internal scale (default 67%), neighborhood clamping, confidence-weighted accumulation, and history reset on first frame, long pause, presentation failure, resize, or preset change.
+- The default `Balanced` preset is fixed for the session. `Ultra`, `High`, and `Performance` trade optical-flow work for precision; the overlay applies changes at a frame boundary and reports per-pass GPU timings.
+- The reference backend uses an optional 50–100% internal processing scale (default 100%), neighborhood clamping, confidence-weighted accumulation, and history reset on first frame, long pause, presentation failure, resize, or preset change.
 - X11/XWayland input is optional at runtime. `Insert` toggles the overlay and pointer/keyboard grabs are released on close and destruction. Native Wayland remains configuration-only in this milestone.
 - The injected runtime uses `ash` directly and does not use `wgpu`, `vulkano`, `eframe`, or `winit`.
 - The initial milestone does not include Windows, DirectX, OpenGL, frame generation, a standalone GUI, or a required FSR 4 runtime.
