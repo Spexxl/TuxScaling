@@ -32,4 +32,8 @@ compile_commands.json
 .idea/
 .vscode/
 
+# Local agent workspaces
+.worktrees/
+.superpowers/
+
 # Keep Cargo.lock tracked: TuxScaling ships binaries and a Vulkan layer.
