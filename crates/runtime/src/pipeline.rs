@@ -315,6 +315,7 @@ mod tests {
 
         assert_eq!(timing.raw, Duration::from_micros(20_000));
         assert_eq!(timing.validated, Duration::from_micros(20_000));
+        assert_eq!(timing.smoothed, Duration::from_nanos(17_000_300));
         assert_eq!(reset, None);
         assert!(timing.smoothed > Duration::from_micros(16_667));
         assert!(timing.smoothed < Duration::from_micros(20_000));
