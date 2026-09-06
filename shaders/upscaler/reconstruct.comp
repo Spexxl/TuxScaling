@@ -10,7 +10,8 @@ layout(r8, binding = 4) uniform readonly image2D reactive_image;
 layout(r8, binding = 5) uniform readonly image2D disocclusion_image;
 layout(r32f, binding = 6) uniform readonly image2D exposure_image;
 layout(r32f, binding = 7) uniform readonly image2D depth_image;
-layout(binding = 8) uniform writeonly image2D output_image;
+layout(r8, binding = 8) uniform readonly image2D composition_image;
+layout(binding = 9) uniform writeonly image2D output_image;
 
 layout(push_constant) uniform Params {
     uint width;
@@ -68,9 +69,18 @@ void main() {
     );
     vec4 current = texture(input_frame, input_uv);
     if (p.debug_view != 0) {
-        float value = p.debug_view == 1
-            ? imageLoad(reactive_image, input_pixel).r
-            : imageLoad(disocclusion_image, input_pixel).r;
+        float value = 0.0;
+        if (p.debug_view == 1) {
+            value = imageLoad(reactive_image, input_pixel).r;
+        } else if (p.debug_view == 2) {
+            value = imageLoad(disocclusion_image, input_pixel).r;
+        } else if (p.debug_view == 3) {
+            value = imageLoad(depth_image, input_pixel).r;
+        } else if (p.debug_view == 4) {
+            value = imageLoad(composition_image, input_pixel).r;
+        } else if (p.debug_view == 5) {
+            value = imageLoad(exposure_image, ivec2(0)).r;
+        }
         imageStore(output_image, pixel, vec4(value, value, value, 1.0));
         return;
     }

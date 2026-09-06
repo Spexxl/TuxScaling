@@ -70,7 +70,7 @@ impl ReferenceUpscaler {
                 None,
             )
         }?;
-        let bindings = (0..9)
+        let bindings = (0..10)
             .map(|binding| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(binding)
@@ -100,7 +100,7 @@ impl ReferenceUpscaler {
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_IMAGE,
-                            descriptor_count: (7 * image_count.max(1)) as u32,
+                            descriptor_count: (8 * image_count.max(1)) as u32,
                         },
                     ]),
                 None,
@@ -131,7 +131,8 @@ impl ReferenceUpscaler {
             (5, guidance.disocclusion.view),
             (6, guidance.exposure.view),
             (7, guidance.depth.view),
-            (8, result.output.view),
+            (8, guidance.transparency_composition.view),
+            (9, result.output.view),
         ];
         let mut writes = Vec::with_capacity(result.descriptor_sets.len() * (2 + storage.len()));
         for descriptor_set in &result.descriptor_sets {

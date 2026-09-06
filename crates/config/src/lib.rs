@@ -211,6 +211,9 @@ mod tests {
             Config::parse("debug_view = 'exposure'").unwrap().debug_view,
             DebugView::Exposure
         );
+        assert_eq!(DebugView::Depth as u32, 8);
+        assert_eq!(DebugView::Composition as u32, 9);
+        assert_eq!(DebugView::Exposure as u32, 10);
     }
 
     #[test]

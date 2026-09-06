@@ -66,15 +66,18 @@ pub mod quality {
         height: u32,
         dx: f32,
         dy: f32,
-    ) -> (Vec<[f32; 4]>, Vec<[f32; 2]>) {
+    ) -> (Vec<[f32; 4]>, Vec<[f32; 2]>, Vec<bool>) {
         let mut current = Vec::with_capacity(previous.len());
         let mut motion = Vec::with_capacity(previous.len());
+        let mut valid = Vec::with_capacity(previous.len());
         for y in 0..height {
             for x in 0..width {
-                let source_x = (x as f32 - dx)
+                let source_x_unclamped = x as f32 - dx;
+                let source_y_unclamped = y as f32 - dy;
+                let source_x = source_x_unclamped
                     .round()
                     .clamp(0.0, width.saturating_sub(1) as f32);
-                let source_y = (y as f32 - dy)
+                let source_y = source_y_unclamped
                     .round()
                     .clamp(0.0, height.saturating_sub(1) as f32);
                 let index = source_y as usize * width as usize + source_x as usize;
@@ -82,9 +85,15 @@ pub mod quality {
                 // Motion is explicitly current-to-previous, matching the
                 // public guidance contract.
                 motion.push([-dx, -dy]);
+                valid.push(
+                    source_x_unclamped >= 0.0
+                        && source_x_unclamped < width as f32
+                        && source_y_unclamped >= 0.0
+                        && source_y_unclamped < height as f32,
+                );
             }
         }
-        (current, motion)
+        (current, motion, valid)
     }
 
     fn empty_labels(len: usize) -> (Vec<bool>, Vec<bool>, Vec<bool>, Vec<bool>) {
@@ -98,9 +107,9 @@ pub mod quality {
 
     fn base_translation(width: u32, height: u32, dx: f32, dy: f32, seed: u32) -> SequenceFixture {
         let previous = scene(width, height, seed);
-        let (current, motion) = shifted(&previous, width, height, dx, dy);
+        let (current, motion, valid) = shifted(&previous, width, height, dx, dy);
         let len = previous.len();
-        let (valid, occlusion, transparency, hud) = empty_labels(len);
+        let (_, occlusion, transparency, hud) = empty_labels(len);
         SequenceFixture {
             width,
             height,
@@ -133,20 +142,29 @@ pub mod quality {
         let dy = -1.5;
         let mut current = Vec::with_capacity(previous.len());
         let mut motion = Vec::with_capacity(previous.len());
+        let mut valid = Vec::with_capacity(previous.len());
         for y in 0..height {
             for x in 0..width {
-                let source_x = (cx + (x as f32 - cx) / scale - dx)
+                let source_x_unclamped = cx + (x as f32 - cx) / scale - dx;
+                let source_y_unclamped = cy + (y as f32 - cy) / scale - dy;
+                let source_x = source_x_unclamped
                     .round()
                     .clamp(0.0, width.saturating_sub(1) as f32);
-                let source_y = (cy + (y as f32 - cy) / scale - dy)
+                let source_y = source_y_unclamped
                     .round()
                     .clamp(0.0, height.saturating_sub(1) as f32);
                 current.push(previous[source_y as usize * width as usize + source_x as usize]);
                 motion.push([source_x - x as f32, source_y - y as f32]);
+                valid.push(
+                    source_x_unclamped >= 0.0
+                        && source_x_unclamped < width as f32
+                        && source_y_unclamped >= 0.0
+                        && source_y_unclamped < height as f32,
+                );
             }
         }
         let len = previous.len();
-        let (valid, occlusion, transparency, hud) = empty_labels(len);
+        let (_, occlusion, transparency, hud) = empty_labels(len);
         SequenceFixture {
             width,
             height,
@@ -174,7 +192,10 @@ pub mod quality {
                 let index = y as usize * width as usize + x as usize;
                 result.motion[index] = [-7.0, -3.0];
                 result.depth[index] = 1.0;
-                result.current[index] = result.previous[index];
+                let source_x = (x as i32 - 7).clamp(0, width.saturating_sub(1) as i32) as usize;
+                let source_y = (y as i32 - 3).clamp(0, height.saturating_sub(1) as i32) as usize;
+                result.current[index] = result.previous[source_y * width as usize + source_x];
+                result.valid[index] = x >= 7 && y >= 3;
             }
         }
         result
@@ -259,19 +280,43 @@ pub mod quality {
     }
 
     pub fn endpoint_error(estimated: &[[f32; 2]], reference: &[[f32; 2]]) -> f32 {
-        let count = estimated.len().min(reference.len());
+        endpoint_error_masked(
+            estimated,
+            reference,
+            &vec![true; estimated.len().min(reference.len())],
+        )
+    }
+
+    pub fn endpoint_error_masked(
+        estimated: &[[f32; 2]],
+        reference: &[[f32; 2]],
+        valid: &[bool],
+    ) -> f32 {
+        let count = estimated.len().min(reference.len()).min(valid.len());
         if count == 0 {
             return 0.0;
         }
-        estimated
+        let mut total = 0.0;
+        let mut samples = 0;
+        for ((estimate, expected), is_valid) in estimated
             .iter()
             .zip(reference.iter())
+            .zip(valid.iter())
             .take(count)
-            .map(|(estimate, expected)| {
+        {
+            if !is_valid {
+                continue;
+            }
+            total += {
                 ((estimate[0] - expected[0]).powi(2) + (estimate[1] - expected[1]).powi(2)).sqrt()
-            })
-            .sum::<f32>()
-            / count as f32
+            };
+            samples += 1;
+        }
+        if samples == 0 {
+            0.0
+        } else {
+            total / samples as f32
+        }
     }
 
     pub fn epe(estimated: &[[f32; 2]], reference: &[[f32; 2]]) -> f32 {
@@ -280,6 +325,10 @@ pub mod quality {
 
     pub fn mean_epe(estimated: &[[f32; 2]], reference: &[[f32; 2]]) -> f32 {
         endpoint_error(estimated, reference)
+    }
+
+    pub fn epe_masked(estimated: &[[f32; 2]], reference: &[[f32; 2]], valid: &[bool]) -> f32 {
+        endpoint_error_masked(estimated, reference, valid)
     }
 
     /// Percentile accepts either a fraction (`0.95`) or a percentage (`95`).

@@ -3,8 +3,8 @@ mod sequence;
 
 use ash::vk;
 use sequence::{
-    affine_motion, auroc, depth_order, endpoint_error, ev_error, f1, fade, flash, hud, image_error,
-    layered_parallax, occlusion, percentile, scene_cut, translation, transparency,
+    affine_motion, auroc, depth_order, endpoint_error_masked, ev_error, f1, fade, flash, hud,
+    image_error, layered_parallax, occlusion, percentile, scene_cut, translation, transparency,
 };
 use std::time::Duration;
 use tuxscaling_temporal::{
@@ -36,21 +36,9 @@ fn view() -> GuidanceView {
     GuidanceView {
         motion: resource(metadata, vk::Format::R16G16_SFLOAT, SignalState::Estimated),
         confidence: resource(metadata, vk::Format::R8_UNORM, SignalState::Estimated),
-        disocclusion: resource(
-            metadata,
-            vk::Format::R8_UNORM,
-            SignalState::ConstantFallback,
-        ),
-        reactive: resource(
-            metadata,
-            vk::Format::R8_UNORM,
-            SignalState::ConstantFallback,
-        ),
-        exposure: resource(
-            metadata,
-            vk::Format::R32_SFLOAT,
-            SignalState::ConstantFallback,
-        ),
+        disocclusion: resource(metadata, vk::Format::R8_UNORM, SignalState::Estimated),
+        reactive: resource(metadata, vk::Format::R8_UNORM, SignalState::Estimated),
+        exposure: resource(metadata, vk::Format::R32_SFLOAT, SignalState::Estimated),
         depth: resource(
             metadata,
             vk::Format::R32_SFLOAT,
@@ -120,6 +108,13 @@ fn off_jitter_and_flat_depth_are_explicit_fallbacks() {
     assert_eq!(view.jitter.signal_state(), SignalState::Unavailable);
     assert_eq!(view.depth_semantics, DepthSemantics::FlatFallback);
     assert_eq!(view.depth.state, SignalState::ConstantFallback);
+    assert_eq!(view.disocclusion.state, SignalState::Estimated);
+    assert_eq!(view.reactive.state, SignalState::Estimated);
+    assert_eq!(view.exposure.state, SignalState::Estimated);
+    assert_eq!(
+        view.transparency_composition.state,
+        SignalState::ConstantFallback
+    );
 }
 
 #[test]
@@ -141,6 +136,23 @@ fn procedural_fixtures_have_deterministic_ground_truth_labels() {
             .iter()
             .any(|motion| *motion == [-7.0, -3.0])
     );
+    for y in 12..36 {
+        for x in 16..48 {
+            let index = y * 64 + x;
+            let source_x = (x as i32 - 7).clamp(0, 63) as usize;
+            let source_y = (y as i32 - 3).clamp(0, 47) as usize;
+            assert_eq!(
+                parallax_fixture.current[index],
+                parallax_fixture.previous[source_y * 64 + source_x]
+            );
+            assert!(parallax_fixture.valid[index]);
+        }
+    }
+
+    assert!(!translation_fixture.valid[0]);
+    assert!(!translation_fixture.valid[4]);
+    assert!(!translation_fixture.valid[47 * 64]);
+    assert!(translation_fixture.valid[20 * 64 + 20]);
 
     assert!(occlusion(64, 48).occlusion.iter().any(|label| *label));
     assert!(transparency(64, 48).transparency.iter().any(|label| *label));
@@ -172,7 +184,9 @@ fn procedural_fixtures_have_deterministic_ground_truth_labels() {
 fn quality_metrics_report_expected_values() {
     let truth = vec![[1.0, 0.0], [0.0, -2.0], [3.0, 4.0]];
     let estimate = vec![[1.0, 0.0], [0.0, -1.0], [3.0, 4.0]];
-    assert!((endpoint_error(&estimate, &truth) - 1.0 / 3.0).abs() < 1e-6);
+    assert!(
+        (endpoint_error_masked(&estimate, &truth, &[true, true, true]) - 1.0 / 3.0).abs() < 1e-6
+    );
     assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0], 0.5), 2.5);
     assert_eq!(
         f1(&[true, true, false, false], &[true, false, true, false]),
@@ -185,4 +199,18 @@ fn quality_metrics_report_expected_values() {
         image_error(&[[0.0; 4], [1.0; 4]], &[[0.0; 4], [0.5; 4]]),
         0.125
     );
+
+    let fixture = translation(16, 12);
+    let mut estimated = fixture.motion.clone();
+    estimated[0] = [100.0, 100.0];
+    assert_eq!(
+        endpoint_error_masked(&estimated, &fixture.motion, &fixture.valid),
+        0.0
+    );
+    let parallax = layered_parallax(16, 12);
+    assert_eq!(depth_order(&parallax.depth, &parallax.depth), 1.0);
+    let occluded = occlusion(16, 12);
+    assert_eq!(f1(&occluded.occlusion, &occluded.occlusion), 1.0);
+    assert_eq!(auroc(&[1.0, 0.0], &[true, false]), 1.0);
+    assert!(ev_error(flash(16, 12).exposure_ev, 0.0) > 0.0);
 }

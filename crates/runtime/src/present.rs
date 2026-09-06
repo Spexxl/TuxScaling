@@ -68,10 +68,30 @@ fn mode_name(mode: u32) -> &'static str {
         "History",
         "Reactive",
         "Disocclusion",
+        "Depth",
+        "Composition",
+        "Exposure",
     ]
     .get(mode as usize)
     .copied()
     .unwrap_or("Original")
+}
+
+fn debug_mode_id(name: &str) -> Option<u32> {
+    Some(match name {
+        "original" => 0,
+        "luminance" => 1,
+        "motion" => 2,
+        "confidence" => 3,
+        "reconstructed" => 4,
+        "history" => 5,
+        "reactive" => 6,
+        "disocclusion" => 7,
+        "depth" => 8,
+        "composition" => 9,
+        "exposure" => 10,
+        _ => return None,
+    })
 }
 
 fn motion_quality(quality: tuxscaling_config::MotionQuality) -> MotionQuality {
@@ -332,19 +352,11 @@ impl SwapchainRuntime {
         }?;
         let image_count = images.output_images.len();
         let mode = match std::env::var("TUXSCALING_VIEW").as_deref() {
-            Ok("luminance") => 1,
-            Ok("motion") => 2,
-            Ok("confidence") => 3,
-            Ok("reconstructed") => 4,
-            Ok("history") => 5,
-            Ok("reactive") => 6,
-            Ok("disocclusion") => 7,
-            Ok("original") => 0,
+            Ok(value) => debug_mode_id(value).ok_or_else(|| {
+                eprintln!("TuxScaling: unsupported TUXSCALING_VIEW={value}");
+                vk::Result::ERROR_INITIALIZATION_FAILED
+            })?,
             Err(_) => config.debug_view as u32,
-            Ok(other) => {
-                eprintln!("TuxScaling: unsupported TUXSCALING_VIEW={other}");
-                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-            }
         };
         let diagnostic_resolution = temporal.resolution;
         Ok(Self {
@@ -828,6 +840,9 @@ impl SwapchainRuntime {
                     match self.mode {
                         6 => 1,
                         7 => 2,
+                        8 => 3,
+                        9 => 4,
+                        10 => 5,
                         _ => 0,
                     },
                 );
@@ -1117,5 +1132,19 @@ impl Drop for SwapchainRuntime {
             self.device.destroy_command_pool(self.pool, None);
             self.device.destroy_query_pool(self.temporal.queries, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::debug_mode_id;
+
+    #[test]
+    fn assigns_stable_debug_mode_ids_for_guidance_views() {
+        assert_eq!(debug_mode_id("original"), Some(0));
+        assert_eq!(debug_mode_id("depth"), Some(8));
+        assert_eq!(debug_mode_id("composition"), Some(9));
+        assert_eq!(debug_mode_id("exposure"), Some(10));
+        assert_eq!(debug_mode_id("unsupported"), None);
     }
 }

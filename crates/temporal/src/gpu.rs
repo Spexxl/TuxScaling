@@ -380,19 +380,19 @@ impl GuidanceEstimator {
                 self.disocclusion.handle,
                 self.disocclusion.view,
                 vk::Format::R8_UNORM,
-                SignalState::ConstantFallback,
+                SignalState::Estimated,
             ),
             reactive: resource(
                 self.reactive.handle,
                 self.reactive.view,
                 vk::Format::R8_UNORM,
-                SignalState::ConstantFallback,
+                SignalState::Estimated,
             ),
             exposure: resource(
                 self.exposure.handle,
                 self.exposure.view,
                 vk::Format::R32_SFLOAT,
-                SignalState::ConstantFallback,
+                SignalState::Estimated,
             ),
             depth: resource(
                 self.depth.handle,
