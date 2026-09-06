@@ -108,6 +108,8 @@ type GrabPointer = unsafe extern "C" fn(
 type UngrabPointer = unsafe extern "C" fn(*mut Display, c_ulong) -> c_int;
 type Flush = unsafe extern "C" fn(*mut Display) -> c_int;
 type CloseDisplay = unsafe extern "C" fn(*mut Display) -> c_int;
+type Sync = unsafe extern "C" fn(*mut Display, c_int) -> c_int;
+type SelectInput = unsafe extern "C" fn(*mut Display, c_ulong, c_long) -> c_int;
 type GrabKey =
     unsafe extern "C" fn(*mut Display, c_int, c_uint, c_ulong, c_int, c_int, c_int) -> c_int;
 
@@ -166,7 +168,13 @@ impl X11Input {
         let root = unsafe { root_window(display, screen) };
         let insert_keycode = unsafe { keysym_to_keycode(display, INSERT_KEYSYM) };
         let grab_key = load::<GrabKey>(&library, b"XGrabKey\0")?;
+        let select_input = load::<SelectInput>(&library, b"XSelectInput\0")?;
         unsafe {
+            select_input(
+                display,
+                if window == 0 { root } else { window as c_ulong },
+                3 | POINTER_EVENT_MASK as c_long,
+            );
             grab_key(
                 display,
                 insert_keycode.into(),
@@ -193,6 +201,8 @@ impl X11Input {
             close_display,
         };
         input.update_grab();
+        let sync = load::<Sync>(&input._library, b"XSync\0")?;
+        unsafe { sync(display, 0) };
         Ok(input)
     }
 

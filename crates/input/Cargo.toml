@@ -9,3 +9,6 @@ rust-version.workspace = true
 egui.workspace = true
 thiserror.workspace = true
 libloading.workspace = true
+
+[dev-dependencies]
+x11rb.workspace = true

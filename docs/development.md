@@ -29,6 +29,8 @@ cargo xtask smoke
 
 The debug WSI harness sets `TUXSCALING_TEST_FORCE_VIRTUAL=1` so it can validate small logical game images against the discovered monitor output without depending on a window manager fullscreen transition. Release builds ignore this test-only override.
 
+The harness accepts `TUXSCALING_TEST_SCENARIO=upscale|native|aspect|resize`. These scenarios exercise 1280x720 to native output, equal-extent Native AA, centered aspect-fit bars, and swapchain recreation. `TUXSCALING_TEST_FORCE_RESIZE_FAILURE=1` verifies the direct-mode transaction fallback. Every other frame uses `vkAcquireNextImage2KHR` so both acquisition entry points stay covered.
+
 Set `TUXSCALING_TEST_FORCE_TEMPORAL_FAILURE=1` in a debug run to exercise the mandatory spatial bilinear fallback used when temporal recording fails after virtual output has started.
 
 Set `TUXSCALING_TEST_RESIZE_INTERVAL=0` only for a warmed-up timing run; the default interval is four frames and keeps resize coverage enabled.

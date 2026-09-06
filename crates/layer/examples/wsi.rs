@@ -5,6 +5,31 @@ use std::{
     time::{Duration, Instant},
 };
 use tuxscaling_vulkan::image_barrier;
+use x11rb::{
+    connection::Connection,
+    protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt},
+};
+
+fn game_extent() -> vk::Extent2D {
+    match std::env::var("TUXSCALING_TEST_SCENARIO").as_deref() {
+        Ok("upscale") => vk::Extent2D {
+            width: 1280,
+            height: 720,
+        },
+        Ok("native") => vk::Extent2D {
+            width: 1920,
+            height: 1080,
+        },
+        Ok("aspect") => vk::Extent2D {
+            width: 1024,
+            height: 768,
+        },
+        _ => vk::Extent2D {
+            width: 400,
+            height: 300,
+        },
+    }
+}
 
 #[link(name = "X11")]
 unsafe extern "C" {
@@ -136,6 +161,32 @@ unsafe fn replace(
         swapchains.destroy_swapchain(chain.handle, None);
         chain.handle = new;
         chain.images = swapchains.get_swapchain_images(new).unwrap();
+        let mut count = 0;
+        assert_eq!(
+            (swapchains.fp().get_swapchain_images_khr)(
+                device.handle(),
+                new,
+                &mut count,
+                std::ptr::null_mut()
+            ),
+            vk::Result::SUCCESS
+        );
+        assert_eq!(count as usize, chain.images.len());
+        if count > 1 {
+            let mut first = vk::Image::null();
+            count = 1;
+            assert_eq!(
+                (swapchains.fp().get_swapchain_images_khr)(
+                    device.handle(),
+                    new,
+                    &mut count,
+                    &mut first
+                ),
+                vk::Result::INCOMPLETE
+            );
+            assert_eq!(first, chain.images[0]);
+            assert_eq!(count, 1);
+        }
         chain.ready = chain
             .images
             .iter()
@@ -163,13 +214,26 @@ unsafe fn run() {
                 XDefaultRootWindow(display),
                 20 + i * 440,
                 40,
-                400,
-                300,
+                game_extent().width,
+                game_extent().height,
                 0,
                 0,
                 0,
             );
             XStoreName(display, w, c"TuxScaling WSI validation".as_ptr());
+            XFlush(display);
+            if std::env::var("TUXSCALING_TEST_SCENARIO").is_ok() {
+                let (connection, _) = x11rb::connect(None).unwrap();
+                connection
+                    .change_window_attributes(
+                        w as u32,
+                        &ChangeWindowAttributesAux::new().override_redirect(1),
+                    )
+                    .unwrap()
+                    .check()
+                    .unwrap();
+                connection.flush().unwrap();
+            }
             XMapWindow(display, w);
             mark_fullscreen(display, w);
             w
@@ -281,13 +345,31 @@ unsafe fn run() {
                 &surface_loader,
                 &swapchains,
                 chain,
-                vk::Extent2D {
-                    width: 400,
-                    height: 300,
-                },
+                game_extent(),
             );
         }
         let start = Instant::now();
+        if std::env::var("TUXSCALING_TEST_SCENARIO").is_ok() {
+            let display = tuxscaling_display::X11Display::connect().unwrap();
+            for window in windows {
+                let rect = display.window_rect(window).unwrap();
+                let expected = if std::env::var("TUXSCALING_TEST_FORCE_RESIZE_FAILURE").as_deref()
+                    == Ok("1")
+                {
+                    game_extent()
+                } else {
+                    vk::Extent2D {
+                        width: 1920,
+                        height: 1080,
+                    }
+                };
+                assert_eq!(
+                    [rect.width, rect.height],
+                    [expected.width, expected.height],
+                    "physical presentation extent"
+                );
+            }
+        }
         let seconds = std::env::var("TUXSCALING_TEST_SECONDS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -339,12 +421,23 @@ unsafe fn run() {
                 device
                     .wait_for_fences(&[chain.fence], true, 10_000_000_000)
                     .unwrap();
-                let (index, _) = match swapchains.acquire_next_image(
-                    chain.handle,
-                    u64::MAX,
-                    chain.acquired,
-                    vk::Fence::null(),
-                ) {
+                let acquired = if frame.is_multiple_of(2) {
+                    swapchains.acquire_next_image2(
+                        &vk::AcquireNextImageInfoKHR::default()
+                            .swapchain(chain.handle)
+                            .timeout(u64::MAX)
+                            .semaphore(chain.acquired)
+                            .device_mask(1),
+                    )
+                } else {
+                    swapchains.acquire_next_image(
+                        chain.handle,
+                        u64::MAX,
+                        chain.acquired,
+                        vk::Fence::null(),
+                    )
+                };
+                let (index, _) = match acquired {
                     Ok(v) => v,
                     Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                         replace(

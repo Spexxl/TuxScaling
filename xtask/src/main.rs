@@ -67,7 +67,19 @@ fn main() -> ExitCode {
             let libraries = std::iter::once(root.join("target/debug"))
                 .chain(std::env::split_paths(&inherited))
                 .collect::<Vec<_>>();
-            let run_wsi = |force_temporal_failure| {
+            let smoke_config = root.join("target/native-output-smoke.toml");
+            std::fs::write(
+                &smoke_config,
+                "output_resolution = \"1920x1080\"\nprocessing_scale = 1.0\n",
+            )
+            .unwrap();
+            let direct_config = root.join("target/native-aa-smoke.toml");
+            std::fs::write(
+                &direct_config,
+                "output_resolution = \"swapchain\"\nprocessing_scale = 1.0\n",
+            )
+            .unwrap();
+            let run_wsi = |scenario: &str, force_temporal_failure, resize_failure| {
                 let mut command = Command::new(root.join("target/debug/examples/wsi"));
                 validation(&mut command)
                     .env("VK_ADD_LAYER_PATH", root.join("assets/vulkan-layer"))
@@ -76,15 +88,38 @@ fn main() -> ExitCode {
                         "VK_INSTANCE_LAYERS",
                         "VK_LAYER_TUXSCALING_overlay:VK_LAYER_KHRONOS_validation",
                     )
-                    .env("TUXSCALING_VIEW", "motion")
+                    .env("TUXSCALING_VIEW", "reconstructed")
+                    .env(
+                        "TUXSCALING_CONFIG",
+                        if scenario == "native" {
+                            &direct_config
+                        } else {
+                            &smoke_config
+                        },
+                    )
+                    .env("TUXSCALING_TEST_SCENARIO", scenario)
+                    .env("TUXSCALING_TEST_RESIZE_INTERVAL", "0")
                     .env("TUXSCALING_TEST_FORCE_VIRTUAL", "1")
-                    .env("TUXSCALING_TEST_SECONDS", "12");
+                    .env("TUXSCALING_TEST_SECONDS", "3")
+                    .env("TUXSCALING_TEST_FORCE_TEMPORAL_FAILURE", "0")
+                    .env("TUXSCALING_TEST_FORCE_RESIZE_FAILURE", "0");
                 if force_temporal_failure {
                     command.env("TUXSCALING_TEST_FORCE_TEMPORAL_FAILURE", "1");
                 }
+                if resize_failure {
+                    command.env("TUXSCALING_TEST_FORCE_RESIZE_FAILURE", "1");
+                }
+                if scenario == "resize" {
+                    command.env("TUXSCALING_TEST_RESIZE_INTERVAL", "4");
+                }
                 report(command.output())
             };
-            run_wsi(false) && run_wsi(true)
+            run_wsi("upscale", false, false)
+                && run_wsi("native", false, false)
+                && run_wsi("aspect", false, false)
+                && run_wsi("upscale", true, false)
+                && run_wsi("upscale", false, true)
+                && run_wsi("resize", false, false)
         }
         "check" => {
             run("cargo", &["fmt", "--all", "--", "--check"])
