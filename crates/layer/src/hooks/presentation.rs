@@ -20,12 +20,23 @@ unsafe fn uses_virtual_output(info: &vk::PresentInfoKHR<'_>) -> bool {
     })
 }
 
-unsafe fn has_only_incremental_present(next: *const std::ffi::c_void) -> bool {
-    if next.is_null() {
-        return false;
+unsafe fn find_present_regions(
+    mut next: *const std::ffi::c_void,
+) -> Option<vk::PresentRegionsKHR<'static>> {
+    let mut regions = None;
+    while !next.is_null() {
+        let header = unsafe { &*next.cast::<vk::BaseInStructure<'_>>() };
+        if header.s_type == vk::StructureType::PRESENT_REGIONS_KHR {
+            regions = Some(unsafe { *next.cast::<vk::PresentRegionsKHR<'static>>() });
+        } else if !matches!(
+            header.s_type,
+            vk::StructureType::PRESENT_ID_KHR | vk::StructureType::PRESENT_TIMES_INFO_GOOGLE
+        ) {
+            return None;
+        }
+        next = header.p_next.cast();
     }
-    let header = unsafe { &*next.cast::<vk::BaseInStructure<'_>>() };
-    header.s_type == vk::StructureType::PRESENT_REGIONS_KHR && header.p_next.is_null()
+    regions
 }
 
 unsafe fn submit_overlay(
@@ -191,10 +202,25 @@ unsafe fn queue_present_inner(
         let mut mapped_rectangles = Vec::<Vec<vk::RectLayerKHR>>::new();
         let mapped_regions: Vec<vk::PresentRegionKHR<'_>>;
         let mut mapped_present_regions = vk::PresentRegionsKHR::default();
+        let mut present_id = None;
+        let mut present_times = None;
+        let mut chain = info.p_next;
+        while !chain.is_null() {
+            let header = unsafe { &*chain.cast::<vk::BaseInStructure<'_>>() };
+            match header.s_type {
+                vk::StructureType::PRESENT_ID_KHR => {
+                    present_id = Some(unsafe { *chain.cast::<vk::PresentIdKHR<'_>>() })
+                }
+                vk::StructureType::PRESENT_TIMES_INFO_GOOGLE => {
+                    present_times = Some(unsafe { *chain.cast::<vk::PresentTimesInfoGOOGLE<'_>>() })
+                }
+                _ => {}
+            }
+            chain = header.p_next.cast();
+        }
         if unsafe { uses_virtual_output(info) }
-            && unsafe { has_only_incremental_present(info.p_next) }
+            && let Some(source) = unsafe { find_present_regions(info.p_next) }
         {
-            let source = unsafe { &*info.p_next.cast::<vk::PresentRegionsKHR<'_>>() };
             let valid = source.swapchain_count == info.swapchain_count
                 && (source.swapchain_count == 0 || !source.p_regions.is_null());
             if valid {
@@ -266,6 +292,18 @@ unsafe fn queue_present_inner(
                         .collect();
                     mapped_present_regions.swapchain_count = mapped_regions.len() as u32;
                     mapped_present_regions.p_regions = mapped_regions.as_ptr();
+                    {
+                        let mut next = std::ptr::null();
+                        if let Some(times) = &mut present_times {
+                            times.p_next = next;
+                            next = (times as *const vk::PresentTimesInfoGOOGLE<'_>).cast();
+                        }
+                        if let Some(id) = &mut present_id {
+                            id.p_next = next;
+                            next = (id as *const vk::PresentIdKHR<'_>).cast();
+                        }
+                        mapped_present_regions.p_next = next;
+                    }
                     modified.p_next =
                         (&mapped_present_regions as *const vk::PresentRegionsKHR<'_>).cast();
                 } else {
