@@ -1,6 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
+layout(rg16f,binding=9) uniform readonly image2D dense_motion_input;
 
 float level0_sample(bool previous,vec2 original) {
     vec2 q=original*0.5;
@@ -29,7 +30,7 @@ void main() {
     uvec2 size=uvec2(imageSize(motion_image));
     if(any(greaterThanEqual(q,size))) return;
     ivec2 pixel=ivec2(q);
-    vec2 motion=imageLoad(motion_image,pixel).xy;
+    vec2 motion=imageLoad(dense_motion_input,pixel).xy;
     vec2 target=vec2(pixel)+motion;
     bool inside=all(greaterThanEqual(target,vec2(0))) &&
         all(lessThanEqual(target,vec2(size)-vec2(1)));
@@ -47,7 +48,7 @@ void main() {
     float stability=0.0;
     for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++) {
         ivec2 n=clamp(pixel+ivec2(x,y),ivec2(0),ivec2(size)-1);
-        stability+=length(imageLoad(motion_image,n).xy-motion);
+        stability+=length(imageLoad(dense_motion_input,n).xy-motion);
     }
     float spatial=exp(-0.12*stability/9.0);
     float ambiguity=clamp(forward.w,0.0,1.0);

@@ -14,7 +14,7 @@ layout(std430,binding=5) buffer Metadata {
 layout(rgba8,binding=6) uniform image2D visualization;
 layout(rg16f,binding=7) uniform image2D motion_image;
 layout(r8,binding=8) uniform image2D confidence_image;
-layout(std430,binding=9) buffer Statistics { uint partials[]; };
+layout(std430,binding=10) buffer Statistics { uint partials[]; };
 layout(push_constant) uniform Params {
     uint width; uint height; uint offset; uint grid_offset;
     uint parent_width; uint parent_height; uint parent_offset; uint parent_grid_offset;

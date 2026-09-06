@@ -100,15 +100,16 @@ const STATS_WORDS: u64 = 68;
 
 pub struct MotionEstimator {
     device: ash::Device,
-    pub levels: Vec<Level>,
-    pub luma: Vec<Buffer>,
-    pub forward: Buffer,
-    pub backward: Buffer,
+    levels: Vec<Level>,
+    luma: Vec<Buffer>,
+    forward: Buffer,
+    backward: Buffer,
     pub metadata: Buffer,
     pub stats: Buffer,
     pub visualization: Image,
     pub vectors: Image,
     pub confidence: Image,
+    dense_input: Image,
     sampler: vk::Sampler,
     descriptor_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
@@ -168,6 +169,7 @@ impl MotionEstimator {
             // details.  Consumers receive a dense processing-extent signal.
             vectors: image(extent, vk::Format::R16G16_SFLOAT)?,
             confidence: image(extent, vk::Format::R8_UNORM)?,
+            dense_input: image(extent, vk::Format::R16G16_SFLOAT)?,
             sampler: vk::Sampler::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
@@ -190,14 +192,14 @@ impl MotionEstimator {
                 None,
             )
         }?;
-        let bindings = (0..=9)
+        let bindings = (0..=10)
             .map(|binding| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(binding)
                     .descriptor_type(match binding {
                         0 => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                        1..=5 | 9 => vk::DescriptorType::STORAGE_BUFFER,
-                        6..=8 => vk::DescriptorType::STORAGE_IMAGE,
+                        1..=5 | 10 => vk::DescriptorType::STORAGE_BUFFER,
+                        6..=9 => vk::DescriptorType::STORAGE_IMAGE,
                         _ => unreachable!(),
                     })
                     .descriptor_count(1)
@@ -221,7 +223,7 @@ impl MotionEstimator {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 6,
+                descriptor_count: 8,
             },
         ];
         result.descriptor_pool = unsafe {
@@ -279,6 +281,7 @@ impl MotionEstimator {
                 (6, &result.visualization),
                 (7, &result.vectors),
                 (8, &result.confidence),
+                (9, &result.dense_input),
             ] {
                 let data = [vk::DescriptorImageInfo::default()
                     .image_view(image.view)
@@ -301,7 +304,7 @@ impl MotionEstimator {
                 device.update_descriptor_sets(
                     &[vk::WriteDescriptorSet::default()
                         .dst_set(*set)
-                        .dst_binding(9)
+                        .dst_binding(10)
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .buffer_info(&data)],
                     &[],
@@ -462,7 +465,12 @@ impl MotionEstimator {
                     self.device
                         .cmd_fill_buffer(command, buffer.handle, 0, buffer.size, 0);
                 }
-                for image in [&self.visualization, &self.vectors, &self.confidence] {
+                for image in [
+                    &self.visualization,
+                    &self.vectors,
+                    &self.confidence,
+                    &self.dense_input,
+                ] {
                     image_barrier(
                         &self.device,
                         command,

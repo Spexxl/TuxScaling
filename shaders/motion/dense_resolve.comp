@@ -1,6 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
+layout(rg16f,binding=9) uniform image2D dense_motion_input;
 
 // The flow search intentionally runs on a private, compact grid.  This pass
 // expands that grid once, preserving its sub-pixel result and rejecting
@@ -68,5 +69,8 @@ void main() {
         weighted_median(x_values,x_weights),
         weighted_median(y_values,y_weights));
     if(p.valid==0 || any(isnan(dense)) || any(isinf(dense))) dense=vec2(0);
+    // Keep confidence's neighbourhood source immutable during its dispatch;
+    // motion_image is the published destination and is written separately.
+    imageStore(dense_motion_input,pixel,vec4(dense,0,0));
     imageStore(motion_image,pixel,vec4(dense,0,0));
 }

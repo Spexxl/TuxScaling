@@ -6,6 +6,14 @@ use tuxscaling_vulkan::{Buffer, Image, image_barrier, memory_barrier};
 mod support;
 use support::Gpu;
 
+#[test]
+fn confidence_reads_a_separate_dense_motion_source() {
+    let shader = include_str!("../../../shaders/motion/confidence.comp");
+    assert!(shader.contains("dense_motion_input"));
+    assert!(shader.contains("imageLoad(dense_motion_input,n)"));
+    assert!(!shader.contains("imageLoad(motion_image,n)"));
+}
+
 fn noise(a: i32, b: i32) -> f32 {
     let mut v = (a as u32).wrapping_mul(1664525) ^ (b as u32).wrapping_mul(1013904223) ^ 0x91e10da5;
     v ^= v >> 16;
@@ -102,6 +110,36 @@ fn dense_outputs_match_processing_extent() {
             .unwrap();
     assert_eq!(estimator.vectors.extent, extent);
     assert_eq!(estimator.confidence.extent, extent);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn dense_confidence_output_is_stable_across_repeated_dispatches() {
+    let width = 129;
+    let height = 97;
+    let previous = pattern(width, height, 0, 0);
+    let current = pattern(width, height, 5, -3);
+    let first =
+        unsafe { pair_quality(width, height, &previous, &current, MotionQuality::Balanced) };
+    let second =
+        unsafe { pair_quality(width, height, &previous, &current, MotionQuality::Balanced) };
+    let max_motion_delta = first
+        .0
+        .iter()
+        .zip(second.0.iter())
+        .map(|(left, right)| (left[0] - right[0]).abs().max((left[1] - right[1]).abs()))
+        .fold(0.0, f32::max);
+    let max_confidence_delta = first
+        .1
+        .iter()
+        .zip(second.1.iter())
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0, f32::max);
+    eprintln!(
+        "repeated dense output deltas: motion={max_motion_delta:.6}, confidence={max_confidence_delta:.6}"
+    );
+    assert!(max_motion_delta <= 0.001);
+    assert!(max_confidence_delta <= 0.001);
 }
 unsafe fn pair(
     width: u32,

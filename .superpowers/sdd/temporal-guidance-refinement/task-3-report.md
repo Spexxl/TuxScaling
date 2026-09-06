@@ -126,3 +126,87 @@ The Xlib smoke exited 139 in `vkcube` before establishing a usable window-system
 ## Commit
 
 `feat: refine dense optical flow guidance` (final commit hash is reported by `git log -1`)
+
+## Fix round 1 — race-free confidence source and private coarse state
+
+### Findings addressed
+
+- Added a persistent full-resolution `dense_input` storage image. The dense resolve pass writes both the published `motion_image` and this source; confidence declares `dense_motion_input` as `readonly` and reads its 3x3 neighbourhood while writing only the published output. This removes the prior same-dispatch neighbourhood read/write race.
+- Shifted the statistics descriptor from binding 9 to binding 10 and added the dense source at binding 9 without changing the existing query indexes or Task 2 partial/reduction algorithm.
+- Made `MotionEstimator::levels`, `luma`, `forward`, and `backward` private. Published dense vectors/confidence, metadata, statistics, visualization, and configured cut thresholds remain available to their existing consumers.
+- Added a source-path regression test and a repeated odd-extent GPU output stability test. Existing odd-extent finiteness, independent-object AUROC, invalid-history zeroing, and all-preset EPE tests remain enabled.
+
+### TDD RED/GREEN evidence
+
+The new regression test was introduced before the source/descriptors/shader fix:
+
+```text
+$ cargo test -p tuxscaling-motion --test gpu confidence_reads_a_separate_dense_motion_source -- --nocapture
+test confidence_reads_a_separate_dense_motion_source ... FAILED
+assertion failed: shader.contains("dense_motion_input")
+test result: FAILED. 0 passed; 1 failed
+```
+
+After adding the separate source and read-only confidence declaration:
+
+```text
+$ cargo test -p tuxscaling-motion --test gpu confidence_reads_a_separate_dense_motion_source -- --nocapture
+test confidence_reads_a_separate_dense_motion_source ... ok
+test result: ok. 1 passed; 0 failed
+```
+
+The GPU stability regression passed with identical repeated outputs:
+
+```text
+$ cargo test -p tuxscaling-motion --test gpu dense_confidence_output_is_stable_across_repeated_dispatches -- --ignored --nocapture --test-threads=1
+repeated dense output deltas: motion=0.000000, confidence=0.000000
+test dense_confidence_output_is_stable_across_repeated_dispatches ... ok
+test result: ok. 1 passed; 0 failed
+```
+
+### Fix-round verification
+
+```text
+$ cargo xtask check
+...
+test result: ok. 1 passed; 0 failed; 0 ignored; 8 ignored
+...
+Finished `dev` profile
+```
+
+The workspace check exited 0; all normal workspace tests/doc tests and Clippy/check completed, with the expected repository-marked GPU/X11 tests ignored.
+
+```text
+$ cargo xtask gpu-check
+...
+repeated dense output deltas: motion=0.000000, confidence=0.000000
+...
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; 8 ignored
+```
+
+The validation-enabled capture and motion GPU suites exited 0. All 8 ignored motion GPU fixtures executed successfully and no validation errors were reported.
+
+```text
+$ timeout 10s env DISPLAY=:0 XAUTHORITY=/run/user/1000/.mutter-Xwaylandauth.KZT6U3 \
+  VK_ADD_LAYER_PATH="$PWD/assets/vulkan-layer" \
+  LD_LIBRARY_PATH="$PWD/target/debug${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  VK_INSTANCE_LAYERS=VK_LAYER_TUXSCALING_overlay:VK_LAYER_KHRONOS_validation \
+  VK_LAYER_VALIDATE_SYNC=1 DISABLE_MANGOHUD=1 DISABLE_LSFG=1 \
+  vkcube --wsi xlib
+timeout: the monitored command dumped core
+```
+
+The requested validation-enabled Xlib smoke exited 139 in `vkcube` before a usable window-system run, even with the isolated `target/debug` layer and provided XAUTHORITY.
+
+### Fix-round self-review
+
+- `confidence.comp` has no `imageLoad(motion_image, ...)`; its motion and neighbourhood reads come from a separately bound `readonly` image that is fully populated before the confidence dispatch.
+- The dense source and published output are both initialized from `UNDEFINED` to `GENERAL`; the dense resolve dispatch is followed by the existing memory barrier before confidence starts.
+- Binding 10 is used consistently by `common.glsl`, `scene_reduce.comp`, and the Rust descriptor writes. The timestamp/query sequence and statistics dispatch order are unchanged.
+- Coarse pyramid levels, luminance buffers, and bidirectional flow buffers are no longer public fields. Consumer compilation was rechecked by the workspace check.
+- The repeated output test runs two complete odd-extent GPU pairs and compares every dense vector/confidence value, while the static regression prevents accidentally reintroducing the old source path.
+
+### Fix-round concerns
+
+- The repeated-dispatch regression cannot prove all possible GPU scheduling races by itself, but the confidence shader now has a separate descriptor declared `readonly` and no longer reads the image it writes. Validation-enabled GPU fixtures pass with exact repeated output equality.
+- The validation-enabled Xlib `vkcube` smoke remains blocked by the environment's Xlib crash; this is unchanged from the initial Task 3 verification.
