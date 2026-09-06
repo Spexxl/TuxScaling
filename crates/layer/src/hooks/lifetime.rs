@@ -16,6 +16,10 @@ unsafe fn destroy_swapchain_inner(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&swapchain);
+        let restore_surface = state.as_ref().and_then(|state| {
+            let state = state.lock().unwrap_or_else(|e| e.into_inner());
+            state.virtual_images.as_ref().map(|_| state.surface)
+        });
         let device_state = devices()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -30,10 +34,31 @@ unsafe fn destroy_swapchain_inner(
                 destroy_overlay(&device_state, state.overlay)
             }));
         }
+        if let Some(surface) = restore_surface {
+            restore_surface_window(surface);
+        }
     }));
     if let Some(proc) = destroy {
         let destroy_swapchain: vk::PFN_vkDestroySwapchainKHR = unsafe { std::mem::transmute(proc) };
         unsafe { destroy_swapchain(device, swapchain, allocation_callbacks) };
+    }
+}
+
+fn restore_surface_window(surface: vk::SurfaceKHR) {
+    let Some((window, original)) = surfaces()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&surface)
+        .and_then(|state| {
+            let original = state.original_window.take()?;
+            state.logical_extent = None;
+            Some((state.window, original))
+        })
+    else {
+        return;
+    };
+    if let Ok(display) = tuxscaling_display::X11Display::connect() {
+        let _ = display.resize_window(window, tuxscaling_display::Monitor::new(original));
     }
 }
 
@@ -80,11 +105,13 @@ unsafe fn destroy_device_inner(
                 let _ = device_state.device.device_wait_idle();
                 for state in overlays {
                     if let Ok(state) = Arc::try_unwrap(state) {
-                        state
-                            .into_inner()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .overlay
-                            .destroy(&device_state.device);
+                        let state = state.into_inner().unwrap_or_else(|e| e.into_inner());
+                        let restore_surface =
+                            state.virtual_images.is_some().then_some(state.surface);
+                        state.overlay.destroy(&device_state.device);
+                        if let Some(surface) = restore_surface {
+                            restore_surface_window(surface);
+                        }
                     }
                 }
             }));

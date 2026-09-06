@@ -15,6 +15,7 @@ pub(crate) struct X11Surface {
 
 pub(crate) struct SwapchainState {
     pub(crate) device: vk::Device,
+    pub(crate) surface: vk::SurfaceKHR,
     pub(crate) overlay: OverlaySwapchain,
     pub(crate) virtual_images: Option<Vec<Image>>,
 }

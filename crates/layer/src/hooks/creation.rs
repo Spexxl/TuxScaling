@@ -6,12 +6,83 @@ struct ResizedWindow {
     original: tuxscaling_display::Rect,
 }
 
+fn virtual_swapchain_supported(info: &vk::SwapchainCreateInfoKHR<'_>) -> bool {
+    if !info.flags.is_empty()
+        || info.image_array_layers != 1
+        || info.image_sharing_mode != vk::SharingMode::EXCLUSIVE
+        || info.queue_family_index_count != 0
+    {
+        return false;
+    }
+    let mut next = info.p_next.cast::<vk::BaseInStructure<'_>>();
+    while !next.is_null() {
+        let structure_type = unsafe { (*next).s_type };
+        if structure_type == vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR {
+            return false;
+        }
+        next = unsafe { (*next).p_next.cast() };
+    }
+    true
+}
+
+fn clear_surface_virtualization(surface: vk::SurfaceKHR) {
+    if let Some(state) = surfaces()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get_mut(&surface)
+    {
+        state.logical_extent = None;
+        state.original_window = None;
+    }
+}
+
 impl ResizedWindow {
     fn restore(self) {
         if let Ok(display) = tuxscaling_display::X11Display::connect() {
             let _ =
                 display.resize_window(self.window, tuxscaling_display::Monitor::new(self.original));
         }
+    }
+}
+
+struct DirectSwapchain<'a> {
+    create_swapchain: vk::PFN_vkCreateSwapchainKHR,
+    loader: &'a ash::khr::swapchain::Device,
+    device: vk::Device,
+    create_info: *const vk::SwapchainCreateInfoKHR<'a>,
+    allocation_callbacks: *const vk::AllocationCallbacks<'a>,
+    swapchain: *mut vk::SwapchainKHR,
+    surface: vk::SurfaceKHR,
+}
+
+impl DirectSwapchain<'_> {
+    unsafe fn recreate(
+        self,
+        resized_window: Option<ResizedWindow>,
+    ) -> Result<Vec<vk::Image>, vk::Result> {
+        if let Some(window) = resized_window {
+            window.restore();
+        }
+        clear_surface_virtualization(self.surface);
+        unsafe {
+            self.loader
+                .destroy_swapchain(*self.swapchain, self.allocation_callbacks.as_ref())
+        };
+        let result = unsafe {
+            (self.create_swapchain)(
+                self.device,
+                self.create_info,
+                self.allocation_callbacks,
+                self.swapchain,
+            )
+        };
+        if result != vk::Result::SUCCESS {
+            return Err(result);
+        }
+        unsafe { self.loader.get_swapchain_images(*self.swapchain) }.inspect_err(|_| unsafe {
+            self.loader
+                .destroy_swapchain(*self.swapchain, self.allocation_callbacks.as_ref())
+        })
     }
 }
 
@@ -475,7 +546,8 @@ unsafe fn create_swapchain_inner(
     if result != vk::Result::SUCCESS {
         return result;
     }
-    let _ = catch_unwind(AssertUnwindSafe(|| {
+    let recovery_window = resized.map(|(_, window)| window);
+    let post_result = catch_unwind(AssertUnwindSafe(|| {
         let Some(device_state) = devices()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -506,13 +578,38 @@ unsafe fn create_swapchain_inner(
             extent: modified.image_extent,
         };
         let loader = ash::khr::swapchain::Device::new(&device_state.instance, &device_state.device);
-        let Ok(mut output_images) = (unsafe { loader.get_swapchain_images(handle) }) else {
-            return result;
+        let direct = || DirectSwapchain {
+            create_swapchain,
+            loader: &loader,
+            device,
+            create_info,
+            allocation_callbacks,
+            swapchain,
+            surface: original.surface,
+        };
+        let mut resized_window = resized.map(|(_, window)| window);
+        let mut output_images = match unsafe { loader.get_swapchain_images(handle) } {
+            Ok(images) => images,
+            Err(_) if resized_window.is_some() => {
+                match unsafe { direct().recreate(resized_window.take()) } {
+                    Ok(images) => {
+                        handle = unsafe { *swapchain };
+                        capture_enabled = false;
+                        info = SwapchainInfo {
+                            format: original.image_format,
+                            extent: original.image_extent,
+                        };
+                        images
+                    }
+                    Err(error) => return error,
+                }
+            }
+            Err(_) => return result,
         };
         let mut virtual_images = None;
-        if let Some((_, resized_window)) = resized.take() {
-            let virtual_eligible = original.image_sharing_mode == vk::SharingMode::EXCLUSIVE
-                && original.queue_family_index_count == 0;
+        let mut virtual_window = None;
+        if let Some(resized_window) = resized_window.take() {
+            let virtual_eligible = virtual_swapchain_supported(original);
             let virtual_result = if virtual_eligible {
                 let memory = unsafe {
                     device_state
@@ -548,33 +645,22 @@ unsafe fn create_swapchain_inner(
                             }
                         });
                     virtual_images = Some(images);
+                    virtual_window = Some(resized_window);
                 }
                 Err(error) => {
                     eprintln!("TuxScaling: virtual swapchain bypassed: {error:?}");
-                    unsafe { loader.destroy_swapchain(handle, allocation_callbacks.as_ref()) };
-                    resized_window.restore();
-                    let recreate = unsafe {
-                        create_swapchain(device, create_info, allocation_callbacks, swapchain)
-                    };
-                    if recreate != vk::Result::SUCCESS {
-                        return recreate;
-                    }
-                    handle = unsafe { *swapchain };
-                    let Ok(images) = (unsafe { loader.get_swapchain_images(handle) }) else {
-                        return result;
+                    let recreated = unsafe { direct().recreate(Some(resized_window)) };
+                    let Ok(images) = recreated else {
+                        return recreated
+                            .err()
+                            .unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED);
                     };
                     output_images = images;
+                    handle = unsafe { *swapchain };
                     info = SwapchainInfo {
                         format: original.image_format,
                         extent: original.image_extent,
                     };
-                    if let Some(surface) = surfaces()
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .get_mut(&original.surface)
-                    {
-                        surface.logical_extent = None;
-                    }
                     capture_enabled = false;
                 }
             }
@@ -593,6 +679,7 @@ unsafe fn create_swapchain_inner(
             .unwrap_or_else(|error| error.into_inner())
             .get(&original.surface)
             .map(|surface| surface.window);
+        let was_virtual = virtual_window.is_some();
         let overlay = unsafe {
             OverlaySwapchain::new(
                 &device_state.instance,
@@ -611,22 +698,44 @@ unsafe fn create_swapchain_inner(
                 device_state.set_loader_data,
             )
         };
-        if let Ok(overlay) = overlay {
-            swapchains()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    handle,
-                    Arc::new(Mutex::new(SwapchainState {
-                        device,
-                        overlay,
-                        virtual_images,
-                    })),
+        match overlay {
+            Ok(overlay) => {
+                swapchains()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        handle,
+                        Arc::new(Mutex::new(SwapchainState {
+                            device,
+                            surface: original.surface,
+                            overlay,
+                            virtual_images,
+                        })),
+                    );
+            }
+            Err(error) if was_virtual => {
+                eprintln!(
+                    "TuxScaling: overlay initialization failed; restoring direct swapchain: {error:?}"
                 );
+                let recreated = unsafe { direct().recreate(virtual_window) };
+                if let Err(error) = recreated {
+                    return error;
+                }
+            }
+            Err(error) => {
+                eprintln!("TuxScaling: overlay disabled for swapchain: {error:?}");
+            }
         }
         result
     }));
-    result
+    if post_result.is_err() {
+        if let Some(window) = recovery_window {
+            window.restore();
+            clear_surface_virtualization(original.surface);
+        }
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    post_result.unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED)
 }
 pub(super) unsafe extern "system" fn create_swapchain_khr(
     device: vk::Device,
@@ -638,4 +747,34 @@ pub(super) unsafe extern "system" fn create_swapchain_khr(
         create_swapchain_inner(device, create_info, allocation_callbacks, swapchain)
     }))
     .unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::virtual_swapchain_supported;
+    use ash::vk;
+
+    #[test]
+    fn rejects_mutable_format_virtual_swapchains() {
+        let info = vk::SwapchainCreateInfoKHR::default()
+            .flags(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT);
+
+        assert!(!virtual_swapchain_supported(&info));
+    }
+
+    #[test]
+    fn rejects_protected_swapchains() {
+        let info =
+            vk::SwapchainCreateInfoKHR::default().flags(vk::SwapchainCreateFlagsKHR::PROTECTED);
+
+        assert!(!virtual_swapchain_supported(&info));
+    }
+
+    #[test]
+    fn rejects_device_group_swapchains() {
+        let mut group = vk::DeviceGroupSwapchainCreateInfoKHR::default();
+        let info = vk::SwapchainCreateInfoKHR::default().push_next(&mut group);
+
+        assert!(!virtual_swapchain_supported(&info));
+    }
 }
