@@ -10,6 +10,7 @@ pub struct FrameDiagnostics {
     pub mode: String,
     pub quality: MotionQuality,
     pub requested_quality: Option<MotionQuality>,
+    pub requested_processing_scale: Option<f32>,
     pub processing_scale: f32,
     pub game_extent: [u32; 2],
     pub processing_extent: [u32; 2],
@@ -32,6 +33,13 @@ pub fn resolution_mode(game_extent: [u32; 2], output_extent: [u32; 2]) -> &'stat
     }
 }
 
+pub fn processing_scale_request(value: f32) -> Option<f32> {
+    value
+        .is_finite()
+        .then_some(value)
+        .filter(|value| (0.5..=1.0).contains(value))
+}
+
 pub fn render_diagnostics(
     context: &Context,
     size: [u32; 2],
@@ -40,6 +48,7 @@ pub fn render_diagnostics(
     visible: bool,
 ) -> OverlayFrame {
     diagnostics.requested_quality = None;
+    diagnostics.requested_processing_scale = None;
     let output = context.run(
         RawInput {
             screen_rect: Some(Rect::from_min_size(
@@ -98,6 +107,24 @@ pub fn render_diagnostics(
                             diagnostics.output_extent,
                         ));
                     }
+                    egui::CollapsingHeader::new("Advanced")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let mut scale = diagnostics.processing_scale;
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut scale, 0.5..=1.0)
+                                        .text("Processing scale"),
+                                )
+                                .changed()
+                            {
+                                diagnostics.requested_processing_scale =
+                                    processing_scale_request(scale);
+                            }
+                            ui.small(
+                                "This changes TuxScaling work, not the game's render resolution.",
+                            );
+                        });
                     ui.label(format!("Frame delta: {:.2} ms", diagnostics.frame_delta_ms));
                     if diagnostics.budget_warning {
                         ui.colored_label(
@@ -130,6 +157,7 @@ pub fn render_diagnostics(
         primitives: context.tessellate(output.shapes, output.pixels_per_point),
         textures_delta: output.textures_delta,
         requested_quality: diagnostics.requested_quality,
+        requested_processing_scale: diagnostics.requested_processing_scale,
     }
 }
 
@@ -148,6 +176,7 @@ pub struct OverlayFrame {
     pub primitives: Vec<ClippedPrimitive>,
     pub textures_delta: TexturesDelta,
     pub requested_quality: Option<MotionQuality>,
+    pub requested_processing_scale: Option<f32>,
 }
 
 pub fn render_smoke_frame(
@@ -181,6 +210,7 @@ pub fn render_smoke_frame(
         primitives,
         textures_delta: output.textures_delta,
         requested_quality: None,
+        requested_processing_scale: None,
     }
 }
 
@@ -207,7 +237,7 @@ impl Default for OverlayState {
 
 #[cfg(test)]
 mod tests {
-    use super::{OverlayState, render_smoke_frame, resolution_mode};
+    use super::{OverlayState, processing_scale_request, render_smoke_frame, resolution_mode};
 
     #[test]
     fn starts_hidden() {
@@ -235,5 +265,13 @@ mod tests {
             resolution_mode([1280, 720], [1920, 1080]),
             "Virtual upscale"
         );
+    }
+
+    #[test]
+    fn accepts_only_processing_scales_in_the_supported_range() {
+        assert_eq!(processing_scale_request(0.75), Some(0.75));
+        assert_eq!(processing_scale_request(0.49), None);
+        assert_eq!(processing_scale_request(1.01), None);
+        assert_eq!(processing_scale_request(f32::NAN), None);
     }
 }

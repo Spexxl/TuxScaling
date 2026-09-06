@@ -1,13 +1,16 @@
 #![allow(clippy::missing_safety_doc)]
 use ash::vk;
-use std::time::Instant;
 use tuxscaling_capture::Capture;
-use tuxscaling_motion::{MotionEstimator, MotionQuality};
+use tuxscaling_motion::MotionQuality;
 use tuxscaling_overlay::FrameDiagnostics;
 use tuxscaling_overlay_vulkan::{OverlayRenderer, SwapchainInfo};
-use tuxscaling_temporal::{FrameExtent, GuidanceEstimator, GuidanceReset, History};
-use tuxscaling_upscaler::{ReferenceUpscaler, ResolutionPlan, content_viewport};
+use tuxscaling_temporal::{FrameExtent, GuidanceReset};
+use tuxscaling_upscaler::{ResolutionPlan, content_viewport};
 use tuxscaling_vulkan::{image_barrier, memory_barrier};
+
+#[path = "pipeline.rs"]
+mod pipeline;
+pub use pipeline::{TemporalPipeline, TemporalPipelineDescriptor};
 
 pub type SetLoaderData = unsafe extern "system" fn(vk::Device, *mut std::ffi::c_void) -> vk::Result;
 
@@ -178,9 +181,10 @@ unsafe fn record_spatial_fallback(
 }
 
 pub struct SwapchainRuntime {
+    instance: ash::Instance,
+    physical: vk::PhysicalDevice,
     device: ash::Device,
     info: SwapchainInfo,
-    resolution: ResolutionPlan,
     game_images: Vec<vk::Image>,
     output_images: Vec<vk::Image>,
     overlay: Option<OverlayRenderer>,
@@ -189,23 +193,10 @@ pub struct SwapchainRuntime {
     queue: Option<vk::Queue>,
     enabled: bool,
     set_loader_data: Option<SetLoaderData>,
-    capture: Option<Capture>,
-    motion: Option<MotionEstimator>,
-    guidance: Option<GuidanceEstimator>,
-    upscaler: Option<ReferenceUpscaler>,
-    history: History,
-    start: Instant,
-    last_time: Option<std::time::Duration>,
-    pending_time: std::time::Duration,
-    reset_reason: GuidanceReset,
-    pending_quality: Option<MotionQuality>,
+    temporal: TemporalPipeline,
     mode: u32,
-    queries: vk::QueryPool,
-    query_ready: Vec<bool>,
     output_presented: Vec<bool>,
     pending_output: Option<usize>,
-    timestamp_period: f32,
-    timings: Vec<[f32; GPU_PHASES]>,
     diagnostics: FrameDiagnostics,
 }
 impl SwapchainRuntime {
@@ -252,106 +243,19 @@ impl SwapchainRuntime {
                 window,
             )
         }?;
-        let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
-        let properties = unsafe { instance.get_physical_device_properties(physical) };
-        let capture = if capture_enabled {
-            Some(unsafe {
-                Capture::new(device, &memory, resolution.processing_extent, info.format)
-            }?)
-        } else {
-            None
-        };
-        let mut motion = if let Some(capture) = &capture {
-            Some(unsafe {
-                MotionEstimator::new(
-                    device,
-                    &memory,
-                    resolution.processing_extent,
-                    capture.color.view,
-                    matches!(
-                        info.format,
-                        vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
-                    ),
-                )
-            }?)
-        } else {
-            None
-        };
-        if let Some(motion) = &mut motion {
-            motion.set_quality(match config.motion_quality {
-                tuxscaling_config::MotionQuality::Ultra => MotionQuality::Ultra,
-                tuxscaling_config::MotionQuality::High => MotionQuality::High,
-                tuxscaling_config::MotionQuality::Balanced => MotionQuality::Balanced,
-                tuxscaling_config::MotionQuality::Performance => MotionQuality::Performance,
-            });
-            motion.cut_thresholds = [
-                config.scene_distance_threshold,
-                config.scene_consistency_threshold,
-            ];
-        }
-        let guidance = if let (Some(capture), Some(motion)) = (&capture, &motion) {
-            match unsafe {
-                GuidanceEstimator::new(
-                    device,
-                    &memory,
-                    resolution.processing_extent,
-                    capture.color.view,
-                    capture.previous.view,
-                    motion.confidence.view,
-                )
-            } {
-                Ok(value) => Some(value),
-                Err(error) => {
-                    eprintln!("TuxScaling: guidance estimation disabled: {error:?}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let mut upscaler = None;
-        if let (Some(guidance), Some(motion), Some(capture)) = (&guidance, &motion, &capture) {
-            let features =
-                unsafe { instance.get_physical_device_format_properties(physical, info.format) }
-                    .optimal_tiling_features;
-            let device_features = unsafe { instance.get_physical_device_features(physical) };
-            let required = vk::FormatFeatureFlags::STORAGE_IMAGE
-                | vk::FormatFeatureFlags::SAMPLED_IMAGE
-                | vk::FormatFeatureFlags::BLIT_SRC
-                | vk::FormatFeatureFlags::BLIT_DST;
-            if features.contains(required)
-                && device_features.shader_storage_image_write_without_format != 0
-            {
-                let view = guidance.view(
-                    motion,
-                    0,
-                    resolution.processing_extent,
-                    false,
-                    GuidanceReset::Initialize,
-                );
-                match unsafe {
-                    ReferenceUpscaler::new(
-                        device,
-                        &memory,
-                        capture.color.view,
-                        resolution.processing_extent,
-                        resolution.output_extent,
-                        info.format,
-                        view,
-                    )
-                } {
-                    Ok(value) => upscaler = Some(value),
-                    Err(error) => {
-                        eprintln!("TuxScaling: reference reconstruction disabled: {error:?}")
-                    }
-                }
-            } else {
-                eprintln!(
-                    "TuxScaling: swapchain format {:?} lacks storage-image support; reconstruction bypassed",
-                    info.format
-                );
-            }
-        }
+        let temporal = unsafe {
+            TemporalPipeline::new(TemporalPipelineDescriptor {
+                instance,
+                physical,
+                device,
+                info,
+                resolution,
+                config: &config,
+                capture_enabled,
+                image_count: images.output_images.len(),
+            })
+        }?;
+        let image_count = images.output_images.len();
         let mode = match std::env::var("TUXSCALING_VIEW").as_deref() {
             Ok("luminance") => 1,
             Ok("motion") => 2,
@@ -367,11 +271,12 @@ impl SwapchainRuntime {
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
         };
-        let image_count = images.output_images.len();
+        let diagnostic_resolution = temporal.resolution;
         Ok(Self {
+            instance: instance.clone(),
+            physical,
             device: device.clone(),
             info,
-            resolution,
             game_images: images.game_images,
             output_images: images.output_images,
             overlay: Some(overlay),
@@ -380,27 +285,10 @@ impl SwapchainRuntime {
             queue: None,
             enabled: true,
             set_loader_data,
-            capture,
-            motion,
-            guidance,
-            upscaler,
-            history: History::default(),
-            start: Instant::now(),
-            last_time: None,
-            pending_time: std::time::Duration::ZERO,
-            reset_reason: GuidanceReset::Initialize,
-            pending_quality: None,
+            temporal,
             mode,
-            queries: vk::QueryPool::null(),
-            query_ready: vec![false; image_count],
             output_presented: vec![false; image_count],
             pending_output: None,
-            timestamp_period: if properties.limits.timestamp_compute_and_graphics != 0 {
-                properties.limits.timestamp_period
-            } else {
-                0.0
-            },
-            timings: Vec::new(),
             diagnostics: FrameDiagnostics {
                 state: if capture_enabled {
                     "Capture ready"
@@ -411,14 +299,17 @@ impl SwapchainRuntime {
                 mode: mode_name(mode).into(),
                 quality: config.motion_quality,
                 processing_scale: config.processing_scale,
-                game_extent: [resolution.game_extent.width, resolution.game_extent.height],
+                game_extent: [
+                    diagnostic_resolution.game_extent.width,
+                    diagnostic_resolution.game_extent.height,
+                ],
                 processing_extent: [
-                    resolution.processing_extent.width,
-                    resolution.processing_extent.height,
+                    diagnostic_resolution.processing_extent.width,
+                    diagnostic_resolution.processing_extent.height,
                 ],
                 output_extent: [
-                    resolution.output_extent.width,
-                    resolution.output_extent.height,
+                    diagnostic_resolution.output_extent.width,
+                    diagnostic_resolution.output_extent.height,
                 ],
                 ..Default::default()
             },
@@ -444,8 +335,8 @@ impl SwapchainRuntime {
                 None,
             )
         }?;
-        if self.timestamp_period > 0.0 {
-            self.queries = unsafe {
+        if self.temporal.timestamp_period > 0.0 {
+            self.temporal.queries = unsafe {
                 self.device.create_query_pool(
                     &vk::QueryPoolCreateInfo::default()
                         .query_type(vk::QueryType::TIMESTAMP)
@@ -494,6 +385,48 @@ impl SwapchainRuntime {
         }
         Ok(())
     }
+
+    unsafe fn apply_pending_processing_scale(&mut self) -> Result<(), vk::Result> {
+        let Some(scale) = self.temporal.pending_processing_scale.take() else {
+            return Ok(());
+        };
+        if (scale - self.diagnostics.processing_scale).abs() < f32::EPSILON {
+            return Ok(());
+        }
+        for slot in &self.slots {
+            unsafe { self.device.wait_for_fences(&[slot.fence], true, u64::MAX) }?;
+        }
+        let mut config = self.temporal.config.clone();
+        config.processing_scale = scale;
+        let resolution = ResolutionPlan::new(
+            self.temporal.resolution.game_extent,
+            self.temporal.resolution.output_extent,
+            scale,
+        );
+        let capture_enabled = self.temporal.capture.is_some();
+        unsafe {
+            self.temporal.rebuild(
+                TemporalPipelineDescriptor {
+                    instance: &self.instance,
+                    physical: self.physical,
+                    device: &self.device,
+                    info: self.info,
+                    resolution,
+                    config: &config,
+                    capture_enabled,
+                    image_count: self.output_images.len(),
+                },
+                &self.device,
+            )?;
+        }
+        self.diagnostics.processing_scale = scale;
+        self.diagnostics.processing_extent = [
+            resolution.processing_extent.width,
+            resolution.processing_extent.height,
+        ];
+        self.diagnostics.state = "Processing scale changed; history reset".into();
+        Ok(())
+    }
     pub unsafe fn prepare_frame(
         &mut self,
         _device: &ash::Device,
@@ -505,6 +438,7 @@ impl SwapchainRuntime {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
         unsafe { self.initialize(queue, family) }?;
+        unsafe { self.apply_pending_processing_scale() }?;
         let index = index as usize;
         let slot = self
             .slots
@@ -516,22 +450,22 @@ impl SwapchainRuntime {
             vk::ImageLayout::UNDEFINED
         };
         unsafe { self.device.wait_for_fences(&[slot.fence], true, u64::MAX) }?;
-        if let Some(quality) = self.pending_quality.take() {
-            if let Some(motion) = &mut self.motion {
+        if let Some(quality) = self.temporal.pending_quality.take() {
+            if let Some(motion) = &mut self.temporal.motion {
                 motion.set_quality(quality);
             }
-            self.history.reset();
-            self.reset_reason = GuidanceReset::PresetChanged;
-            if let Some(upscaler) = &mut self.upscaler {
+            self.temporal.history.reset();
+            self.temporal.reset_reason = GuidanceReset::PresetChanged;
+            if let Some(upscaler) = &mut self.temporal.upscaler {
                 upscaler.reset();
             }
             self.diagnostics.state = "Preset changed; history reset".into();
         }
-        if self.query_ready[index] && self.queries != vk::QueryPool::null() {
+        if self.temporal.query_ready[index] && self.temporal.queries != vk::QueryPool::null() {
             let mut times = [0u64; GPU_TIMESTAMPS];
             if unsafe {
                 self.device.get_query_pool_results(
-                    self.queries,
+                    self.temporal.queries,
                     index as u32 * GPU_TIMESTAMPS as u32,
                     &mut times,
                     vk::QueryResultFlags::TYPE_64,
@@ -540,7 +474,8 @@ impl SwapchainRuntime {
             .is_ok()
             {
                 let ms = [0, 1, 2, 3, 4].map(|i| {
-                    times[i + 1].wrapping_sub(times[i]) as f32 * self.timestamp_period / 1_000_000.0
+                    times[i + 1].wrapping_sub(times[i]) as f32 * self.temporal.timestamp_period
+                        / 1_000_000.0
                 });
                 self.diagnostics.capture_ms = ms[0];
                 self.diagnostics.motion_ms = ms[1];
@@ -550,12 +485,13 @@ impl SwapchainRuntime {
                 let temporal_ms = ms[1] + ms[2] + ms[3];
                 self.diagnostics.budget_warning =
                     temporal_ms > quality_budget(self.diagnostics.quality);
-                if self.history.frame_id >= 180 {
-                    if self.timings.len() == 18000 {
-                        self.timings.remove(0);
+                if self.temporal.history.frame_id >= 180 {
+                    if self.temporal.timings.len() == 18000 {
+                        self.temporal.timings.remove(0);
                     }
-                    self.timings.push(ms);
+                    self.temporal.timings.push(ms);
                     let mut totals = self
+                        .temporal
                         .timings
                         .iter()
                         .map(|timing| timing[1] + timing[2] + timing[3])
@@ -567,18 +503,21 @@ impl SwapchainRuntime {
                 }
             }
         }
-        self.pending_time = self.start.elapsed();
-        let frame_delta = self.last_time.map_or(std::time::Duration::ZERO, |last| {
-            self.pending_time.saturating_sub(last)
-        });
-        self.last_time = Some(self.pending_time);
+        self.temporal.pending_time = self.temporal.start.elapsed();
+        let frame_delta = self
+            .temporal
+            .last_time
+            .map_or(std::time::Duration::ZERO, |last| {
+                self.temporal.pending_time.saturating_sub(last)
+            });
+        self.temporal.last_time = Some(self.temporal.pending_time);
         self.diagnostics.frame_delta_ms = frame_delta.as_secs_f32() * 1_000.0;
         if frame_delta > std::time::Duration::from_millis(250) {
-            self.reset_reason = GuidanceReset::LongPause;
-            self.history.reset();
+            self.temporal.reset_reason = GuidanceReset::LongPause;
+            self.temporal.history.reset();
         }
-        let valid = self.history.valid(self.pending_time);
-        if self.motion.is_some() {
+        let valid = self.temporal.history.valid(self.temporal.pending_time);
+        if self.temporal.motion.is_some() {
             self.diagnostics.state = if valid {
                 "Estimated motion"
             } else {
@@ -586,26 +525,26 @@ impl SwapchainRuntime {
             }
             .into();
         }
-        let guidance_view = match (&self.guidance, &self.motion) {
+        let guidance_view = match (&self.temporal.guidance, &self.temporal.motion) {
             (Some(guidance), Some(motion)) => Some(guidance.view(
                 motion,
-                self.history.frame_id + 1,
-                self.resolution.processing_extent,
+                self.temporal.history.frame_id + 1,
+                self.temporal.resolution.processing_extent,
                 valid,
                 if valid {
                     GuidanceReset::None
                 } else {
-                    self.reset_reason
+                    self.temporal.reset_reason
                 },
             )),
             _ => None,
         };
         let guidance_view = guidance_view.and_then(|view| {
             let frame_extent = FrameExtent {
-                width: self.resolution.processing_extent.width,
-                height: self.resolution.processing_extent.height,
+                width: self.temporal.resolution.processing_extent.width,
+                height: self.temporal.resolution.processing_extent.height,
             };
-            if view.is_valid_for(self.history.frame_id + 1, frame_extent) {
+            if view.is_valid_for(self.temporal.history.frame_id + 1, frame_extent) {
                 Some(view)
             } else {
                 eprintln!("TuxScaling: invalid guidance metadata; reconstruction bypassed");
@@ -619,7 +558,10 @@ impl SwapchainRuntime {
             &mut self.diagnostics,
         )?;
         if let Some(quality) = frame.requested_quality {
-            self.pending_quality = Some(motion_quality(quality));
+            self.temporal.pending_quality = Some(motion_quality(quality));
+        }
+        if let Some(scale) = frame.requested_processing_scale {
+            self.temporal.pending_processing_scale = Some(scale);
         }
         unsafe {
             self.device
@@ -629,26 +571,26 @@ impl SwapchainRuntime {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
-            if self.queries != vk::QueryPool::null() {
+            if self.temporal.queries != vk::QueryPool::null() {
                 self.device.cmd_reset_query_pool(
                     slot.command,
-                    self.queries,
+                    self.temporal.queries,
                     index as u32 * GPU_TIMESTAMPS as u32,
                     GPU_TIMESTAMPS as u32,
                 );
                 self.device.cmd_write_timestamp(
                     slot.command,
                     vk::PipelineStageFlags::TOP_OF_PIPE,
-                    self.queries,
+                    self.temporal.queries,
                     index as u32 * GPU_TIMESTAMPS as u32,
                 );
             }
-            if let Some(capture) = &mut self.capture {
+            if let Some(capture) = &mut self.temporal.capture {
                 capture.record_scaled_from(
                     &self.device,
                     slot.command,
                     self.game_images[index],
-                    self.resolution.game_extent,
+                    self.temporal.resolution.game_extent,
                     vk::ImageLayout::PRESENT_SRC_KHR,
                     if self.game_images[index] == self.output_images[index] {
                         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
@@ -665,35 +607,40 @@ impl SwapchainRuntime {
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 );
             }
-            if self.queries != vk::QueryPool::null() {
+            if self.temporal.queries != vk::QueryPool::null() {
                 self.device.cmd_write_timestamp(
                     slot.command,
                     vk::PipelineStageFlags::ALL_COMMANDS,
-                    self.queries,
+                    self.temporal.queries,
                     index as u32 * GPU_TIMESTAMPS as u32 + 1,
                 );
             }
-            if let Some(motion) = &mut self.motion {
-                motion.record(slot.command, self.history.write_index(), valid, self.mode);
+            if let Some(motion) = &mut self.temporal.motion {
+                motion.record(
+                    slot.command,
+                    self.temporal.history.write_index(),
+                    valid,
+                    self.mode,
+                );
                 memory_barrier(&self.device, slot.command);
             }
-            if self.queries != vk::QueryPool::null() {
+            if self.temporal.queries != vk::QueryPool::null() {
                 self.device.cmd_write_timestamp(
                     slot.command,
                     vk::PipelineStageFlags::ALL_COMMANDS,
-                    self.queries,
+                    self.temporal.queries,
                     index as u32 * GPU_TIMESTAMPS as u32 + 2,
                 );
             }
-            if let Some(guidance) = &mut self.guidance {
+            if let Some(guidance) = &mut self.temporal.guidance {
                 guidance.record(slot.command, valid);
                 memory_barrier(&self.device, slot.command);
             }
-            if self.queries != vk::QueryPool::null() {
+            if self.temporal.queries != vk::QueryPool::null() {
                 self.device.cmd_write_timestamp(
                     slot.command,
                     vk::PipelineStageFlags::ALL_COMMANDS,
-                    self.queries,
+                    self.temporal.queries,
                     index as u32 * GPU_TIMESTAMPS as u32 + 3,
                 );
             }
@@ -706,13 +653,13 @@ impl SwapchainRuntime {
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 );
             }
-            if let (Some(upscaler), Some(guidance)) = (&mut self.upscaler, guidance_view) {
+            if let (Some(upscaler), Some(guidance)) = (&mut self.temporal.upscaler, guidance_view) {
                 upscaler.record(
                     slot.command,
                     self.output_images[index],
                     guidance,
                     valid,
-                    self.history.write_index(),
+                    self.temporal.history.write_index(),
                     match self.mode {
                         6 => 1,
                         7 => 2,
@@ -720,28 +667,28 @@ impl SwapchainRuntime {
                     },
                 );
             } else if self.game_images[index] != self.output_images[index]
-                && let Some(capture) = &self.capture
+                && let Some(capture) = &self.temporal.capture
             {
                 record_spatial_fallback(
                     &self.device,
                     slot.command,
                     capture,
                     self.output_images[index],
-                    self.resolution.output_extent,
+                    self.temporal.resolution.output_extent,
                 );
             }
             if self.mode == 5
-                && let Some(upscaler) = &self.upscaler
+                && let Some(upscaler) = &self.temporal.upscaler
             {
                 upscaler.record_debug(
                     slot.command,
                     self.output_images[index],
-                    self.history.write_index(),
+                    self.temporal.history.write_index(),
                 );
             }
             if self.mode != 0
                 && self.mode <= 3
-                && let Some(motion) = &self.motion
+                && let Some(motion) = &self.temporal.motion
             {
                 image_barrier(
                     &self.device,
@@ -803,11 +750,11 @@ impl SwapchainRuntime {
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 );
             }
-            if self.queries != vk::QueryPool::null() {
+            if self.temporal.queries != vk::QueryPool::null() {
                 self.device.cmd_write_timestamp(
                     slot.command,
                     vk::PipelineStageFlags::ALL_COMMANDS,
-                    self.queries,
+                    self.temporal.queries,
                     index as u32 * GPU_TIMESTAMPS as u32 + 4,
                 );
             }
@@ -822,11 +769,11 @@ impl SwapchainRuntime {
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::ImageLayout::PRESENT_SRC_KHR,
             );
-            if self.queries != vk::QueryPool::null() {
+            if self.temporal.queries != vk::QueryPool::null() {
                 self.device.cmd_write_timestamp(
                     slot.command,
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.queries,
+                    self.temporal.queries,
                     index as u32 * GPU_TIMESTAMPS as u32 + 5,
                 );
             }
@@ -835,7 +782,7 @@ impl SwapchainRuntime {
         if self.game_images[index] != self.output_images[index] {
             self.pending_output = Some(index);
         }
-        self.query_ready[index] = true;
+        self.temporal.query_ready[index] = true;
         Ok(FrameSubmission {
             command_buffer: slot.command,
             fence: slot.fence,
@@ -843,14 +790,14 @@ impl SwapchainRuntime {
         })
     }
     pub fn submitted(&mut self) {
-        self.history.commit(self.pending_time);
+        self.temporal.history.commit(self.temporal.pending_time);
         if let Some(index) = self.pending_output.take() {
             self.output_presented[index] = true;
         }
-        self.diagnostics.frame_id = self.history.frame_id;
+        self.diagnostics.frame_id = self.temporal.history.frame_id;
     }
     pub fn presentation_failed(&mut self) {
-        self.history.reset();
+        self.temporal.history.reset();
         self.output_presented.fill(false);
     }
     pub unsafe fn destroy(self, _device: &ash::Device) {
@@ -859,13 +806,18 @@ impl SwapchainRuntime {
 }
 impl Drop for SwapchainRuntime {
     fn drop(&mut self) {
-        if !self.timings.is_empty() {
+        if !self.temporal.timings.is_empty() {
             let mut summary = String::new();
             for (axis, name) in ["capture", "flow", "guidance", "reconstruction", "overlay"]
                 .iter()
                 .enumerate()
             {
-                let mut values = self.timings.iter().map(|v| v[axis]).collect::<Vec<_>>();
+                let mut values = self
+                    .temporal
+                    .timings
+                    .iter()
+                    .map(|v| v[axis])
+                    .collect::<Vec<_>>();
                 values.sort_by(f32::total_cmp);
                 summary.push_str(&format!(
                     " {name}: median={:.3} p95={:.3} ms",
@@ -877,12 +829,12 @@ impl Drop for SwapchainRuntime {
                 "TuxScaling {}x{} GPU samples={}{}",
                 self.info.extent.width,
                 self.info.extent.height,
-                self.timings.len(),
+                self.temporal.timings.len(),
                 summary
             );
         }
-        drop(self.motion.take());
-        drop(self.capture.take());
+        drop(self.temporal.motion.take());
+        drop(self.temporal.capture.take());
         drop(self.overlay.take());
         unsafe {
             for slot in &self.slots {
@@ -890,7 +842,7 @@ impl Drop for SwapchainRuntime {
                 self.device.destroy_fence(slot.fence, None);
             }
             self.device.destroy_command_pool(self.pool, None);
-            self.device.destroy_query_pool(self.queries, None);
+            self.device.destroy_query_pool(self.temporal.queries, None);
         }
     }
 }

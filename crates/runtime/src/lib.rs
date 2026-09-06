@@ -43,8 +43,9 @@ impl Default for Runtime {
 
 #[cfg(test)]
 mod tests {
-    use super::{PresentDecision, Runtime, RuntimeState, SwapchainImages};
+    use super::{PresentDecision, Runtime, RuntimeState, SwapchainImages, TemporalPipeline};
     use ash::vk;
+    use tuxscaling_upscaler::ResolutionPlan;
 
     #[test]
     fn starts_bypassed_and_passes_through() {
@@ -66,5 +67,24 @@ mod tests {
         assert_eq!(swapchain.game_images, images);
         assert_eq!(swapchain.output_images, images);
         assert_eq!(swapchain.game_extent, extent);
+    }
+
+    #[test]
+    fn temporal_pipeline_owns_the_explicit_resolution_plan() {
+        let plan = ResolutionPlan::new(
+            vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            },
+            1.0,
+        );
+
+        let pipeline = TemporalPipeline::for_test(plan);
+
+        assert_eq!(pipeline.resolution, plan);
     }
 }
