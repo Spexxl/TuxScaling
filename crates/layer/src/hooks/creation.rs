@@ -104,6 +104,17 @@ fn virtual_output_extent(
     surface: vk::SurfaceKHR,
     game_extent: vk::Extent2D,
 ) -> Option<(vk::Extent2D, ResizedWindow)> {
+    let debug_test = cfg!(debug_assertions)
+        && std::env::var("TUXSCALING_TEST_FORCE_VIRTUAL")
+            .ok()
+            .as_deref()
+            == Some("1");
+    if debug_test {
+        eprintln!(
+            "TuxScaling virtual output probe: game={}x{}",
+            game_extent.width, game_extent.height
+        );
+    }
     let config = if let Ok(path) = std::env::var("TUXSCALING_CONFIG") {
         let source = std::fs::read_to_string(path).ok()?;
         tuxscaling_config::Config::parse(&source).ok()?
@@ -117,14 +128,43 @@ fn virtual_output_extent(
             Some(vk::Extent2D { width, height })
         }
     };
-    let surface = surfaces()
+    let surface = match surfaces()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(&surface)
-        .copied()?;
-    let display = tuxscaling_display::X11Display::connect().ok()?;
-    let target_info = display.target_for_window(surface.window).ok()?;
-    if !target_info.window.fullscreen && target_info.window.rect != target_info.monitor.rect {
+        .copied()
+    {
+        Some(surface) => surface,
+        None => {
+            if debug_test {
+                eprintln!("TuxScaling virtual output skipped: unknown surface");
+            }
+            return None;
+        }
+    };
+    let display = match tuxscaling_display::X11Display::connect() {
+        Ok(display) => display,
+        Err(error) => {
+            if debug_test {
+                eprintln!("TuxScaling virtual output skipped: display {error}");
+            }
+            return None;
+        }
+    };
+    let target_info = match display.target_for_window(surface.window) {
+        Ok(target) => target,
+        Err(error) => {
+            if debug_test {
+                eprintln!("TuxScaling virtual output skipped: target {error}");
+            }
+            return None;
+        }
+    };
+    let force_test_virtual = debug_test;
+    if !force_test_virtual
+        && !target_info.window.fullscreen
+        && target_info.window.rect != target_info.monitor.rect
+    {
         return None;
     }
     let target = target.unwrap_or(vk::Extent2D {
@@ -326,8 +366,42 @@ unsafe fn create_device_inner(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
     let create_device: vk::PFN_vkCreateDevice = unsafe { std::mem::transmute(proc) };
-    let result =
-        unsafe { create_device(physical_device, create_info, allocation_callbacks, device) };
+    let physical_features = unsafe { instance.get_physical_device_features(physical_device) };
+    let mut modified_info = unsafe { *create_info };
+    let mut enabled_features = unsafe { (*create_info).p_enabled_features.as_ref() }
+        .copied()
+        .unwrap_or_default();
+    let mut features2 = None;
+    if physical_features.shader_storage_image_write_without_format != 0 {
+        let mut next = unsafe { (*create_info).p_next.cast::<vk::BaseInStructure<'_>>() };
+        while !next.is_null() {
+            if unsafe { (*next).s_type } == vk::StructureType::PHYSICAL_DEVICE_FEATURES_2 {
+                let source = unsafe { &*next.cast::<vk::PhysicalDeviceFeatures2<'_>>() };
+                let mut replacement = *source;
+                replacement
+                    .features
+                    .shader_storage_image_write_without_format = vk::TRUE;
+                features2 = Some(replacement);
+                break;
+            }
+            next = unsafe { (*next).p_next.cast() };
+        }
+        if let Some(replacement) = features2.as_mut() {
+            modified_info.p_enabled_features = std::ptr::null();
+            modified_info.p_next = replacement as *mut _ as *const c_void;
+        } else {
+            enabled_features.shader_storage_image_write_without_format = vk::TRUE;
+            modified_info.p_enabled_features = &enabled_features;
+        }
+    }
+    let result = unsafe {
+        create_device(
+            physical_device,
+            &modified_info,
+            allocation_callbacks,
+            device,
+        )
+    };
     if result != vk::Result::SUCCESS {
         return result;
     }
@@ -497,6 +571,10 @@ unsafe fn create_swapchain_inner(
     let mut resized = virtual_output_extent(original.surface, original.image_extent);
     if let Some((extent, _)) = resized {
         modified.image_extent = extent;
+        eprintln!(
+            "TuxScaling virtual output requested: game={}x{} output={}x{}",
+            original.image_extent.width, original.image_extent.height, extent.width, extent.height
+        );
     }
     let needed = vk::ImageUsageFlags::TRANSFER_SRC
         | vk::ImageUsageFlags::TRANSFER_DST
@@ -793,5 +871,14 @@ mod tests {
         let info = vk::SwapchainCreateInfoKHR::default().push_next(&mut group);
 
         assert!(!virtual_swapchain_supported(&info));
+    }
+
+    #[test]
+    fn accepts_exclusive_single_layer_swapchains() {
+        let info = vk::SwapchainCreateInfoKHR::default()
+            .image_array_layers(1)
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        assert!(virtual_swapchain_supported(&info));
     }
 }

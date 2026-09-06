@@ -724,6 +724,12 @@ impl SwapchainRuntime {
             }
             if let Some(guidance) = &mut self.temporal.guidance {
                 if self.temporal.queries != vk::QueryPool::null() {
+                    self.device.cmd_reset_query_pool(
+                        slot.command,
+                        self.temporal.queries,
+                        index as u32 * GPU_TIMESTAMPS as u32 + 10,
+                        3,
+                    );
                     guidance.record_timed(
                         slot.command,
                         valid,
@@ -760,6 +766,7 @@ impl SwapchainRuntime {
                     guidance,
                     valid,
                     self.temporal.history.write_index(),
+                    index,
                     match self.mode {
                         6 => 1,
                         7 => 2,

@@ -130,6 +130,7 @@ impl TemporalPipeline {
                         resolution.output_extent,
                         info.format,
                         view,
+                        image_count,
                     )
                 } {
                     Ok(value) => upscaler = Some(value),

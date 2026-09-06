@@ -19,7 +19,7 @@ pub struct ReferenceUpscaler {
     sampler: vk::Sampler,
     descriptor_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
+    descriptor_sets: Vec<vk::DescriptorSet>,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     pub input_extent: vk::Extent2D,
@@ -28,6 +28,7 @@ pub struct ReferenceUpscaler {
 }
 
 impl ReferenceUpscaler {
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         device: &ash::Device,
         memory: &vk::PhysicalDeviceMemoryProperties,
@@ -36,6 +37,7 @@ impl ReferenceUpscaler {
         output_extent: vk::Extent2D,
         output_format: vk::Format,
         guidance: GuidanceView,
+        image_count: usize,
     ) -> Result<Self, vk::Result> {
         let usage = vk::ImageUsageFlags::TRANSFER_SRC
             | vk::ImageUsageFlags::TRANSFER_DST
@@ -51,7 +53,7 @@ impl ReferenceUpscaler {
             sampler: vk::Sampler::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
-            descriptor_set: vk::DescriptorSet::null(),
+            descriptor_sets: Vec::new(),
             pipeline_layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
             input_extent,
@@ -90,27 +92,27 @@ impl ReferenceUpscaler {
         result.descriptor_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(1)
+                    .max_sets(image_count.max(1) as u32)
                     .pool_sizes(&[
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                            descriptor_count: 2,
+                            descriptor_count: (2 * image_count.max(1)) as u32,
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_IMAGE,
-                            descriptor_count: 7,
+                            descriptor_count: (7 * image_count.max(1)) as u32,
                         },
                     ]),
                 None,
             )
         }?;
-        result.descriptor_set = unsafe {
+        result.descriptor_sets = unsafe {
             device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(result.descriptor_pool)
-                    .set_layouts(&[result.descriptor_layout]),
+                    .set_layouts(&vec![result.descriptor_layout; image_count.max(1)]),
             )
-        }?[0];
+        }?;
 
         let sampled = [
             vk::DescriptorImageInfo::default()
@@ -131,18 +133,23 @@ impl ReferenceUpscaler {
             (7, guidance.depth.view),
             (8, result.output.view),
         ];
-        let mut writes = vec![
-            vk::WriteDescriptorSet::default()
-                .dst_set(result.descriptor_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&sampled[0..1]),
-            vk::WriteDescriptorSet::default()
-                .dst_set(result.descriptor_set)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&sampled[1..2]),
-        ];
+        let mut writes = Vec::with_capacity(result.descriptor_sets.len() * (2 + storage.len()));
+        for descriptor_set in &result.descriptor_sets {
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*descriptor_set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&sampled[0..1]),
+            );
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*descriptor_set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&sampled[1..2]),
+            );
+        }
         let storage_infos = storage
             .iter()
             .map(|(_, view)| {
@@ -152,13 +159,15 @@ impl ReferenceUpscaler {
             })
             .collect::<Vec<_>>();
         for ((binding, _), image) in storage.iter().zip(storage_infos.iter()) {
-            writes.push(
-                vk::WriteDescriptorSet::default()
-                    .dst_set(result.descriptor_set)
-                    .dst_binding(*binding)
-                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                    .image_info(std::slice::from_ref(image)),
-            );
+            for descriptor_set in &result.descriptor_sets {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(*descriptor_set)
+                        .dst_binding(*binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(std::slice::from_ref(image)),
+                );
+            }
         }
         unsafe { device.update_descriptor_sets(&writes, &[]) };
         result.pipeline_layout = unsafe {
@@ -208,6 +217,7 @@ impl ReferenceUpscaler {
         guidance: GuidanceView,
         valid: bool,
         history_write: usize,
+        slot: usize,
         debug_view: u32,
     ) {
         let history_read = 1 - history_write;
@@ -252,7 +262,7 @@ impl ReferenceUpscaler {
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             self.device.update_descriptor_sets(
                 &[vk::WriteDescriptorSet::default()
-                    .dst_set(self.descriptor_set)
+                    .dst_set(self.descriptor_sets[slot % self.descriptor_sets.len()])
                     .dst_binding(1)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&sampled_history)],
@@ -276,7 +286,7 @@ impl ReferenceUpscaler {
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline_layout,
                 0,
-                &[self.descriptor_set],
+                &[self.descriptor_sets[slot % self.descriptor_sets.len()]],
                 &[],
             );
             let params = [

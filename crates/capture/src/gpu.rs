@@ -136,6 +136,30 @@ impl Capture {
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 );
+            } else {
+                image_barrier(
+                    device,
+                    command,
+                    self.previous.handle,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                );
+                device.cmd_clear_color_image(
+                    command,
+                    self.previous.handle,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 1.0],
+                    },
+                    &[tuxscaling_vulkan::color_range()],
+                );
+                image_barrier(
+                    device,
+                    command,
+                    self.previous.handle,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                );
             }
             image_barrier(
                 device,
