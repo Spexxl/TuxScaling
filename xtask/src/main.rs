@@ -76,6 +76,7 @@ fn main() -> ExitCode {
                         "VK_LAYER_TUXSCALING_overlay:VK_LAYER_KHRONOS_validation",
                     )
                     .env("TUXSCALING_VIEW", "motion")
+                    .env("TUXSCALING_TEST_FORCE_VIRTUAL", "1")
                     .env("TUXSCALING_TEST_SECONDS", "12")
                     .output(),
             )

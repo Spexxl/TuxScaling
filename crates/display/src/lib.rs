@@ -160,24 +160,40 @@ impl X11Display {
 
     pub fn monitor_for_window(&self, window: u64) -> Result<Monitor, DisplayError> {
         let window_rect = self.window_rect(window)?;
-        let reply = self
+        let monitors = self
             .connection
             .randr_get_monitors(window as Window, true)
-            .map_err(operation)?
-            .reply()
-            .map_err(operation)?;
-        let monitors = reply
-            .monitors
-            .iter()
-            .map(|monitor| {
-                Monitor::new(Rect::new(
-                    monitor.x.into(),
-                    monitor.y.into(),
-                    monitor.width.into(),
-                    monitor.height.into(),
-                ))
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|reply| {
+                reply
+                    .monitors
+                    .iter()
+                    .map(|monitor| {
+                        Monitor::new(Rect::new(
+                            monitor.x.into(),
+                            monitor.y.into(),
+                            monitor.width.into(),
+                            monitor.height.into(),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
             })
-            .collect::<Vec<_>>();
+            .filter(|monitors| !monitors.is_empty())
+            .unwrap_or_else(|| {
+                self.connection
+                    .get_geometry(self.root)
+                    .ok()
+                    .and_then(|cookie| cookie.reply().ok())
+                    .map_or_else(Vec::new, |geometry| {
+                        vec![Monitor::new(Rect::new(
+                            0,
+                            0,
+                            geometry.width.into(),
+                            geometry.height.into(),
+                        ))]
+                    })
+            });
         select_monitor(window_rect, &monitors).ok_or(DisplayError::Monitor)
     }
 

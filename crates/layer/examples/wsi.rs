@@ -91,7 +91,12 @@ unsafe fn replace(
                     && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
             })
             .unwrap();
-        let extent = if caps.current_extent.width == u32::MAX {
+        let extent = if caps.current_extent.width == u32::MAX
+            || std::env::var("TUXSCALING_TEST_FORCE_VIRTUAL")
+                .ok()
+                .as_deref()
+                == Some("1")
+        {
             extent
         } else {
             caps.current_extent
@@ -165,8 +170,8 @@ unsafe fn run() {
                 0,
             );
             XStoreName(display, w, c"TuxScaling WSI validation".as_ptr());
-            mark_fullscreen(display, w);
             XMapWindow(display, w);
+            mark_fullscreen(display, w);
             w
         });
         XFlush(display);
@@ -295,7 +300,7 @@ unsafe fn run() {
             .unwrap();
         let present: vk::PFN_vkQueuePresentKHR = std::mem::transmute(present_proc);
         while start.elapsed() < Duration::from_secs(seconds) {
-            if frame > 0 && frame.is_multiple_of(120) {
+            if frame > 0 && frame.is_multiple_of(4) {
                 let extent = if resizes % 2 == 0 {
                     vk::Extent2D {
                         width: 480,

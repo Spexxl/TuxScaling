@@ -27,6 +27,8 @@ cargo xtask smoke
 
 `cargo xtask check` is the preferred host-only command. `gpu-check` runs ignored GPU tests. `smoke` exercises multiple swapchains, grouped presents, resize, capture, optical flow, virtual-output fallback, and validation synchronization.
 
+The debug WSI harness sets `TUXSCALING_TEST_FORCE_VIRTUAL=1` so it can validate small logical game images against the discovered monitor output without depending on a window manager fullscreen transition. Release builds ignore this test-only override.
+
 ## Native boundary
 
 The native boundary is intentionally SDK-free in the initial milestone:
