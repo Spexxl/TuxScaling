@@ -66,6 +66,8 @@ debug_view = "original"
 
 The fixed quality targets are Ultra (12 ms), High (8 ms), Balanced (4 ms), and Performance (2.5 ms) for temporal work at 1080p. The overlay reports capture, luma, pyramid, forward/backward flow, confidence, scene, invalidate, reactive, exposure, reconstruction, and overlay timings. It warns when measured work exceeds the selected target; it never changes the preset automatically.
 
+The current RADV reference measurement on the RX 9060 XT at 1920x1080, after 180 warm-up frames and 120 recorded samples, is: capture 0.028 ms, luma 0.014 ms, pyramid 0.007 ms, forward 1.532 ms, backward 1.552 ms, confidence 0.010 ms, scene 5.175 ms, invalidate 0.002 ms, reactive 0.024 ms, exposure 17.237 ms, reconstruction 0.105 ms, and overlay 0.002 ms. Each value is the median; the corresponding p95 values are capture 0.028, luma 0.015, pyramid 0.007, forward 1.560, backward 1.588, confidence 0.021, scene 5.231, invalidate 0.018, reactive 0.025, exposure 17.498, reconstruction 0.106, and overlay 0.002 ms. This reference run uses the default processing scale and records all passes without automatic quality changes.
+
 ## Language and naming policy
 
 All source code, identifiers, comments, documentation, configuration keys, logs, errors, tests, UI text, and commit messages are written in English. Directory names remain short; Cargo package names use the `tuxscaling-` namespace.
