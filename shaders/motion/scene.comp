@@ -41,7 +41,7 @@ void main() {
         atomicAdd(current_bins[log_bin(current)], 1);
         atomicAdd(previous_bins[log_bin(previous)], 1);
         ivec2 confidence_size = imageSize(confidence_image);
-        ivec2 confidence_coord = min(ivec2(q / 2u), confidence_size - 1);
+        ivec2 confidence_coord = min(ivec2(q * 2u), confidence_size - 1);
         if (imageLoad(confidence_image, confidence_coord).r > 0.2) {
             atomicAdd(good_count, 1);
         }

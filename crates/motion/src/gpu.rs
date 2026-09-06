@@ -90,7 +90,7 @@ fn visualization_needed(mode: u32) -> bool {
 pub struct MotionField {
     pub vectors: vk::Image,
     pub confidence: vk::Image,
-    pub grid: vk::Extent2D,
+    pub extent: vk::Extent2D,
     pub original: vk::Extent2D,
     pub previous_id: u64,
     pub current_id: u64,
@@ -155,10 +155,6 @@ impl MotionEstimator {
                     | vk::ImageUsageFlags::SAMPLED,
             )
         };
-        let grid = vk::Extent2D {
-            width: extent.width.div_ceil(4),
-            height: extent.height.div_ceil(4),
-        };
         let mut result = Self {
             device: device.clone(),
             levels,
@@ -168,8 +164,10 @@ impl MotionEstimator {
             metadata: buffer(32)?,
             stats: buffer(stats_size)?,
             visualization: image(extent, vk::Format::R8G8B8A8_UNORM)?,
-            vectors: image(grid, vk::Format::R16G16_SFLOAT)?,
-            confidence: image(grid, vk::Format::R8_UNORM)?,
+            // The pyramid and its coarse flow buffers are implementation
+            // details.  Consumers receive a dense processing-extent signal.
+            vectors: image(extent, vk::Format::R16G16_SFLOAT)?,
+            confidence: image(extent, vk::Format::R8_UNORM)?,
             sampler: vk::Sampler::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
@@ -331,6 +329,7 @@ impl MotionEstimator {
             include_bytes!(concat!(env!("OUT_DIR"), "/scene_reduce.spv")).as_slice(),
             include_bytes!(concat!(env!("OUT_DIR"), "/invalidate.spv")).as_slice(),
             include_bytes!(concat!(env!("OUT_DIR"), "/visualize.spv")).as_slice(),
+            include_bytes!(concat!(env!("OUT_DIR"), "/dense_resolve.spv")).as_slice(),
         ] {
             let words = ash::util::read_spv(&mut std::io::Cursor::new(bytes))
                 .map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?;
@@ -540,6 +539,14 @@ impl MotionEstimator {
                 }
             }
             let grid = self.vectors.extent;
+            // Resolve the private level-0 coarse grid into processing-extent
+            // motion before confidence and all external consumers sample it.
+            let mut dense_params = self.params(0, 0, valid, mode, profile.levels);
+            dense_params[0] = grid.width;
+            dense_params[1] = grid.height;
+            dense_params[4] = self.levels[0].width;
+            dense_params[5] = self.levels[0].height;
+            self.dispatch(command, 8, dense_params, grid.width, grid.height);
             self.dispatch(
                 command,
                 3,

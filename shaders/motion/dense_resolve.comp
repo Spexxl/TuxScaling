@@ -1,0 +1,72 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// The flow search intentionally runs on a private, compact grid.  This pass
+// expands that grid once, preserving its sub-pixel result and rejecting
+// cross-edge neighbours with a luminance-guided weighted median.
+
+vec3 rgb_at(ivec2 q) {
+    ivec2 size=textureSize(color_frame,0);
+    q=clamp(q,ivec2(0),size-1);
+    vec3 c=clamp(texelFetch(color_frame,q,0).rgb,0,1);
+    if(p.decode_srgb!=0) c=mix(c/12.92,pow((c+0.055)/1.055,vec3(2.4)),greaterThan(c,vec3(0.04045)));
+    return c;
+}
+float luma_at(ivec2 q) {
+    return dot(rgb_at(q),vec3(0.2126,0.7152,0.0722));
+}
+vec4 coarse_flow(ivec2 q,bool reverse) {
+    int gw=int((p.parent_width+1)/2);
+    int gh=int((p.parent_height+1)/2);
+    q=clamp(q,ivec2(0),ivec2(gw,gh)-1);
+    uint index=p.grid_offset+uint(q.y*gw+q.x);
+    return reverse?backward_flow[index]:forward_flow[index];
+}
+float weighted_median(inout float values[9],inout float weights[9]) {
+    for(int i=0;i<9;i++) for(int j=i+1;j<9;j++) if(values[j]<values[i]) {
+        float value=values[i]; values[i]=values[j]; values[j]=value;
+        float weight=weights[i]; weights[i]=weights[j]; weights[j]=weight;
+    }
+    float total=0.0;
+    for(int i=0;i<9;i++) total+=weights[i];
+    float midpoint=total*0.5;
+    float sum=0.0;
+    for(int i=0;i<9;i++) {
+        sum+=weights[i];
+        if(sum>=midpoint) return values[i];
+    }
+    return values[8];
+}
+void main() {
+    uvec2 q=gl_GlobalInvocationID.xy;
+    if(q.x>=p.width || q.y>=p.height) return;
+    ivec2 pixel=ivec2(q);
+    vec2 grid_position=(vec2(pixel)+0.5)/4.0-0.5;
+    ivec2 center=ivec2(round(grid_position));
+    float center_luma=luma_at(pixel);
+    float x_values[9];
+    float y_values[9];
+    float x_weights[9];
+    float y_weights[9];
+    int n=0;
+    for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++) {
+        ivec2 coarse=center+ivec2(x,y);
+        vec2 candidate=coarse_flow(coarse,false).xy*2.0;
+        ivec2 neighbour=clamp(pixel+ivec2(x,y)*4,ivec2(0),ivec2(p.width,p.height)-1);
+        float edge=abs(luma_at(neighbour)-center_luma);
+        float weight=1.0/(1.0+edge*24.0);
+        // Keep the centre sample authoritative at a strong image edge.
+        if(x==0 && y==0) weight=1.0;
+        x_values[n]=candidate.x;
+        y_values[n]=candidate.y;
+        x_weights[n]=weight;
+        y_weights[n]=weight;
+        n++;
+    }
+    vec2 dense=vec2(
+        weighted_median(x_values,x_weights),
+        weighted_median(y_values,y_weights));
+    if(p.valid==0 || any(isnan(dense)) || any(isinf(dense))) dense=vec2(0);
+    imageStore(motion_image,pixel,vec4(dense,0,0));
+}

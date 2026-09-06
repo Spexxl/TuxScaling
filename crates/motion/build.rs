@@ -16,6 +16,7 @@ fn main() {
         "scene_reduce",
         "invalidate",
         "visualize",
+        "dense_resolve",
     ] {
         let source = root.join(format!("{name}.comp"));
         println!("cargo:rerun-if-changed={}", source.display());

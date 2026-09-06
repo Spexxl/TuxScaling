@@ -84,7 +84,7 @@ void main() {
         imageStore(output_image, pixel, vec4(value, value, value, 1.0));
         return;
     }
-    ivec2 motion_pixel = min(input_pixel / 4, ivec2(p.motion_width, p.motion_height) - 1);
+    ivec2 motion_pixel = min(input_pixel, ivec2(p.motion_width, p.motion_height) - 1);
     vec2 motion = imageLoad(motion_image, motion_pixel).xy;
     vec2 history_uv = clamp(
         output_uv + motion / vec2(p.input_width, p.input_height) * content_size,

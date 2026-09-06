@@ -35,7 +35,7 @@ void main() {
     }
     if (q.x >= p.width || q.y >= p.height) return;
     ivec2 pixel = ivec2(q);
-    ivec2 confidence_pixel = min(pixel / 4, imageSize(confidence_image) - 1);
+    ivec2 confidence_pixel = min(pixel, imageSize(confidence_image) - 1);
     float confidence = imageLoad(confidence_image, confidence_pixel).r;
     float disocclusion = 1.0 - confidence;
     float reactive = 1.0;

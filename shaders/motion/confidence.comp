@@ -1,17 +1,62 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
+
+float level0_sample(bool previous,vec2 original) {
+    vec2 q=original*0.5;
+    ivec2 a=ivec2(floor(q));
+    vec2 f=fract(q);
+    ivec2 size=ivec2(p.parent_width,p.parent_height);
+    a=clamp(a,ivec2(0),size-1);
+    ivec2 ax=clamp(a+ivec2(1,0),ivec2(0),size-1);
+    ivec2 ay=clamp(a+ivec2(0,1),ivec2(0),size-1);
+    ivec2 axy=clamp(a+ivec2(1,1),ivec2(0),size-1);
+    float v00=previous?previous_luma[p.offset+uint(a.y)*p.parent_width+uint(a.x)]:current_luma[p.offset+uint(a.y)*p.parent_width+uint(a.x)];
+    float v10=previous?previous_luma[p.offset+uint(ax.y)*p.parent_width+uint(ax.x)]:current_luma[p.offset+uint(ax.y)*p.parent_width+uint(ax.x)];
+    float v01=previous?previous_luma[p.offset+uint(ay.y)*p.parent_width+uint(ay.x)]:current_luma[p.offset+uint(ay.y)*p.parent_width+uint(ay.x)];
+    float v11=previous?previous_luma[p.offset+uint(axy.y)*p.parent_width+uint(axy.x)]:current_luma[p.offset+uint(axy.y)*p.parent_width+uint(axy.x)];
+    return mix(mix(v00,v10,f.x),mix(v01,v11,f.x),f.y);
+}
+vec4 coarse(ivec2 q,bool reverse) {
+    int gw=int((p.parent_width+1)/2);
+    int gh=int((p.parent_height+1)/2);
+    q=clamp(q,ivec2(0),ivec2(gw,gh)-1);
+    uint i=p.grid_offset+uint(q.y*gw+q.x);
+    return reverse?backward_flow[i]:forward_flow[i];
+}
 void main() {
     uvec2 q=gl_GlobalInvocationID.xy;
     uvec2 size=uvec2(imageSize(motion_image));
     if(any(greaterThanEqual(q,size))) return;
-    vec4 f=forward_flow[q.y*size.x+q.x];
-    vec2 target=vec2(q)+f.xy*0.5;
-    ivec2 t=ivec2(round(target));
-    bool inside=all(greaterThanEqual(t,ivec2(0)))&&all(lessThan(t,ivec2(size)));
-    vec2 b=inside?backward_flow[uint(t.y)*size.x+uint(t.x)].xy:vec2(1000);
-    float consistency=length((f.xy+b)*2);
-    float confidence=inside&&p.valid!=0?exp(-f.z*12)*f.w*clamp(1-consistency/2,0,1):0;
-    imageStore(motion_image,ivec2(q),vec4(p.valid!=0?f.xy*2:vec2(0),0,0));
-    imageStore(confidence_image,ivec2(q),vec4(confidence));
+    ivec2 pixel=ivec2(q);
+    vec2 motion=imageLoad(motion_image,pixel).xy;
+    vec2 target=vec2(pixel)+motion;
+    bool inside=all(greaterThanEqual(target,vec2(0))) &&
+        all(lessThanEqual(target,vec2(size)-vec2(1)));
+    ivec2 target_grid=ivec2(floor(target/4.0));
+    vec4 forward=coarse(ivec2(floor(vec2(pixel)/4.0)),false);
+    vec2 backward=coarse(target_grid,true).xy*2.0;
+    float consistency=inside?length(motion+backward):1000.0;
+    float consistency_score=exp(-0.65*consistency);
+
+    float current=level0_sample(false,vec2(pixel));
+    float previous=inside?level0_sample(true,target):0.0;
+    float residual=abs(current-previous);
+    float photometric=exp(-18.0*sqrt(residual*residual+1e-4));
+
+    float stability=0.0;
+    for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++) {
+        ivec2 n=clamp(pixel+ivec2(x,y),ivec2(0),ivec2(size)-1);
+        stability+=length(imageLoad(motion_image,n).xy-motion);
+    }
+    float spatial=exp(-0.12*stability/9.0);
+    float ambiguity=clamp(forward.w,0.0,1.0);
+    float bounds=inside?1.0:0.0;
+    float confidence=(p.valid!=0)?photometric*ambiguity*consistency_score*bounds*spatial:0.0;
+    if(any(isnan(motion)) || any(isinf(motion)) || isnan(confidence) || isinf(confidence)) {
+        motion=vec2(0);
+        confidence=0.0;
+    }
+    imageStore(motion_image,pixel,vec4(p.valid!=0?motion:vec2(0),0,0));
+    imageStore(confidence_image,pixel,vec4(clamp(confidence,0.0,1.0)));
 }

@@ -7,9 +7,9 @@ vec3 hsv(float h,float v) {
 void main() {
     ivec2 q=ivec2(gl_GlobalInvocationID.xy), size=imageSize(visualization);
     if(any(greaterThanEqual(q,size))) return;
-    ivec2 grid=min(q/4,imageSize(motion_image)-1);
-    vec2 flow=imageLoad(motion_image,grid).xy;
-    float confidence=imageLoad(confidence_image,grid).r;
+    ivec2 guidance_pixel=min(q,imageSize(motion_image)-1);
+    vec2 flow=imageLoad(motion_image,guidance_pixel).xy;
+    float confidence=imageLoad(confidence_image,guidance_pixel).r;
     vec3 color;
     if(p.mode==1) {
         ivec2 l=min(q/2,ivec2(p.width,p.height)-1);
