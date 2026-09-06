@@ -43,16 +43,19 @@ impl OverlayRenderer {
         device: &ash::Device,
         info: SwapchainInfo,
         images: &[vk::Image],
+        window: Option<u64>,
     ) -> Result<Self, vk::Result> {
         let mut result = Self {
             device: device.clone(),
             info,
             render_pass: vk::RenderPass::null(),
             slots: Vec::new(),
-            input: X11Input::connect()
-                .map_err(|error| eprintln!("TuxScaling input: {error}"))
-                .ok(),
-            visible: true,
+            input: window.and_then(|window| {
+                X11Input::connect(window)
+                    .map_err(|error| eprintln!("TuxScaling input: {error}"))
+                    .ok()
+            }),
+            visible: false,
         };
         let attachments = [vk::AttachmentDescription::default()
             .format(info.format)

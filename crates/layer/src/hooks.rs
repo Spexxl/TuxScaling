@@ -5,21 +5,33 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tuxscaling_overlay_vulkan::SwapchainInfo;
-use tuxscaling_runtime::SwapchainRuntime as OverlaySwapchain;
+use tuxscaling_runtime::{
+    SwapchainImages, SwapchainRuntime as OverlaySwapchain, SwapchainRuntimeCreateInfo,
+};
 
 use super::{
     loader::{LAYER_LINK_INFO, LayerCreateInfo, next_gipa},
-    state::{DeviceState, QueueState, SwapchainState, devices, instances, queues, swapchains},
+    state::{
+        DeviceState, QueueState, SwapchainState, X11Surface, devices, instances, queues, surfaces,
+        swapchains,
+    },
 };
 
+mod acquire;
 mod creation;
 mod lifetime;
 mod presentation;
+mod surface;
+use acquire::{acquire_next_image_khr, acquire_next_image2_khr, get_swapchain_images_khr};
 use creation::{
     create_device, create_instance, create_swapchain_khr, get_device_queue, get_device_queue2,
 };
 use lifetime::{destroy_device, destroy_instance, destroy_swapchain_khr};
 use presentation::queue_present_khr;
+use surface::{
+    create_xcb_surface_khr, create_xlib_surface_khr, destroy_surface_khr,
+    get_physical_device_surface_capabilities_khr, get_physical_device_surface_capabilities2_khr,
+};
 
 unsafe fn downstream(instance: vk::Instance, name: &CStr) -> vk::PFN_vkVoidFunction {
     let get_instance_proc_addr = if instance == vk::Instance::null() {
@@ -68,10 +80,46 @@ pub(crate) unsafe fn get_instance_proc_addr_inner(
                 destroy_instance as vk::PFN_vkDestroyInstance,
             )
         },
+        b"vkCreateXlibSurfaceKHR" => unsafe {
+            std::mem::transmute::<vk::PFN_vkCreateXlibSurfaceKHR, vk::PFN_vkVoidFunction>(
+                create_xlib_surface_khr as vk::PFN_vkCreateXlibSurfaceKHR,
+            )
+        },
+        b"vkCreateXcbSurfaceKHR" => unsafe {
+            std::mem::transmute::<vk::PFN_vkCreateXcbSurfaceKHR, vk::PFN_vkVoidFunction>(
+                create_xcb_surface_khr as vk::PFN_vkCreateXcbSurfaceKHR,
+            )
+        },
+        b"vkDestroySurfaceKHR" => unsafe {
+            std::mem::transmute::<vk::PFN_vkDestroySurfaceKHR, vk::PFN_vkVoidFunction>(
+                destroy_surface_khr as vk::PFN_vkDestroySurfaceKHR,
+            )
+        },
+        b"vkGetPhysicalDeviceSurfaceCapabilitiesKHR" => unsafe {
+            std::mem::transmute::<
+                vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR,
+                vk::PFN_vkVoidFunction,
+            >(
+                get_physical_device_surface_capabilities_khr
+                    as vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR,
+            )
+        },
+        b"vkGetPhysicalDeviceSurfaceCapabilities2KHR" => unsafe {
+            std::mem::transmute::<
+                vk::PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR,
+                vk::PFN_vkVoidFunction,
+            >(
+                get_physical_device_surface_capabilities2_khr
+                    as vk::PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR,
+            )
+        },
         b"vkGetDeviceQueue"
         | b"vkGetDeviceQueue2"
         | b"vkCreateSwapchainKHR"
         | b"vkDestroySwapchainKHR"
+        | b"vkGetSwapchainImagesKHR"
+        | b"vkAcquireNextImageKHR"
+        | b"vkAcquireNextImage2KHR"
         | b"vkDestroyDevice"
         | b"vkQueuePresentKHR" => unsafe {
             get_device_proc_addr_inner(vk::Device::null(), name.as_ptr())
@@ -117,6 +165,21 @@ pub(crate) unsafe fn get_device_proc_addr_inner(
         b"vkDestroySwapchainKHR" => unsafe {
             std::mem::transmute::<vk::PFN_vkDestroySwapchainKHR, vk::PFN_vkVoidFunction>(
                 destroy_swapchain_khr as vk::PFN_vkDestroySwapchainKHR,
+            )
+        },
+        b"vkGetSwapchainImagesKHR" => unsafe {
+            std::mem::transmute::<vk::PFN_vkGetSwapchainImagesKHR, vk::PFN_vkVoidFunction>(
+                get_swapchain_images_khr as vk::PFN_vkGetSwapchainImagesKHR,
+            )
+        },
+        b"vkAcquireNextImageKHR" => unsafe {
+            std::mem::transmute::<vk::PFN_vkAcquireNextImageKHR, vk::PFN_vkVoidFunction>(
+                acquire_next_image_khr as vk::PFN_vkAcquireNextImageKHR,
+            )
+        },
+        b"vkAcquireNextImage2KHR" => unsafe {
+            std::mem::transmute::<vk::PFN_vkAcquireNextImage2KHR, vk::PFN_vkVoidFunction>(
+                acquire_next_image2_khr as vk::PFN_vkAcquireNextImage2KHR,
             )
         },
         b"vkDestroyDevice" => unsafe {

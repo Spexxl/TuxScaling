@@ -50,27 +50,47 @@ void main() {
         return;
     }
     vec2 output_uv = (vec2(pixel) + 0.5) / vec2(p.width, p.height);
-    vec4 current = texture(input_frame, output_uv);
+    float input_aspect = float(p.input_width) / float(p.input_height);
+    float output_aspect = float(p.width) / float(p.height);
+    vec2 content_size = output_aspect > input_aspect
+        ? vec2(input_aspect / output_aspect, 1.0)
+        : vec2(1.0, output_aspect / input_aspect);
+    vec2 content_min = (vec2(1.0) - content_size) * 0.5;
+    vec2 content_max = content_min + content_size;
+    if (any(lessThan(output_uv, content_min)) || any(greaterThan(output_uv, content_max))) {
+        imageStore(output_image, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    vec2 input_uv = (output_uv - content_min) / content_size;
+    ivec2 input_pixel = min(
+        ivec2(input_uv * vec2(p.input_width, p.input_height)),
+        ivec2(p.input_width, p.input_height) - 1
+    );
+    vec4 current = texture(input_frame, input_uv);
     if (p.debug_view != 0) {
         float value = p.debug_view == 1
-            ? imageLoad(reactive_image, pixel).r
-            : imageLoad(disocclusion_image, pixel).r;
+            ? imageLoad(reactive_image, input_pixel).r
+            : imageLoad(disocclusion_image, input_pixel).r;
         imageStore(output_image, pixel, vec4(value, value, value, 1.0));
         return;
     }
-    ivec2 motion_pixel = min(pixel / 4, ivec2(p.motion_width, p.motion_height) - 1);
+    ivec2 motion_pixel = min(input_pixel / 4, ivec2(p.motion_width, p.motion_height) - 1);
     vec2 motion = imageLoad(motion_image, motion_pixel).xy;
-    vec2 history_uv = clamp(output_uv - motion / vec2(p.width, p.height), vec2(0.0), vec2(1.0));
+    vec2 history_uv = clamp(
+        output_uv - motion / vec2(p.input_width, p.input_height) * content_size,
+        content_min,
+        content_max
+    );
     vec3 history = texture(history_frame, history_uv).rgb;
-    vec3 lower = neighborhood_min(output_uv);
-    vec3 upper = neighborhood_max(output_uv);
+    vec3 lower = neighborhood_min(input_uv);
+    vec3 upper = neighborhood_max(input_uv);
     history = clamp(history, lower, upper);
 
-    float confidence = imageLoad(confidence_image, pixel).r;
-    float reactive = imageLoad(reactive_image, pixel).r;
-    float disocclusion = imageLoad(disocclusion_image, pixel).r;
+    float confidence = imageLoad(confidence_image, input_pixel).r;
+    float reactive = imageLoad(reactive_image, input_pixel).r;
+    float disocclusion = imageLoad(disocclusion_image, input_pixel).r;
     float exposure = max(imageLoad(exposure_image, ivec2(0)).r, 0.001);
-    float depth = imageLoad(depth_image, pixel).r;
+    float depth = imageLoad(depth_image, input_pixel).r;
     float history_weight = (p.valid != 0 && p.reset == 0)
         ? clamp(0.08 + confidence * 0.82, 0.08, 0.9)
             * (1.0 - reactive) * (1.0 - disocclusion) * clamp(depth, 0.0, 1.0)

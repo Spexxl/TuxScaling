@@ -16,3 +16,5 @@ tracing.workspace = true
 tuxscaling-overlay-vulkan = { path = "../overlay-vulkan" }
 tuxscaling-runtime = { path = "../runtime" }
 tuxscaling-vulkan = { path = "../vulkan" }
+tuxscaling-config = { path = "../config" }
+tuxscaling-display = { path = "../display" }

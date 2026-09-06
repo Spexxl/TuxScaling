@@ -4,7 +4,7 @@
 
 The Vulkan layer injects work immediately before presentation while preserving the application's Vulkan device, queues, and swapchains. The layer must fail open: if TuxScaling cannot process a present, the original call is forwarded unchanged.
 
-The runtime captures supported swapchains, computes estimated optical flow and frame guidance, runs the reference reconstruction when the format supports storage images, and renders the Egui diagnostic panel over `vkcube` on RADV. Unsupported formats and allocation failures bypass reconstruction while preserving presentation.
+The runtime captures supported swapchains, computes estimated optical flow and frame guidance, runs the reference reconstruction when the format supports storage images, and renders the Egui diagnostic panel over `vkcube` on RADV. In fullscreen X11/XWayland virtual-output mode, game-owned layer images remain at the requested game extent while the real swapchain images use the configured output extent. Unsupported formats and allocation failures bypass reconstruction while preserving presentation.
 
 ## Ownership
 

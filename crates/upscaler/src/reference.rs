@@ -14,7 +14,6 @@ pub fn scaled_extent(output: vk::Extent2D, scale: f32) -> vk::Extent2D {
 
 pub struct ReferenceUpscaler {
     device: ash::Device,
-    pub input: Image,
     pub output: Image,
     pub history: [Image; 2],
     sampler: vk::Sampler,
@@ -32,19 +31,18 @@ impl ReferenceUpscaler {
     pub unsafe fn new(
         device: &ash::Device,
         memory: &vk::PhysicalDeviceMemoryProperties,
+        input_view: vk::ImageView,
+        input_extent: vk::Extent2D,
         output_extent: vk::Extent2D,
         output_format: vk::Format,
-        scale: f32,
         guidance: GuidanceView,
     ) -> Result<Self, vk::Result> {
-        let input_extent = scaled_extent(output_extent, scale);
         let usage = vk::ImageUsageFlags::TRANSFER_SRC
             | vk::ImageUsageFlags::TRANSFER_DST
             | vk::ImageUsageFlags::SAMPLED
             | vk::ImageUsageFlags::STORAGE;
         let mut result = Self {
             device: device.clone(),
-            input: unsafe { Image::new(device, memory, input_extent, output_format, usage) }?,
             output: unsafe { Image::new(device, memory, output_extent, output_format, usage) }?,
             history: [
                 unsafe { Image::new(device, memory, output_extent, output_format, usage) }?,
@@ -117,7 +115,7 @@ impl ReferenceUpscaler {
         let sampled = [
             vk::DescriptorImageInfo::default()
                 .sampler(result.sampler)
-                .image_view(result.input.view)
+                .image_view(input_view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
             vk::DescriptorImageInfo::default()
                 .sampler(result.sampler)
@@ -206,8 +204,6 @@ impl ReferenceUpscaler {
     pub unsafe fn record(
         &mut self,
         command: vk::CommandBuffer,
-        source: vk::Image,
-        source_layout: vk::ImageLayout,
         swapchain: vk::Image,
         guidance: GuidanceView,
         valid: bool,
@@ -219,66 +215,6 @@ impl ReferenceUpscaler {
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .layer_count(1);
         unsafe {
-            image_barrier(
-                &self.device,
-                command,
-                source,
-                source_layout,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            );
-            image_barrier(
-                &self.device,
-                command,
-                self.input.handle,
-                if self.initialized {
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-                } else {
-                    vk::ImageLayout::UNDEFINED
-                },
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            );
-            self.device.cmd_blit_image(
-                command,
-                source,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                self.input.handle,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[vk::ImageBlit::default()
-                    .src_subresource(layers)
-                    .dst_subresource(layers)
-                    .src_offsets([
-                        vk::Offset3D::default(),
-                        vk::Offset3D {
-                            x: self.output_extent.width as i32,
-                            y: self.output_extent.height as i32,
-                            z: 1,
-                        },
-                    ])
-                    .dst_offsets([
-                        vk::Offset3D::default(),
-                        vk::Offset3D {
-                            x: self.input_extent.width as i32,
-                            y: self.input_extent.height as i32,
-                            z: 1,
-                        },
-                    ])],
-                vk::Filter::LINEAR,
-            );
-            image_barrier(
-                &self.device,
-                command,
-                source,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                source_layout,
-            );
-            image_barrier(
-                &self.device,
-                command,
-                self.input.handle,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            );
-
             if !self.initialized || !valid {
                 for history in &self.history {
                     image_barrier(

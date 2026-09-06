@@ -126,7 +126,7 @@ pub struct InputFrame {
 pub struct X11Input {
     _library: Library,
     display: *mut Display,
-    root: c_ulong,
+    window: c_ulong,
     insert_keycode: u8,
     overlay_open: bool,
     pending: Pending,
@@ -142,7 +142,7 @@ pub struct X11Input {
 unsafe impl Send for X11Input {}
 
 impl X11Input {
-    pub fn connect() -> Result<Self, InputError> {
+    pub fn connect(window: u64) -> Result<Self, InputError> {
         let library = unsafe { Library::new("libX11.so.6") }?;
         let open_display = load::<OpenDisplay>(&library, b"XOpenDisplay\0")?;
         let default_screen = load::<DefaultScreen>(&library, b"XDefaultScreen\0")?;
@@ -166,9 +166,9 @@ impl X11Input {
         let input = Self {
             _library: library,
             display,
-            root,
+            window: if window == 0 { root } else { window as c_ulong },
             insert_keycode,
-            overlay_open: true,
+            overlay_open: false,
             pending,
             next_event,
             grab_keyboard,
@@ -248,10 +248,10 @@ impl X11Input {
     fn update_grab(&self) {
         if self.overlay_open {
             unsafe {
-                (self.grab_keyboard)(self.display, self.root, 0, 1, 1, 0);
+                (self.grab_keyboard)(self.display, self.window, 0, 1, 1, 0);
                 (self.grab_pointer)(
                     self.display,
-                    self.root,
+                    self.window,
                     0,
                     POINTER_EVENT_MASK,
                     1,

@@ -1,5 +1,75 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+struct ResizedWindow {
+    window: u64,
+    original: tuxscaling_display::Rect,
+}
+
+impl ResizedWindow {
+    fn restore(self) {
+        if let Ok(display) = tuxscaling_display::X11Display::connect() {
+            let _ =
+                display.resize_window(self.window, tuxscaling_display::Monitor::new(self.original));
+        }
+    }
+}
+
+fn virtual_output_extent(
+    surface: vk::SurfaceKHR,
+    game_extent: vk::Extent2D,
+) -> Option<(vk::Extent2D, ResizedWindow)> {
+    let config = if let Ok(path) = std::env::var("TUXSCALING_CONFIG") {
+        let source = std::fs::read_to_string(path).ok()?;
+        tuxscaling_config::Config::parse(&source).ok()?
+    } else {
+        tuxscaling_config::Config::default()
+    };
+    let target = match config.output_resolution {
+        tuxscaling_config::OutputResolution::Swapchain => return None,
+        tuxscaling_config::OutputResolution::Native => None,
+        tuxscaling_config::OutputResolution::Fixed { width, height } => {
+            Some(vk::Extent2D { width, height })
+        }
+    };
+    let surface = surfaces()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&surface)
+        .copied()?;
+    let display = tuxscaling_display::X11Display::connect().ok()?;
+    let monitor = display.monitor_for_window(surface.window).ok()?;
+    let window = display.window_rect(surface.window).ok()?;
+    if !display.is_fullscreen(surface.window) && window != monitor.rect {
+        return None;
+    }
+    let target = target.unwrap_or(vk::Extent2D {
+        width: monitor.rect.width,
+        height: monitor.rect.height,
+    });
+    if target == game_extent || target.width == 0 || target.height == 0 {
+        return None;
+    }
+    display
+        .resize_window(
+            surface.window,
+            tuxscaling_display::Monitor::new(tuxscaling_display::Rect::new(
+                monitor.rect.x,
+                monitor.rect.y,
+                target.width,
+                target.height,
+            )),
+        )
+        .ok()?;
+    Some((
+        target,
+        ResizedWindow {
+            window: surface.window,
+            original: window,
+        },
+    ))
+}
+
 unsafe fn has_present_fences(mut next: *const c_void) -> bool {
     while !next.is_null() {
         let header = unsafe { &*next.cast::<vk::BaseInStructure<'_>>() };
@@ -337,6 +407,10 @@ unsafe fn create_swapchain_inner(
         .cloned();
     let original = unsafe { &*create_info };
     let mut modified = *original;
+    let mut resized = virtual_output_extent(original.surface, original.image_extent);
+    if let Some((extent, _)) = resized {
+        modified.image_extent = extent;
+    }
     let needed = vk::ImageUsageFlags::TRANSFER_SRC
         | vk::ImageUsageFlags::TRANSFER_DST
         | vk::ImageUsageFlags::COLOR_ATTACHMENT;
@@ -379,15 +453,25 @@ unsafe fn create_swapchain_inner(
             }
         }
     }
+    if resized.is_some() && !capture_enabled {
+        resized.take().unwrap().1.restore();
+        modified = *original;
+    }
     let mut result =
         unsafe { create_swapchain(device, &modified, allocation_callbacks, swapchain) };
-    if result != vk::Result::SUCCESS
-        && capture_enabled
-        && modified.image_usage != original.image_usage
-    {
-        capture_enabled = false;
-        modified = *original;
-        result = unsafe { create_swapchain(device, create_info, allocation_callbacks, swapchain) };
+    if result != vk::Result::SUCCESS {
+        if let Some((_, resized_window)) = resized.take() {
+            resized_window.restore();
+            modified = *original;
+            capture_enabled = false;
+            result =
+                unsafe { create_swapchain(device, create_info, allocation_callbacks, swapchain) };
+        } else if capture_enabled && modified.image_usage != original.image_usage {
+            capture_enabled = false;
+            modified = *original;
+            result =
+                unsafe { create_swapchain(device, create_info, allocation_callbacks, swapchain) };
+        }
     }
     if result != vk::Result::SUCCESS {
         return result;
@@ -413,28 +497,119 @@ unsafe fn create_swapchain_inner(
         {
             return result;
         }
-        let handle = unsafe { *swapchain };
+        let mut handle = unsafe { *swapchain };
         eprintln!(
             "TuxScaling swapchain: format={:?} color_space={:?} flags={:?} capture={capture_enabled} usage={:?}",
             original.image_format, original.image_color_space, original.flags, modified.image_usage
         );
-        let info = SwapchainInfo {
-            format: unsafe { (*create_info).image_format },
-            extent: unsafe { (*create_info).image_extent },
+        let mut info = SwapchainInfo {
+            format: modified.image_format,
+            extent: modified.image_extent,
         };
         let loader = ash::khr::swapchain::Device::new(&device_state.instance, &device_state.device);
-        let Ok(images) = (unsafe { loader.get_swapchain_images(handle) }) else {
+        let Ok(mut output_images) = (unsafe { loader.get_swapchain_images(handle) }) else {
             return result;
         };
+        let mut virtual_images = None;
+        if let Some((_, resized_window)) = resized.take() {
+            let virtual_eligible = original.image_sharing_mode == vk::SharingMode::EXCLUSIVE
+                && original.queue_family_index_count == 0;
+            let virtual_result = if virtual_eligible {
+                let memory = unsafe {
+                    device_state
+                        .instance
+                        .get_physical_device_memory_properties(device_state.physical_device)
+                };
+                let usage = original.image_usage | needed | vk::ImageUsageFlags::SAMPLED;
+                output_images
+                    .iter()
+                    .map(|_| unsafe {
+                        tuxscaling_vulkan::Image::new(
+                            &device_state.device,
+                            &memory,
+                            original.image_extent,
+                            original.image_format,
+                            usage,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            } else {
+                Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
+            };
+            match virtual_result {
+                Ok(images) => {
+                    surfaces()
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .entry(original.surface)
+                        .and_modify(|surface| {
+                            surface.logical_extent = Some(original.image_extent);
+                            if surface.original_window.is_none() {
+                                surface.original_window = Some(resized_window.original);
+                            }
+                        });
+                    virtual_images = Some(images);
+                }
+                Err(error) => {
+                    eprintln!("TuxScaling: virtual swapchain bypassed: {error:?}");
+                    unsafe { loader.destroy_swapchain(handle, allocation_callbacks.as_ref()) };
+                    resized_window.restore();
+                    let recreate = unsafe {
+                        create_swapchain(device, create_info, allocation_callbacks, swapchain)
+                    };
+                    if recreate != vk::Result::SUCCESS {
+                        return recreate;
+                    }
+                    handle = unsafe { *swapchain };
+                    let Ok(images) = (unsafe { loader.get_swapchain_images(handle) }) else {
+                        return result;
+                    };
+                    output_images = images;
+                    info = SwapchainInfo {
+                        format: original.image_format,
+                        extent: original.image_extent,
+                    };
+                    if let Some(surface) = surfaces()
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .get_mut(&original.surface)
+                    {
+                        surface.logical_extent = None;
+                    }
+                    capture_enabled = false;
+                }
+            }
+        }
+        let game_images = virtual_images.as_ref().map_or_else(
+            || output_images.clone(),
+            |images| images.iter().map(|image| image.handle).collect(),
+        );
+        let game_extent = if virtual_images.is_some() {
+            original.image_extent
+        } else {
+            info.extent
+        };
+        let window = surfaces()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&original.surface)
+            .map(|surface| surface.window);
         let overlay = unsafe {
             OverlaySwapchain::new(
                 &device_state.instance,
                 device_state.physical_device,
                 &device_state.device,
-                info,
-                images,
+                SwapchainRuntimeCreateInfo {
+                    info,
+                    images: SwapchainImages {
+                        game_images,
+                        game_extent,
+                        output_images,
+                    },
+                    capture_enabled,
+                    window,
+                },
                 device_state.set_loader_data,
-                capture_enabled,
             )
         };
         if let Ok(overlay) = overlay {
@@ -443,7 +618,11 @@ unsafe fn create_swapchain_inner(
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(
                     handle,
-                    Arc::new(Mutex::new(SwapchainState { device, overlay })),
+                    Arc::new(Mutex::new(SwapchainState {
+                        device,
+                        overlay,
+                        virtual_images,
+                    })),
                 );
         }
         result

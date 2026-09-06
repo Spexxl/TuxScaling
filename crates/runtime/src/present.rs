@@ -6,7 +6,7 @@ use tuxscaling_motion::{MotionEstimator, MotionQuality};
 use tuxscaling_overlay::FrameDiagnostics;
 use tuxscaling_overlay_vulkan::{OverlayRenderer, SwapchainInfo};
 use tuxscaling_temporal::{FrameExtent, GuidanceEstimator, GuidanceReset, History};
-use tuxscaling_upscaler::ReferenceUpscaler;
+use tuxscaling_upscaler::{ReferenceUpscaler, ResolutionPlan, content_viewport};
 use tuxscaling_vulkan::{image_barrier, memory_barrier};
 
 pub type SetLoaderData = unsafe extern "system" fn(vk::Device, *mut std::ffi::c_void) -> vk::Result;
@@ -17,6 +17,35 @@ pub struct FrameSubmission {
     pub render_complete: vk::Semaphore,
     pub fence: vk::Fence,
 }
+
+#[derive(Clone)]
+pub struct SwapchainImages {
+    pub game_images: Vec<vk::Image>,
+    pub game_extent: vk::Extent2D,
+    pub output_images: Vec<vk::Image>,
+}
+
+impl SwapchainImages {
+    pub fn direct(images: Vec<vk::Image>, extent: vk::Extent2D) -> Self {
+        Self {
+            game_images: images.clone(),
+            game_extent: extent,
+            output_images: images,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.game_images.is_empty() && self.game_images.len() == self.output_images.len()
+    }
+}
+
+pub struct SwapchainRuntimeCreateInfo {
+    pub info: SwapchainInfo,
+    pub images: SwapchainImages,
+    pub capture_enabled: bool,
+    pub window: Option<u64>,
+}
+
 struct Slot {
     command: vk::CommandBuffer,
     fence: vk::Fence,
@@ -58,10 +87,102 @@ fn quality_budget(quality: tuxscaling_config::MotionQuality) -> f32 {
         tuxscaling_config::MotionQuality::Performance => 2.5,
     }
 }
+
+unsafe fn record_spatial_fallback(
+    device: &ash::Device,
+    command: vk::CommandBuffer,
+    source: &Capture,
+    output: vk::Image,
+    output_extent: vk::Extent2D,
+) {
+    let viewport = content_viewport(source.color.extent, output_extent);
+    let left = (viewport.offset[0] * output_extent.width as f32).round() as i32;
+    let top = (viewport.offset[1] * output_extent.height as f32).round() as i32;
+    let right =
+        ((viewport.offset[0] + viewport.size[0]) * output_extent.width as f32).round() as i32;
+    let bottom =
+        ((viewport.offset[1] + viewport.size[1]) * output_extent.height as f32).round() as i32;
+    let layers = vk::ImageSubresourceLayers::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .layer_count(1);
+    unsafe {
+        image_barrier(
+            device,
+            command,
+            source.color.handle,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
+        image_barrier(
+            device,
+            command,
+            output,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        device.cmd_clear_color_image(
+            command,
+            output,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+            &[tuxscaling_vulkan::color_range()],
+        );
+        device.cmd_blit_image(
+            command,
+            source.color.handle,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            output,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[vk::ImageBlit::default()
+                .src_subresource(layers)
+                .dst_subresource(layers)
+                .src_offsets([
+                    vk::Offset3D::default(),
+                    vk::Offset3D {
+                        x: source.color.extent.width as i32,
+                        y: source.color.extent.height as i32,
+                        z: 1,
+                    },
+                ])
+                .dst_offsets([
+                    vk::Offset3D {
+                        x: left,
+                        y: top,
+                        z: 0,
+                    },
+                    vk::Offset3D {
+                        x: right,
+                        y: bottom,
+                        z: 1,
+                    },
+                ])],
+            vk::Filter::LINEAR,
+        );
+        image_barrier(
+            device,
+            command,
+            source.color.handle,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+        image_barrier(
+            device,
+            command,
+            output,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+    }
+}
+
 pub struct SwapchainRuntime {
     device: ash::Device,
     info: SwapchainInfo,
-    images: Vec<vk::Image>,
+    resolution: ResolutionPlan,
+    game_images: Vec<vk::Image>,
+    output_images: Vec<vk::Image>,
     overlay: Option<OverlayRenderer>,
     pool: vk::CommandPool,
     slots: Vec<Slot>,
@@ -81,6 +202,8 @@ pub struct SwapchainRuntime {
     mode: u32,
     queries: vk::QueryPool,
     query_ready: Vec<bool>,
+    output_presented: Vec<bool>,
+    pending_output: Option<usize>,
     timestamp_period: f32,
     timings: Vec<[f32; GPU_PHASES]>,
     diagnostics: FrameDiagnostics,
@@ -90,11 +213,15 @@ impl SwapchainRuntime {
         instance: &ash::Instance,
         physical: vk::PhysicalDevice,
         device: &ash::Device,
-        info: SwapchainInfo,
-        images: Vec<vk::Image>,
+        create: SwapchainRuntimeCreateInfo,
         set_loader_data: Option<SetLoaderData>,
-        capture_enabled: bool,
     ) -> Result<Self, vk::Result> {
+        let SwapchainRuntimeCreateInfo {
+            info,
+            images,
+            capture_enabled,
+            window,
+        } = create;
         let config = if let Ok(path) = std::env::var("TUXSCALING_CONFIG") {
             let source = std::fs::read_to_string(path).map_err(|error| {
                 eprintln!("TuxScaling configuration: {error}");
@@ -110,11 +237,27 @@ impl SwapchainRuntime {
         if !config.enabled {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
-        let overlay = unsafe { OverlayRenderer::new(instance, physical, device, info, &images) }?;
+        if !images.is_valid() {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        let resolution =
+            ResolutionPlan::new(images.game_extent, info.extent, config.processing_scale);
+        let overlay = unsafe {
+            OverlayRenderer::new(
+                instance,
+                physical,
+                device,
+                info,
+                &images.output_images,
+                window,
+            )
+        }?;
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         let properties = unsafe { instance.get_physical_device_properties(physical) };
         let capture = if capture_enabled {
-            Some(unsafe { Capture::new(device, &memory, info.extent, info.format) }?)
+            Some(unsafe {
+                Capture::new(device, &memory, resolution.processing_extent, info.format)
+            }?)
         } else {
             None
         };
@@ -123,7 +266,7 @@ impl SwapchainRuntime {
                 MotionEstimator::new(
                     device,
                     &memory,
-                    info.extent,
+                    resolution.processing_extent,
                     capture.color.view,
                     matches!(
                         info.format,
@@ -151,7 +294,7 @@ impl SwapchainRuntime {
                 GuidanceEstimator::new(
                     device,
                     &memory,
-                    info.extent,
+                    resolution.processing_extent,
                     capture.color.view,
                     capture.previous.view,
                     motion.confidence.view,
@@ -167,7 +310,7 @@ impl SwapchainRuntime {
             None
         };
         let mut upscaler = None;
-        if let (Some(guidance), Some(motion)) = (&guidance, &motion) {
+        if let (Some(guidance), Some(motion), Some(capture)) = (&guidance, &motion, &capture) {
             let features =
                 unsafe { instance.get_physical_device_format_properties(physical, info.format) }
                     .optimal_tiling_features;
@@ -179,14 +322,21 @@ impl SwapchainRuntime {
             if features.contains(required)
                 && device_features.shader_storage_image_write_without_format != 0
             {
-                let view = guidance.view(motion, 0, info.extent, false, GuidanceReset::Initialize);
+                let view = guidance.view(
+                    motion,
+                    0,
+                    resolution.processing_extent,
+                    false,
+                    GuidanceReset::Initialize,
+                );
                 match unsafe {
                     ReferenceUpscaler::new(
                         device,
                         &memory,
-                        info.extent,
+                        capture.color.view,
+                        resolution.processing_extent,
+                        resolution.output_extent,
                         info.format,
-                        config.render_scale,
                         view,
                     )
                 } {
@@ -217,11 +367,13 @@ impl SwapchainRuntime {
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
         };
-        let image_count = images.len();
+        let image_count = images.output_images.len();
         Ok(Self {
             device: device.clone(),
             info,
-            images,
+            resolution,
+            game_images: images.game_images,
+            output_images: images.output_images,
             overlay: Some(overlay),
             pool: vk::CommandPool::null(),
             slots: Vec::new(),
@@ -241,6 +393,8 @@ impl SwapchainRuntime {
             mode,
             queries: vk::QueryPool::null(),
             query_ready: vec![false; image_count],
+            output_presented: vec![false; image_count],
+            pending_output: None,
             timestamp_period: if properties.limits.timestamp_compute_and_graphics != 0 {
                 properties.limits.timestamp_period
             } else {
@@ -256,7 +410,16 @@ impl SwapchainRuntime {
                 .into(),
                 mode: mode_name(mode).into(),
                 quality: config.motion_quality,
-                render_scale: config.render_scale,
+                processing_scale: config.processing_scale,
+                game_extent: [resolution.game_extent.width, resolution.game_extent.height],
+                processing_extent: [
+                    resolution.processing_extent.width,
+                    resolution.processing_extent.height,
+                ],
+                output_extent: [
+                    resolution.output_extent.width,
+                    resolution.output_extent.height,
+                ],
                 ..Default::default()
             },
         })
@@ -286,7 +449,7 @@ impl SwapchainRuntime {
                 self.device.create_query_pool(
                     &vk::QueryPoolCreateInfo::default()
                         .query_type(vk::QueryType::TIMESTAMP)
-                        .query_count(self.images.len() as u32 * GPU_TIMESTAMPS as u32),
+                        .query_count(self.output_images.len() as u32 * GPU_TIMESTAMPS as u32),
                     None,
                 )
             }?;
@@ -296,7 +459,7 @@ impl SwapchainRuntime {
                 &vk::CommandBufferAllocateInfo::default()
                     .command_pool(self.pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(self.images.len() as u32),
+                    .command_buffer_count(self.output_images.len() as u32),
             )
         }?;
         for command in commands {
@@ -347,6 +510,11 @@ impl SwapchainRuntime {
             .slots
             .get(index)
             .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
+        let output_layout = if self.output_presented[index] {
+            vk::ImageLayout::PRESENT_SRC_KHR
+        } else {
+            vk::ImageLayout::UNDEFINED
+        };
         unsafe { self.device.wait_for_fences(&[slot.fence], true, u64::MAX) }?;
         if let Some(quality) = self.pending_quality.take() {
             if let Some(motion) = &mut self.motion {
@@ -422,7 +590,7 @@ impl SwapchainRuntime {
             (Some(guidance), Some(motion)) => Some(guidance.view(
                 motion,
                 self.history.frame_id + 1,
-                self.info.extent,
+                self.resolution.processing_extent,
                 valid,
                 if valid {
                     GuidanceReset::None
@@ -434,8 +602,8 @@ impl SwapchainRuntime {
         };
         let guidance_view = guidance_view.and_then(|view| {
             let frame_extent = FrameExtent {
-                width: self.info.extent.width,
-                height: self.info.extent.height,
+                width: self.resolution.processing_extent.width,
+                height: self.resolution.processing_extent.height,
             };
             if view.is_valid_for(self.history.frame_id + 1, frame_extent) {
                 Some(view)
@@ -476,13 +644,24 @@ impl SwapchainRuntime {
                 );
             }
             if let Some(capture) = &mut self.capture {
-                capture.record(&self.device, slot.command, self.images[index]);
+                capture.record_scaled_from(
+                    &self.device,
+                    slot.command,
+                    self.game_images[index],
+                    self.resolution.game_extent,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    if self.game_images[index] == self.output_images[index] {
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                    } else {
+                        vk::ImageLayout::PRESENT_SRC_KHR
+                    },
+                );
             } else {
                 image_barrier(
                     &self.device,
                     slot.command,
-                    self.images[index],
-                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    self.output_images[index],
+                    output_layout,
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 );
             }
@@ -518,14 +697,19 @@ impl SwapchainRuntime {
                     index as u32 * GPU_TIMESTAMPS as u32 + 3,
                 );
             }
-            if let (Some(upscaler), Some(guidance)) = (&mut self.upscaler, guidance_view)
-                && let Some(capture) = &self.capture
-            {
+            if self.game_images[index] != self.output_images[index] {
+                image_barrier(
+                    &self.device,
+                    slot.command,
+                    self.output_images[index],
+                    output_layout,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                );
+            }
+            if let (Some(upscaler), Some(guidance)) = (&mut self.upscaler, guidance_view) {
                 upscaler.record(
                     slot.command,
-                    capture.color.handle,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    self.images[index],
+                    self.output_images[index],
                     guidance,
                     valid,
                     self.history.write_index(),
@@ -535,11 +719,25 @@ impl SwapchainRuntime {
                         _ => 0,
                     },
                 );
+            } else if self.game_images[index] != self.output_images[index]
+                && let Some(capture) = &self.capture
+            {
+                record_spatial_fallback(
+                    &self.device,
+                    slot.command,
+                    capture,
+                    self.output_images[index],
+                    self.resolution.output_extent,
+                );
             }
             if self.mode == 5
                 && let Some(upscaler) = &self.upscaler
             {
-                upscaler.record_debug(slot.command, self.images[index], self.history.write_index());
+                upscaler.record_debug(
+                    slot.command,
+                    self.output_images[index],
+                    self.history.write_index(),
+                );
             }
             if self.mode != 0
                 && self.mode <= 3
@@ -555,7 +753,7 @@ impl SwapchainRuntime {
                 image_barrier(
                     &self.device,
                     slot.command,
-                    self.images[index],
+                    self.output_images[index],
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 );
@@ -585,7 +783,7 @@ impl SwapchainRuntime {
                     slot.command,
                     motion.visualization.handle,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    self.images[index],
+                    self.output_images[index],
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &[region],
                     vk::Filter::NEAREST,
@@ -600,7 +798,7 @@ impl SwapchainRuntime {
                 image_barrier(
                     &self.device,
                     slot.command,
-                    self.images[index],
+                    self.output_images[index],
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 );
@@ -620,7 +818,7 @@ impl SwapchainRuntime {
             image_barrier(
                 &self.device,
                 slot.command,
-                self.images[index],
+                self.output_images[index],
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::ImageLayout::PRESENT_SRC_KHR,
             );
@@ -634,6 +832,9 @@ impl SwapchainRuntime {
             }
             self.device.end_command_buffer(slot.command)?;
         }
+        if self.game_images[index] != self.output_images[index] {
+            self.pending_output = Some(index);
+        }
         self.query_ready[index] = true;
         Ok(FrameSubmission {
             command_buffer: slot.command,
@@ -643,10 +844,14 @@ impl SwapchainRuntime {
     }
     pub fn submitted(&mut self) {
         self.history.commit(self.pending_time);
+        if let Some(index) = self.pending_output.take() {
+            self.output_presented[index] = true;
+        }
         self.diagnostics.frame_id = self.history.frame_id;
     }
     pub fn presentation_failed(&mut self) {
         self.history.reset();
+        self.output_presented.fill(false);
     }
     pub unsafe fn destroy(self, _device: &ash::Device) {
         drop(self);

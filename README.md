@@ -6,7 +6,7 @@ The project targets native Vulkan applications games translated to Vulkan throug
 
 ## Current status
 
-The repository captures supported swapchains, estimates optical flow and temporal guidance on the GPU, downsamples the captured frame, runs a vendor-neutral reference reconstruction with ping-pong history, and renders an egui diagnostic overlay. Vendor SDK adapters and production FSR/DLSS/XeSS backends remain future work.
+The repository captures supported swapchains, estimates optical flow and temporal guidance on the GPU, optionally resamples the captured game image, runs a vendor-neutral reference reconstruction with ping-pong history, and renders an egui diagnostic overlay. On fullscreen X11/XWayland, the layer can present a lower-resolution game swapchain through a monitor-sized output swapchain. Vendor SDK adapters and production FSR/DLSS/XeSS backends remain future work.
 
 ## Design boundaries
 
@@ -14,7 +14,7 @@ The repository captures supported swapchains, estimates optical flow and tempora
 - Native C or C++ code is isolated behind a small C ABI for optional SDK adapters.
 - Inputs are always estimated from captured color frames; game-native temporal inputs are not intercepted.
 - Guidance includes source-pixel current-to-previous motion, confidence, temporal reactive and disocclusion masks, log-luminance exposure, and a flat depth fallback. Jitter is always zero.
-- The default `Balanced` preset is fixed for the session. `Ultra`, `High`, and `Performance` trade optical-flow work for precision; the overlay reports capture, flow, guidance, reconstruction, and overlay timings.
+- The default `Balanced` preset is fixed for the session. `Ultra`, `High`, and `Performance` trade optical-flow work for precision; the overlay applies changes at a frame boundary and reports capture, flow, guidance, reconstruction, and overlay timings.
 - The reference backend uses a configurable 50–100% internal scale (default 67%), neighborhood clamping, confidence-weighted accumulation, and history reset on first frame, long pause, presentation failure, resize, or preset change.
 - X11/XWayland input is optional at runtime. `Insert` toggles the overlay and pointer/keyboard grabs are released on close and destruction. Native Wayland remains configuration-only in this milestone.
 - The injected runtime uses `ash` directly and does not use `wgpu`, `vulkano`, `eframe`, or `winit`.

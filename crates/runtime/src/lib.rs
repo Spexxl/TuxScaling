@@ -43,12 +43,28 @@ impl Default for Runtime {
 
 #[cfg(test)]
 mod tests {
-    use super::{PresentDecision, Runtime, RuntimeState};
+    use super::{PresentDecision, Runtime, RuntimeState, SwapchainImages};
+    use ash::vk;
 
     #[test]
     fn starts_bypassed_and_passes_through() {
         let runtime = Runtime::new();
         assert_eq!(runtime.state(), RuntimeState::Bypassed);
         assert_eq!(runtime.process_present(), PresentDecision::PassThrough);
+    }
+
+    #[test]
+    fn direct_swapchain_images_use_the_same_source_and_output_images() {
+        let images = vec![vk::Image::null(), vk::Image::null()];
+        let extent = vk::Extent2D {
+            width: 1920,
+            height: 1080,
+        };
+
+        let swapchain = SwapchainImages::direct(images.clone(), extent);
+
+        assert_eq!(swapchain.game_images, images);
+        assert_eq!(swapchain.output_images, images);
+        assert_eq!(swapchain.game_extent, extent);
     }
 }

@@ -702,6 +702,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuxscaling-display"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "thiserror",
+]
+
+[[package]]
 name = "tuxscaling-input"
 version = "0.1.0"
 dependencies = [
@@ -718,6 +726,8 @@ dependencies = [
  "parking_lot",
  "tracing",
  "tuxscaling-capture",
+ "tuxscaling-config",
+ "tuxscaling-display",
  "tuxscaling-overlay-vulkan",
  "tuxscaling-runtime",
  "tuxscaling-vulkan",

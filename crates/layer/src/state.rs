@@ -4,10 +4,19 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 use tuxscaling_runtime::{SetLoaderData, SwapchainRuntime as OverlaySwapchain};
+use tuxscaling_vulkan::Image;
+
+#[derive(Clone, Copy)]
+pub(crate) struct X11Surface {
+    pub(crate) window: u64,
+    pub(crate) logical_extent: Option<vk::Extent2D>,
+    pub(crate) original_window: Option<tuxscaling_display::Rect>,
+}
 
 pub(crate) struct SwapchainState {
     pub(crate) device: vk::Device,
     pub(crate) overlay: OverlaySwapchain,
+    pub(crate) virtual_images: Option<Vec<Image>>,
 }
 
 #[derive(Clone, Copy)]
@@ -33,6 +42,7 @@ static DEVICES: OnceLock<Mutex<HashMap<vk::Device, DeviceState>>> = OnceLock::ne
 static QUEUES: OnceLock<Mutex<HashMap<vk::Queue, QueueState>>> = OnceLock::new();
 static SWAPCHAINS: OnceLock<Mutex<HashMap<vk::SwapchainKHR, Arc<Mutex<SwapchainState>>>>> =
     OnceLock::new();
+static SURFACES: OnceLock<Mutex<HashMap<vk::SurfaceKHR, X11Surface>>> = OnceLock::new();
 
 pub(crate) fn instances() -> &'static Mutex<HashMap<vk::Instance, ash::Instance>> {
     INSTANCES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -49,6 +59,9 @@ pub(crate) fn queues() -> &'static Mutex<HashMap<vk::Queue, QueueState>> {
 pub(crate) fn swapchains() -> &'static Mutex<HashMap<vk::SwapchainKHR, Arc<Mutex<SwapchainState>>>>
 {
     SWAPCHAINS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+pub(crate) fn surfaces() -> &'static Mutex<HashMap<vk::SurfaceKHR, X11Surface>> {
+    SURFACES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 pub(crate) fn instance_dispatch()
 -> &'static Mutex<HashMap<vk::Instance, vk::PFN_vkGetInstanceProcAddr>> {
