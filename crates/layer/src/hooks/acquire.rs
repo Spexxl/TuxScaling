@@ -30,7 +30,7 @@ unsafe fn get_swapchain_images_inner(
         let capacity = unsafe { *image_count }.min(total) as usize;
         unsafe {
             std::ptr::copy_nonoverlapping(virtual_images.as_ptr(), images, capacity);
-            *image_count = total;
+            *image_count = capacity as u32;
         }
         return if capacity < total as usize {
             vk::Result::INCOMPLETE

@@ -368,31 +368,39 @@ unsafe fn create_device_inner(
     let create_device: vk::PFN_vkCreateDevice = unsafe { std::mem::transmute(proc) };
     let physical_features = unsafe { instance.get_physical_device_features(physical_device) };
     let mut modified_info = unsafe { *create_info };
+    let original_p_next = unsafe { (*create_info).p_next };
+    let original_p_enabled_features = unsafe { (*create_info).p_enabled_features };
     let mut enabled_features = unsafe { (*create_info).p_enabled_features.as_ref() }
         .copied()
         .unwrap_or_default();
-    let mut features2 = None;
+    let mut features2_override = vk::PhysicalDeviceFeatures2::default();
+    let mut use_features2_override = false;
     if physical_features.shader_storage_image_write_without_format != 0 {
         let mut next = unsafe { (*create_info).p_next.cast::<vk::BaseInStructure<'_>>() };
+        let mut has_features2 = false;
         while !next.is_null() {
             if unsafe { (*next).s_type } == vk::StructureType::PHYSICAL_DEVICE_FEATURES_2 {
-                let source = unsafe { &*next.cast::<vk::PhysicalDeviceFeatures2<'_>>() };
-                let mut replacement = *source;
-                replacement
-                    .features
-                    .shader_storage_image_write_without_format = vk::TRUE;
-                features2 = Some(replacement);
+                has_features2 = true;
                 break;
             }
             next = unsafe { (*next).p_next.cast() };
         }
-        if let Some(replacement) = features2.as_mut() {
+        if !has_features2 {
+            features2_override.features = enabled_features;
+            features2_override
+                .features
+                .shader_storage_image_write_without_format = vk::TRUE;
+            features2_override.p_next = original_p_next as *mut c_void;
             modified_info.p_enabled_features = std::ptr::null();
-            modified_info.p_next = replacement as *mut _ as *const c_void;
-        } else {
-            enabled_features.shader_storage_image_write_without_format = vk::TRUE;
-            modified_info.p_enabled_features = &enabled_features;
+            modified_info.p_next = &features2_override as *const _ as *const c_void;
+            use_features2_override = true;
         }
+    }
+    if !use_features2_override && !original_p_enabled_features.is_null() {
+        if physical_features.shader_storage_image_write_without_format != 0 {
+            enabled_features.shader_storage_image_write_without_format = vk::TRUE;
+        }
+        modified_info.p_enabled_features = &enabled_features;
     }
     let result = unsafe {
         create_device(
