@@ -47,6 +47,7 @@ pub struct SwapchainRuntimeCreateInfo {
     pub images: SwapchainImages,
     pub capture_enabled: bool,
     pub window: Option<u64>,
+    pub fullscreen: bool,
 }
 
 struct Slot {
@@ -285,6 +286,7 @@ impl SwapchainRuntime {
             images,
             capture_enabled,
             window,
+            fullscreen,
         } = create;
         let config = if let Ok(path) = std::env::var("TUXSCALING_CONFIG") {
             let source = std::fs::read_to_string(path).map_err(|error| {
@@ -372,6 +374,16 @@ impl SwapchainRuntime {
                 mode: mode_name(mode).into(),
                 quality: config.motion_quality,
                 processing_scale: config.processing_scale,
+                presentation_mode: if !capture_enabled {
+                    "Fallback: unsupported capture"
+                } else if diagnostic_resolution.game_extent != diagnostic_resolution.output_extent {
+                    "Virtual upscale"
+                } else if fullscreen {
+                    "Native AA"
+                } else {
+                    "Windowed 1:1"
+                }
+                .into(),
                 game_extent: [
                     diagnostic_resolution.game_extent.width,
                     diagnostic_resolution.game_extent.height,

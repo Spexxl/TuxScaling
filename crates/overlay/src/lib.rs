@@ -15,6 +15,7 @@ pub struct FrameDiagnostics {
     pub game_extent: [u32; 2],
     pub processing_extent: [u32; 2],
     pub output_extent: [u32; 2],
+    pub presentation_mode: String,
     pub frame_delta_ms: f32,
     pub capture_ms: f32,
     pub luma_ms: f32,
@@ -111,10 +112,7 @@ pub fn render_diagnostics(
                             diagnostics.output_extent[0],
                             diagnostics.output_extent[1],
                         ));
-                        ui.label(resolution_mode(
-                            diagnostics.game_extent,
-                            diagnostics.output_extent,
-                        ));
+                        ui.label(format!("Mode: {}", diagnostics.presentation_mode));
                     }
                     egui::CollapsingHeader::new("Advanced")
                         .default_open(false)
@@ -131,7 +129,7 @@ pub fn render_diagnostics(
                                     processing_scale_request(scale);
                             }
                             ui.small(
-                                "This changes TuxScaling work, not the game's render resolution.",
+                                "This does not reduce the game's rendering workload.",
                             );
                         });
                     ui.label(format!("Frame delta: {:.2} ms", diagnostics.frame_delta_ms));
