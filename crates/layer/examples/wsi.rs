@@ -22,12 +22,41 @@ unsafe extern "C" {
         background: c_ulong,
     ) -> c_ulong;
     fn XStoreName(display: *mut c_void, window: c_ulong, name: *const c_char) -> c_int;
+    fn XInternAtom(display: *mut c_void, name: *const c_char, only_if_exists: c_int) -> c_ulong;
+    fn XChangeProperty(
+        display: *mut c_void,
+        window: c_ulong,
+        property: c_ulong,
+        property_type: c_ulong,
+        format: c_int,
+        mode: c_int,
+        data: *const u8,
+        element_count: c_int,
+    ) -> c_int;
     fn XMapWindow(display: *mut c_void, window: c_ulong) -> c_int;
     fn XResizeWindow(display: *mut c_void, window: c_ulong, width: c_uint, height: c_uint)
     -> c_int;
     fn XDestroyWindow(display: *mut c_void, window: c_ulong) -> c_int;
     fn XFlush(display: *mut c_void) -> c_int;
     fn XCloseDisplay(display: *mut c_void) -> c_int;
+}
+
+unsafe fn mark_fullscreen(display: *mut c_void, window: c_ulong) {
+    let state = unsafe { XInternAtom(display, c"_NET_WM_STATE".as_ptr(), 0) };
+    let fullscreen = unsafe { XInternAtom(display, c"_NET_WM_STATE_FULLSCREEN".as_ptr(), 0) };
+    let atom_type = unsafe { XInternAtom(display, c"ATOM".as_ptr(), 0) };
+    unsafe {
+        XChangeProperty(
+            display,
+            window,
+            state,
+            atom_type,
+            32,
+            0,
+            (&fullscreen as *const c_ulong).cast(),
+            1,
+        );
+    }
 }
 struct Chain {
     surface: vk::SurfaceKHR,
@@ -136,6 +165,7 @@ unsafe fn run() {
                 0,
             );
             XStoreName(display, w, c"TuxScaling WSI validation".as_ptr());
+            mark_fullscreen(display, w);
             XMapWindow(display, w);
             w
         });

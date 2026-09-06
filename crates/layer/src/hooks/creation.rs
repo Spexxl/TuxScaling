@@ -36,6 +36,20 @@ fn clear_surface_virtualization(surface: vk::SurfaceKHR) {
     }
 }
 
+fn release_previous_virtual_swapchain(old_swapchain: vk::SwapchainKHR, surface: vk::SurfaceKHR) {
+    let should_restore = swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&old_swapchain)
+        .is_some_and(|state| {
+            let state = state.lock().unwrap_or_else(|error| error.into_inner());
+            state.surface == surface && state.virtual_images.is_some()
+        });
+    if should_restore {
+        super::lifetime::restore_surface_window(surface);
+    }
+}
+
 impl ResizedWindow {
     fn restore(self) {
         if let Ok(display) = tuxscaling_display::X11Display::connect() {
@@ -476,6 +490,9 @@ unsafe fn create_swapchain_inner(
         .get(&device)
         .cloned();
     let original = unsafe { &*create_info };
+    if original.old_swapchain != vk::SwapchainKHR::null() {
+        release_previous_virtual_swapchain(original.old_swapchain, original.surface);
+    }
     let mut modified = *original;
     let mut resized = virtual_output_extent(original.surface, original.image_extent);
     if let Some((extent, _)) = resized {

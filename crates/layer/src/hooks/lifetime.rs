@@ -44,7 +44,7 @@ unsafe fn destroy_swapchain_inner(
     }
 }
 
-fn restore_surface_window(surface: vk::SurfaceKHR) {
+pub(super) fn restore_surface_window(surface: vk::SurfaceKHR) {
     let Some((window, original)) = surfaces()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
