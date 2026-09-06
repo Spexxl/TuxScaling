@@ -162,10 +162,7 @@ fn virtual_output_extent(
         }
     };
     let force_test_virtual = debug_test;
-    if !force_test_virtual
-        && !target_info.window.fullscreen
-        && target_info.window.rect != target_info.monitor.rect
-    {
+    if !force_test_virtual && !target_info.is_fullscreen() {
         return None;
     }
     let target = target.unwrap_or(vk::Extent2D {

@@ -74,6 +74,10 @@ pub struct DisplayTarget {
 }
 
 impl DisplayTarget {
+    pub fn is_fullscreen(self) -> bool {
+        self.window.fullscreen || self.window.rect == self.monitor.rect
+    }
+
     pub const fn new(window: X11Window, monitor: Monitor) -> Self {
         Self { window, monitor }
     }
@@ -241,6 +245,8 @@ impl X11Display {
                     .width(rect.width)
                     .height(rect.height),
             )
+            .map_err(operation)?
+            .check()
             .map_err(operation)?;
         self.connection.flush().map_err(operation)
     }
@@ -269,5 +275,18 @@ mod tests {
 
         assert_eq!(target.window.id, 42);
         assert_eq!(target.output_extent(), [1920, 1080]);
+    }
+
+    #[test]
+    fn recognizes_explicit_and_borderless_fullscreen() {
+        let monitor = Monitor::new(Rect::new(1920, 0, 1920, 1080));
+        let mut window = X11Window::new(42);
+        window.rect = Rect::new(2000, 100, 1280, 720);
+        assert!(!DisplayTarget::new(window, monitor).is_fullscreen());
+        window.fullscreen = true;
+        assert!(DisplayTarget::new(window, monitor).is_fullscreen());
+        window.fullscreen = false;
+        window.rect = monitor.rect;
+        assert!(DisplayTarget::new(window, monitor).is_fullscreen());
     }
 }

@@ -16,8 +16,8 @@ struct Slot {
     view: vk::ImageView,
     framebuffer: vk::Framebuffer,
     renderer: Option<Renderer>,
-    context: egui::Context,
     free: Vec<egui::TextureId>,
+    pending_textures: Vec<(egui::TextureId, egui::epaint::ImageDelta)>,
 }
 
 pub struct OverlayRenderer {
@@ -27,6 +27,7 @@ pub struct OverlayRenderer {
     slots: Vec<Slot>,
     input: Option<X11Input>,
     visible: bool,
+    context: egui::Context,
 }
 
 pub fn is_srgb_framebuffer(format: vk::Format) -> bool {
@@ -56,6 +57,7 @@ impl OverlayRenderer {
                     .ok()
             }),
             visible: false,
+            context: egui::Context::default(),
         };
         let attachments = [vk::AttachmentDescription::default()
             .format(info.format)
@@ -84,8 +86,8 @@ impl OverlayRenderer {
                 view: vk::ImageView::null(),
                 framebuffer: vk::Framebuffer::null(),
                 renderer: None,
-                context: egui::Context::default(),
                 free: Vec::new(),
+                pending_textures: Vec::new(),
             });
             let slot = result.slots.last_mut().unwrap();
             slot.view = unsafe {
@@ -154,16 +156,24 @@ impl OverlayRenderer {
             self.visible = !self.visible;
         }
         let frame = tuxscaling_overlay::render_diagnostics(
-            &slot.context,
+            &self.context,
             [self.info.extent.width, self.info.extent.height],
             diagnostics,
             &input.events,
             self.visible,
         );
-        if !frame.textures_delta.set.is_empty() {
-            renderer
-                .set_textures(queue, pool, &frame.textures_delta.set)
+        for slot in &mut self.slots {
+            slot.pending_textures
+                .extend(frame.textures_delta.set.iter().cloned());
+        }
+        let slot = &mut self.slots[index];
+        if !slot.pending_textures.is_empty() {
+            slot.renderer
+                .as_mut()
+                .unwrap()
+                .set_textures(queue, pool, &slot.pending_textures)
                 .map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?;
+            slot.pending_textures.clear();
         }
         slot.free.clone_from(&frame.textures_delta.free);
         Ok(frame)

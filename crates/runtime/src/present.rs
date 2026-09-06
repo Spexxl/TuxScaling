@@ -500,6 +500,17 @@ impl SwapchainRuntime {
             )?;
         }
         self.diagnostics.processing_scale = scale;
+        self.temporal.reset_reason = GuidanceReset::PresetChanged;
+        if self.temporal.timestamp_period > 0.0 {
+            self.temporal.queries = unsafe {
+                self.device.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(self.output_images.len() as u32 * GPU_TIMESTAMPS as u32),
+                    None,
+                )
+            }?;
+        }
         self.diagnostics.processing_extent = [
             resolution.processing_extent.width,
             resolution.processing_extent.height,
