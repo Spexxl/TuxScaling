@@ -17,7 +17,16 @@ pub struct FrameDiagnostics {
     pub output_extent: [u32; 2],
     pub frame_delta_ms: f32,
     pub capture_ms: f32,
+    pub luma_ms: f32,
+    pub pyramid_ms: f32,
+    pub forward_flow_ms: f32,
+    pub backward_flow_ms: f32,
+    pub confidence_ms: f32,
+    pub scene_ms: f32,
+    pub invalidate_ms: f32,
     pub motion_ms: f32,
+    pub reactive_ms: f32,
+    pub exposure_ms: f32,
     pub guidance_ms: f32,
     pub reconstruction_ms: f32,
     pub overlay_ms: f32,
@@ -144,6 +153,21 @@ pub fn render_diagnostics(
                         diagnostics.guidance_ms,
                         diagnostics.reconstruction_ms,
                         diagnostics.overlay_ms
+                    ));
+                    ui.label(format!(
+                        "Passes ms: luma {:.2} | pyramid {:.2} | forward {:.2} | backward {:.2}",
+                        diagnostics.luma_ms,
+                        diagnostics.pyramid_ms,
+                        diagnostics.forward_flow_ms,
+                        diagnostics.backward_flow_ms
+                    ));
+                    ui.label(format!(
+                        "Passes ms: confidence {:.2} | scene {:.2} | invalidate {:.2} | reactive {:.2} | exposure {:.2}",
+                        diagnostics.confidence_ms,
+                        diagnostics.scene_ms,
+                        diagnostics.invalidate_ms,
+                        diagnostics.reactive_ms,
+                        diagnostics.exposure_ms
                     ));
                     if diagnostics.p95_ms > 0.0 {
                         ui.label(format!("Temporal p95: {:.2} ms", diagnostics.p95_ms));

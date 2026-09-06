@@ -54,8 +54,8 @@ struct Slot {
     fence: vk::Fence,
     semaphore: vk::Semaphore,
 }
-const GPU_PHASES: usize = 5;
-const GPU_TIMESTAMPS: usize = GPU_PHASES + 1;
+const GPU_PHASES: usize = 12;
+const GPU_TIMESTAMPS: usize = 15;
 
 fn mode_name(mode: u32) -> &'static str {
     [
@@ -526,16 +526,41 @@ impl SwapchainRuntime {
             }
             .is_ok()
             {
-                let ms = [0, 1, 2, 3, 4].map(|i| {
-                    times[i + 1].wrapping_sub(times[i]) as f32 * self.temporal.timestamp_period
+                let elapsed = |start: usize, end: usize| {
+                    times[end].wrapping_sub(times[start]) as f32 * self.temporal.timestamp_period
                         / 1_000_000.0
-                });
+                };
+                let ms = [
+                    elapsed(0, 1),
+                    elapsed(2, 3),
+                    elapsed(3, 4),
+                    elapsed(4, 5),
+                    elapsed(5, 6),
+                    elapsed(6, 7),
+                    elapsed(7, 8),
+                    elapsed(8, 9),
+                    elapsed(10, 11),
+                    elapsed(11, 12),
+                    elapsed(12, 13),
+                    elapsed(13, 14),
+                ];
                 self.diagnostics.capture_ms = ms[0];
-                self.diagnostics.motion_ms = ms[1];
-                self.diagnostics.guidance_ms = ms[2];
-                self.diagnostics.reconstruction_ms = ms[3];
-                self.diagnostics.overlay_ms = ms[4];
-                let temporal_ms = ms[1] + ms[2] + ms[3];
+                self.diagnostics.luma_ms = ms[1];
+                self.diagnostics.pyramid_ms = ms[2];
+                self.diagnostics.forward_flow_ms = ms[3];
+                self.diagnostics.backward_flow_ms = ms[4];
+                self.diagnostics.confidence_ms = ms[5];
+                self.diagnostics.scene_ms = ms[6];
+                self.diagnostics.invalidate_ms = ms[7];
+                self.diagnostics.motion_ms = ms[1..8].iter().sum();
+                self.diagnostics.reactive_ms = ms[8];
+                self.diagnostics.exposure_ms = ms[9];
+                self.diagnostics.guidance_ms = ms[8] + ms[9];
+                self.diagnostics.reconstruction_ms = ms[10];
+                self.diagnostics.overlay_ms = ms[11];
+                let temporal_ms = self.diagnostics.motion_ms
+                    + self.diagnostics.guidance_ms
+                    + self.diagnostics.reconstruction_ms;
                 self.diagnostics.budget_warning =
                     temporal_ms > quality_budget(self.diagnostics.quality);
                 if self.temporal.history.frame_id >= 180 {
@@ -547,7 +572,7 @@ impl SwapchainRuntime {
                         .temporal
                         .timings
                         .iter()
-                        .map(|timing| timing[1] + timing[2] + timing[3])
+                        .map(|timing| timing[1..11].iter().sum::<f32>())
                         .collect::<Vec<_>>();
                     totals.sort_by(f32::total_cmp);
                     self.diagnostics.p95_ms = totals[(totals.len() - 1) * 95 / 100];
@@ -669,33 +694,55 @@ impl SwapchainRuntime {
                 );
             }
             if let Some(motion) = &mut self.temporal.motion {
-                motion.record(
-                    slot.command,
-                    self.temporal.history.write_index(),
-                    valid,
-                    self.mode,
-                );
+                if self.temporal.queries != vk::QueryPool::null() {
+                    motion.record_timed(
+                        slot.command,
+                        self.temporal.history.write_index(),
+                        valid,
+                        self.mode,
+                        self.temporal.queries,
+                        index as u32 * GPU_TIMESTAMPS as u32 + 2,
+                    );
+                } else {
+                    motion.record(
+                        slot.command,
+                        self.temporal.history.write_index(),
+                        valid,
+                        self.mode,
+                    );
+                }
                 memory_barrier(&self.device, slot.command);
-            }
-            if self.temporal.queries != vk::QueryPool::null() {
-                self.device.cmd_write_timestamp(
-                    slot.command,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
-                    self.temporal.queries,
-                    index as u32 * GPU_TIMESTAMPS as u32 + 2,
-                );
+            } else if self.temporal.queries != vk::QueryPool::null() {
+                for offset in 2..=9 {
+                    self.device.cmd_write_timestamp(
+                        slot.command,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        self.temporal.queries,
+                        index as u32 * GPU_TIMESTAMPS as u32 + offset,
+                    );
+                }
             }
             if let Some(guidance) = &mut self.temporal.guidance {
-                guidance.record(slot.command, valid);
+                if self.temporal.queries != vk::QueryPool::null() {
+                    guidance.record_timed(
+                        slot.command,
+                        valid,
+                        self.temporal.queries,
+                        index as u32 * GPU_TIMESTAMPS as u32 + 10,
+                    );
+                } else {
+                    guidance.record(slot.command, valid);
+                }
                 memory_barrier(&self.device, slot.command);
-            }
-            if self.temporal.queries != vk::QueryPool::null() {
-                self.device.cmd_write_timestamp(
-                    slot.command,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
-                    self.temporal.queries,
-                    index as u32 * GPU_TIMESTAMPS as u32 + 3,
-                );
+            } else if self.temporal.queries != vk::QueryPool::null() {
+                for offset in 10..=12 {
+                    self.device.cmd_write_timestamp(
+                        slot.command,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        self.temporal.queries,
+                        index as u32 * GPU_TIMESTAMPS as u32 + offset,
+                    );
+                }
             }
             if self.game_images[index] != self.output_images[index] {
                 image_barrier(
@@ -808,7 +855,7 @@ impl SwapchainRuntime {
                     slot.command,
                     vk::PipelineStageFlags::ALL_COMMANDS,
                     self.temporal.queries,
-                    index as u32 * GPU_TIMESTAMPS as u32 + 4,
+                    index as u32 * GPU_TIMESTAMPS as u32 + 13,
                 );
             }
             self.overlay
@@ -827,7 +874,7 @@ impl SwapchainRuntime {
                     slot.command,
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     self.temporal.queries,
-                    index as u32 * GPU_TIMESTAMPS as u32 + 5,
+                    index as u32 * GPU_TIMESTAMPS as u32 + 14,
                 );
             }
             self.device.end_command_buffer(slot.command)?;
@@ -861,9 +908,22 @@ impl Drop for SwapchainRuntime {
     fn drop(&mut self) {
         if !self.temporal.timings.is_empty() {
             let mut summary = String::new();
-            for (axis, name) in ["capture", "flow", "guidance", "reconstruction", "overlay"]
-                .iter()
-                .enumerate()
+            for (axis, name) in [
+                "capture",
+                "luma",
+                "pyramid",
+                "forward",
+                "backward",
+                "confidence",
+                "scene",
+                "invalidate",
+                "reactive",
+                "exposure",
+                "reconstruction",
+                "overlay",
+            ]
+            .iter()
+            .enumerate()
             {
                 let mut values = self
                     .temporal

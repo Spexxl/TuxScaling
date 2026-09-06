@@ -406,6 +406,29 @@ impl MotionEstimator {
         valid: bool,
         mode: u32,
     ) {
+        unsafe { self.record_inner(command, write, valid, mode, None) };
+    }
+
+    pub unsafe fn record_timed(
+        &mut self,
+        command: vk::CommandBuffer,
+        write: usize,
+        valid: bool,
+        mode: u32,
+        query_pool: vk::QueryPool,
+        query_base: u32,
+    ) {
+        unsafe { self.record_inner(command, write, valid, mode, Some((query_pool, query_base))) };
+    }
+
+    unsafe fn record_inner(
+        &mut self,
+        command: vk::CommandBuffer,
+        write: usize,
+        valid: bool,
+        mode: u32,
+        timestamps: Option<(vk::QueryPool, u32)>,
+    ) {
         unsafe {
             memory_barrier(&self.device, command);
             if !self.initialized {
@@ -433,6 +456,14 @@ impl MotionEstimator {
                 &[],
             );
             let profile = self.quality.profile(self.levels.len());
+            if let Some((query_pool, query_base)) = timestamps {
+                self.device.cmd_write_timestamp(
+                    command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    query_pool,
+                    query_base,
+                );
+            }
             for (i, l) in self.levels.iter().take(profile.levels).enumerate() {
                 self.dispatch(
                     command,
@@ -440,6 +471,24 @@ impl MotionEstimator {
                     self.params(i, i.saturating_sub(1), valid, mode, profile.levels),
                     l.width,
                     l.height,
+                );
+                if i == 0
+                    && let Some((query_pool, query_base)) = timestamps
+                {
+                    self.device.cmd_write_timestamp(
+                        command,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        query_pool,
+                        query_base + 1,
+                    );
+                }
+            }
+            if let Some((query_pool, query_base)) = timestamps {
+                self.device.cmd_write_timestamp(
+                    command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    query_pool,
+                    query_base + 2,
                 );
             }
             for direction in 0..2 {
@@ -454,6 +503,14 @@ impl MotionEstimator {
                     p[15] = direction | ((self.quality as u32) << 8);
                     self.dispatch(command, 2, p, l.width.div_ceil(2), l.height.div_ceil(2));
                 }
+                if let Some((query_pool, query_base)) = timestamps {
+                    self.device.cmd_write_timestamp(
+                        command,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        query_pool,
+                        query_base + 3 + direction,
+                    );
+                }
             }
             let grid = self.vectors.extent;
             self.dispatch(
@@ -463,6 +520,14 @@ impl MotionEstimator {
                 grid.width,
                 grid.height,
             );
+            if let Some((query_pool, query_base)) = timestamps {
+                self.device.cmd_write_timestamp(
+                    command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    query_pool,
+                    query_base + 5,
+                );
+            }
             self.dispatch(
                 command,
                 4,
@@ -470,6 +535,14 @@ impl MotionEstimator {
                 1,
                 1,
             );
+            if let Some((query_pool, query_base)) = timestamps {
+                self.device.cmd_write_timestamp(
+                    command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    query_pool,
+                    query_base + 6,
+                );
+            }
             self.dispatch(
                 command,
                 5,
@@ -477,6 +550,14 @@ impl MotionEstimator {
                 grid.width,
                 grid.height,
             );
+            if let Some((query_pool, query_base)) = timestamps {
+                self.device.cmd_write_timestamp(
+                    command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    query_pool,
+                    query_base + 7,
+                );
+            }
             if visualization_needed(mode) {
                 self.dispatch(
                     command,
@@ -484,6 +565,14 @@ impl MotionEstimator {
                     self.params(0, 0, valid, mode, profile.levels),
                     self.visualization.extent.width,
                     self.visualization.extent.height,
+                );
+            }
+            if let Some((query_pool, query_base)) = timestamps {
+                self.device.cmd_write_timestamp(
+                    command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    query_pool,
+                    query_base + 8,
                 );
             }
         }

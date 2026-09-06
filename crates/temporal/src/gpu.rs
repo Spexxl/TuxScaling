@@ -206,6 +206,25 @@ impl GuidanceEstimator {
     }
 
     pub unsafe fn record(&mut self, command: vk::CommandBuffer, valid: bool) {
+        unsafe { self.record_inner(command, valid, None) };
+    }
+
+    pub unsafe fn record_timed(
+        &mut self,
+        command: vk::CommandBuffer,
+        valid: bool,
+        query_pool: vk::QueryPool,
+        query_base: u32,
+    ) {
+        unsafe { self.record_inner(command, valid, Some((query_pool, query_base))) };
+    }
+
+    unsafe fn record_inner(
+        &mut self,
+        command: vk::CommandBuffer,
+        valid: bool,
+        timestamps: Option<(vk::QueryPool, u32)>,
+    ) {
         unsafe {
             if !self.initialized {
                 for image in [
@@ -234,6 +253,14 @@ impl GuidanceEstimator {
                 &[self.descriptor_set],
                 &[],
             );
+            if let Some((query_pool, query_base)) = timestamps {
+                self.device.cmd_write_timestamp(
+                    command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    query_pool,
+                    query_base,
+                );
+            }
             let mut params = [self.extent.width, self.extent.height, u32::from(valid), 0];
             self.device.cmd_push_constants(
                 command,
@@ -249,6 +276,14 @@ impl GuidanceEstimator {
                 1,
             );
             memory_barrier(&self.device, command);
+            if let Some((query_pool, query_base)) = timestamps {
+                self.device.cmd_write_timestamp(
+                    command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    query_pool,
+                    query_base + 1,
+                );
+            }
             params[2] = u32::from(valid);
             params[3] = 1;
             self.device.cmd_push_constants(
@@ -260,6 +295,14 @@ impl GuidanceEstimator {
             );
             self.device.cmd_dispatch(command, 1, 1, 1);
             memory_barrier(&self.device, command);
+            if let Some((query_pool, query_base)) = timestamps {
+                self.device.cmd_write_timestamp(
+                    command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    query_pool,
+                    query_base + 2,
+                );
+            }
         }
         self.initialized = true;
     }
