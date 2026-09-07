@@ -562,6 +562,9 @@ impl SwapchainRuntime {
         }
         unsafe { self.initialize(queue, family) }?;
         unsafe { self.apply_pending_processing_scale() }?;
+        if let Some(guidance) = &mut self.temporal.guidance {
+            guidance.clear_provider_failure();
+        }
         let index = index as usize;
         let slot = self
             .slots
@@ -579,6 +582,9 @@ impl SwapchainRuntime {
             }
             self.temporal.history.reset();
             self.temporal.reset_reason = GuidanceReset::PresetChanged;
+            if let Some(guidance) = &mut self.temporal.guidance {
+                guidance.reset_history();
+            }
             if let Some(upscaler) = &mut self.temporal.upscaler {
                 upscaler.reset();
             }
@@ -995,6 +1001,9 @@ impl SwapchainRuntime {
         eprintln!("TuxScaling: temporal processing failed ({reason:?}); using spatial fallback");
         self.temporal.history.reset();
         self.temporal.reset_reason = GuidanceReset::ProviderFailure;
+        if let Some(guidance) = &mut self.temporal.guidance {
+            guidance.reset_history();
+        }
         if let Some(upscaler) = &mut self.temporal.upscaler {
             upscaler.reset();
         }
@@ -1018,6 +1027,14 @@ impl SwapchainRuntime {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
+            if let Some(guidance) = &mut self.temporal.guidance {
+                // The temporal provider failed before prepare_frame could
+                // record its normal producer.  Emit the same coherent GPU
+                // fallbacks on this command buffer so consumers never retain
+                // the previous frame's masks or exposure.
+                guidance.record_provider_failure(slot.command);
+                memory_barrier(&self.device, slot.command);
+            }
             if self.game_images[index] != self.output_images[index] {
                 record_spatial_blit(
                     &self.device,
@@ -1071,6 +1088,9 @@ impl SwapchainRuntime {
     }
     pub fn presentation_failed(&mut self) {
         self.temporal.history.reset();
+        if let Some(guidance) = &mut self.temporal.guidance {
+            guidance.reset_history();
+        }
         self.output_presented.fill(false);
     }
     pub unsafe fn destroy(self, _device: &ash::Device) {

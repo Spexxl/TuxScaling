@@ -19,6 +19,7 @@ layout(rg16f,binding=8) uniform readonly image2D dense_motion;
 layout(r8,binding=9) uniform image2D transparency_image;
 layout(std430,binding=10) readonly buffer CompactStats { uint partials[]; } statistics;
 layout(binding=11) uniform sampler2D previous_transparency;
+layout(r8,binding=12) uniform image2D transparency_residual_image;
 
 layout(push_constant) uniform Params {
     uint width;
@@ -95,7 +96,9 @@ float forward_occupancy(ivec2 pixel, vec2 target) {
         ivec2 n = clamp(pixel + ivec2(x,y), ivec2(0), size - 1);
         vec2 projected = vec2(n) + safe_motion(n);
         float kernel = exp(-0.65 * dot(projected - target, projected - target));
-        occupancy = max(occupancy, kernel * safe_confidence(n));
+        bool covered = all(greaterThanEqual(projected, vec2(0.0))) &&
+            all(lessThanEqual(projected, vec2(size) - vec2(1.0)));
+        occupancy = max(occupancy, covered ? kernel : 0.0);
     }
     return clamp(occupancy, 0.0, 1.0);
 }
@@ -159,6 +162,7 @@ void write_fallback(ivec2 pixel) {
     imageStore(reactive_image, pixel, vec4(0.0));
     imageStore(disocclusion_image, pixel, vec4(0.0));
     imageStore(transparency_image, pixel, vec4(0.0));
+    imageStore(transparency_residual_image, pixel, vec4(0.0));
     imageStore(depth_image, pixel, vec4(1.0));
 }
 
@@ -203,7 +207,7 @@ void main() {
     float chroma_residual = length(chroma(current_normalized) - chroma(previous_normalized));
     float confidence = safe_confidence(pixel);
     float scene_consistency = clamp(float(metadata.consistent) /
-        max(float(p.width * p.height), 1.0), 0.0, 1.0);
+        max(float(((p.width + 1u) / 2u) * ((p.height + 1u) / 2u)), 1.0), 0.0, 1.0);
 
     float occupancy = forward_occupancy(pixel, target);
     float holes = 1.0 - occupancy;
@@ -237,6 +241,8 @@ void main() {
     float composition = clamp(0.35 * previous_residual + 0.16 * variance +
         0.62 * alpha_like + 0.18 * dominant_disagreement + 0.08 * reactive, 0.0, 1.0);
     if (!inside) composition *= 0.5;
+    float residual = clamp(0.72 * alpha_like + 0.18 * dominant_disagreement +
+        0.10 * chroma_residual, 0.0, 1.0);
     if (any(isnan(current_normalized)) || any(isinf(current_normalized)) ||
         any(isnan(previous_normalized)) || any(isinf(previous_normalized))) {
         write_fallback(pixel);
@@ -245,5 +251,6 @@ void main() {
     imageStore(reactive_image, pixel, vec4(reactive));
     imageStore(disocclusion_image, pixel, vec4(disocclusion));
     imageStore(transparency_image, pixel, vec4(composition));
+    imageStore(transparency_residual_image, pixel, vec4(residual));
     imageStore(depth_image, pixel, vec4(1.0));
 }

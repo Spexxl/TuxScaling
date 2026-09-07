@@ -116,3 +116,127 @@ The smoke exited 139 in `vkcube` before establishing a usable Xlib run; this is 
 ## Commit
 
 `feat: estimate temporal masks and exposure`
+
+## Fix round 1 — producer/fallback correctness
+
+### RED evidence
+
+The first post-review run exposed the confidence/occupancy coupling. With
+confidence removed from occupancy but before the translated fixture and
+explicit flow-hole setup were completed, the GPU regression reported no
+detected disocclusion for the changed region:
+
+```text
+$ VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation cargo test -p tuxscaling-temporal --test gpu guidance_disocclusion_uses_flow_holes_and_boundaries -- --ignored --nocapture
+disocclusion counts tp=0 fp=0 fn=256
+disocclusion F1=0.000
+thread 'guidance_disocclusion_uses_flow_holes_and_boundaries' panicked
+assertion failed: score >= 0.65
+test result: FAILED. 0 passed; 1 failed
+```
+
+The review also found that `record_provider_failure` had no runtime call
+site, that the history copy source was `transparency`, and that guidance
+normalized `metadata.consistent` using the full processing extent instead of
+the level-0 sample count. These were source-level RED findings confirmed by
+searching the runtime and shader call/binding sites before the fix.
+
+### GREEN implementation and evidence
+
+- `forward_occupancy` now uses only dense forward-flow coverage and projected
+  bounds. Confidence remains an independent disocclusion cue. The translated
+  flow-hole fixture injects a deterministic `[-5, 0]` current-to-previous
+  field and uses generated boundary labels; it reports disocclusion F1 `0.998`
+  (threshold `>= 0.75`). A complementary low-confidence/full-coverage fixture
+  reports maximum disocclusion `41/255` and average `37.4/255`.
+- Guidance owns a separate `transparency_residual` R8 image at binding 12.
+  The shader writes the persistent residual there; the existing composition
+  image remains the published composition, and only the residual is copied to
+  the history sampler. The two-frame translated fixture reports:
+
+  ```text
+  translated history: first=0.691 second=0.362 background=0.008 exposure=8.070->7.810
+  ```
+
+- The metadata normalization denominator is the level-0 count
+  `((width + 1) / 2) * ((height + 1) / 2)`, matching the motion pyramid. The
+  source regression checks this expression and the preserved compact stats
+  descriptor.
+- Runtime spatial fallback now records `guidance.record_provider_failure` on
+  its existing command buffer before the spatial blit. Invalid and provider
+  failure views label all produced guidance masks/exposure as
+  `ConstantFallback`. Provider fallback readback is zero for all R8 masks and
+  exposure is exactly `1.000`.
+- Invalid/provider failure clears `history_initialized`; successful provider
+  attempts clear the failure latch before view construction. The reset fixture
+  reports `first=2.030 fallback=1.000 fresh=2.030`, proving the next valid
+  frame starts with a direct estimate rather than adapting from fallback.
+- The two-frame fixture also covers exposure adaptation. All GPU readback is
+  test-only; production keeps one command buffer/submission and no runtime
+  readback.
+
+Focused validation command and output:
+
+```text
+$ VK_LOADER_LAYERS_ENABLE='~implicit~' VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation cargo test -p tuxscaling-temporal --test gpu -- --ignored --nocapture
+running 7 tests
+low-confidence coverage disocclusion: max=41 average=37.4
+provider reset exposure: first=2.030 fallback=1.000 fresh=2.030
+translated history: first=0.691 second=0.362 background=0.008 exposure=8.070->7.810
+disocclusion counts tp=239 fp=0 fn=1
+disocclusion F1=0.998
+reactive F1=1.000
+test result: ok. 7 passed; 0 failed; 1 filtered out
+```
+
+The complete workspace checks passed:
+
+```text
+$ cargo xtask check
+exit code 0; workspace tests, doc tests, and Clippy passed
+
+$ cargo xtask gpu-check
+exit code 0; capture passed and all 9 motion GPU fixtures passed
+```
+
+The required validation-enabled smoke was retried with the current XAUTHORITY
+(`/run/user/1000/.mutter-Xwaylandauth.CB5WU3`) and again crashed inside the
+environment's `vkcube` Xlib path:
+
+```text
+$ timeout 10s env DISPLAY=:0 XAUTHORITY=/run/user/1000/.mutter-Xwaylandauth.CB5WU3 VK_ADD_LAYER_PATH="$PWD/assets/vulkan-layer" LD_LIBRARY_PATH="$PWD/target/debug${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" VK_INSTANCE_LAYERS=VK_LAYER_TUXSCALING_overlay:VK_LAYER_KHRONOS_validation VK_LAYER_VALIDATE_SYNC=1 DISABLE_MANGOHUD=1 DISABLE_LSFG=1 vkcube --wsi xlib
+timeout: the monitored command dumped core
+exit code 139
+```
+
+`cargo fmt --all -- --check` and `git diff --check` also passed.
+
+### Files and self-review
+
+Fix-round files:
+
+- `crates/runtime/src/present.rs`
+- `crates/temporal/src/gpu.rs`
+- `crates/temporal/tests/gpu.rs`
+- `shaders/temporal/guidance.comp`
+
+The existing stats descriptors and query indexes are unchanged. Binding 12 is
+an additional residual output; all image transitions and the residual-to-history
+copy remain in the existing guidance recording flow. The fallback path writes
+finite reactive/disocclusion/transparency/depth/exposure values before its
+spatial output. No neural model, CPU readback, new Vulkan requirement, or
+separate crate was added.
+
+### Concerns
+
+- The translated flow test supplies a deterministic dense-flow field so the
+  mask producer is evaluated independently from motion-estimator quality; the
+  runtime still consumes the real provider-owned dense field.
+- Compact-stat percentile exposure remains a bounded 32-bin approximation,
+  while two-frame adaptation and provider reset behavior are covered on RADV.
+- `vkcube --wsi xlib` remains blocked by the reproducible host crash above;
+  validation-enabled temporal GPU fixtures and `cargo xtask gpu-check` pass.
+
+### Fix commit
+
+`fix: harden temporal guidance producers` (this report is included in the fix commit)
