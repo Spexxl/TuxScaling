@@ -1,4 +1,4 @@
-use super::{Capture, SwapchainInfo};
+use super::{Capture, GpuTimingWindow, SwapchainInfo};
 use ash::vk;
 use std::time::{Duration, Instant};
 use tuxscaling_capture::JitterState;
@@ -102,7 +102,7 @@ pub struct TemporalPipeline {
     pub(crate) queries: vk::QueryPool,
     pub(crate) query_ready: Vec<bool>,
     pub(crate) timestamp_period: f32,
-    pub(crate) timings: Vec<[f32; super::GPU_PHASES]>,
+    pub(crate) timings: GpuTimingWindow,
     pub(crate) config: Config,
     pub(crate) jitter: JitterState,
 }
@@ -242,7 +242,7 @@ impl TemporalPipeline {
             queries: vk::QueryPool::null(),
             query_ready: vec![false; image_count],
             timestamp_period,
-            timings: Vec::new(),
+            timings: GpuTimingWindow::default(),
             config: config.clone(),
             jitter: JitterState::new(config.jitter_mode),
         })
@@ -281,7 +281,7 @@ impl TemporalPipeline {
             queries: vk::QueryPool::null(),
             query_ready: Vec::new(),
             timestamp_period: 0.0,
-            timings: Vec::new(),
+            timings: GpuTimingWindow::default(),
             config: Config::default(),
             jitter: JitterState::default(),
         }

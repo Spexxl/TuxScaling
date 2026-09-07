@@ -618,6 +618,14 @@ impl GuidanceEstimator {
             );
             self.device.cmd_dispatch(command, 1, 1, 1);
             memory_barrier(&self.device, command);
+            if let Some((query_pool, query_base)) = timestamps {
+                self.device.cmd_write_timestamp(
+                    command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    query_pool,
+                    query_base + 2,
+                );
+            }
 
             // Relative depth is deliberately a separate reduction pipeline:
             // first solve the compact affine model, then accumulate robust
@@ -702,7 +710,7 @@ impl GuidanceEstimator {
                     command,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     query_pool,
-                    query_base + 2,
+                    query_base + 3,
                 );
             }
         }

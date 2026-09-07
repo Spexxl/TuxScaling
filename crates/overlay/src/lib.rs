@@ -45,11 +45,13 @@ pub struct FrameDiagnostics {
     pub forward_flow_ms: f32,
     pub backward_flow_ms: f32,
     pub confidence_ms: f32,
+    pub stats_ms: f32,
     pub scene_ms: f32,
     pub invalidate_ms: f32,
     pub motion_ms: f32,
     pub reactive_ms: f32,
     pub exposure_ms: f32,
+    pub depth_ms: f32,
     pub guidance_ms: f32,
     pub reconstruction_ms: f32,
     pub overlay_ms: f32,
@@ -269,12 +271,14 @@ pub fn render_diagnostics(
                         diagnostics.backward_flow_ms
                     ));
                     ui.label(format!(
-                        "Passes ms: confidence {:.2} | scene {:.2} | invalidate {:.2} | reactive {:.2} | exposure {:.2}",
+                        "Passes ms: confidence {:.2} | stats {:.2} | scene {:.2} | invalidate {:.2} | reactive {:.2} | exposure {:.2} | depth {:.2}",
                         diagnostics.confidence_ms,
+                        diagnostics.stats_ms,
                         diagnostics.scene_ms,
                         diagnostics.invalidate_ms,
                         diagnostics.reactive_ms,
-                        diagnostics.exposure_ms
+                        diagnostics.exposure_ms,
+                        diagnostics.depth_ms
                     ));
                     ui.label(format!(
                         "CPU ms: capture {:.2} | motion {:.2} | guidance {:.2} | reconstruction {:.2} | overlay {:.2}",

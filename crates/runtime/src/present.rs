@@ -1,6 +1,6 @@
 #![allow(clippy::missing_safety_doc)]
 use ash::vk;
-use std::time::Instant;
+use std::{collections::VecDeque, time::Instant};
 use tuxscaling_capture::Capture;
 use tuxscaling_config::DebugView;
 use tuxscaling_motion::MotionQuality;
@@ -57,8 +57,81 @@ struct Slot {
     fence: vk::Fence,
     semaphore: vk::Semaphore,
 }
-const GPU_PHASES: usize = 13;
-const GPU_TIMESTAMPS: usize = 16;
+const GPU_PHASES: usize = 14;
+const GPU_TIMESTAMPS: usize = 17;
+const GPU_WARMUP_FRAMES: u64 = 180;
+const GPU_SAMPLE_LIMIT: usize = 600;
+
+#[derive(Default)]
+pub(crate) struct GpuTimingWindow {
+    samples: VecDeque<[f32; GPU_PHASES]>,
+}
+
+#[derive(Clone, Copy)]
+struct GpuTimingSummary {
+    median_ms: f32,
+    p95_ms: f32,
+    within_budget: bool,
+}
+
+impl GpuTimingWindow {
+    fn record(&mut self, frame_id: u64, sample: [f32; GPU_PHASES]) {
+        if frame_id < GPU_WARMUP_FRAMES {
+            return;
+        }
+        if self.samples.len() == GPU_SAMPLE_LIMIT {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(sample);
+    }
+
+    fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    fn phase_summary(&self, phase: usize) -> Option<(f32, f32)> {
+        let mut values = self
+            .samples
+            .iter()
+            .map(|sample| sample[phase])
+            .collect::<Vec<_>>();
+        values.sort_by(f32::total_cmp);
+        summary_values(&values)
+    }
+
+    fn summary(&self, quality: tuxscaling_config::MotionQuality) -> Option<GpuTimingSummary> {
+        if self.samples.len() < GPU_SAMPLE_LIMIT {
+            return None;
+        }
+        let mut values = self
+            .samples
+            .iter()
+            .map(|sample| sample[..GPU_PHASES - 1].iter().sum::<f32>())
+            .collect::<Vec<_>>();
+        values.sort_by(f32::total_cmp);
+        let (median_ms, p95_ms) = summary_values(&values)?;
+        Some(GpuTimingSummary {
+            median_ms,
+            p95_ms,
+            within_budget: median_ms <= quality_budget(quality) && p95_ms <= median_ms * 1.35,
+        })
+    }
+}
+
+fn summary_values(values: &[f32]) -> Option<(f32, f32)> {
+    let middle = values.len() / 2;
+    let median = if values.len().is_multiple_of(2) {
+        (values.get(middle - 1)? + values.get(middle)?) * 0.5
+    } else {
+        *values.get(middle)?
+    };
+    let p95 = *values.get((values.len() * 95).div_ceil(100).saturating_sub(1))?;
+    Some((median, p95))
+}
 
 fn mode_name(mode: u32) -> &'static str {
     [
@@ -675,6 +748,7 @@ impl SwapchainRuntime {
                     elapsed(12, 13),
                     elapsed(13, 14),
                     elapsed(14, 15),
+                    elapsed(15, 16),
                 ];
                 self.diagnostics.capture_ms = ms[0];
                 self.diagnostics.luma_ms = ms[1];
@@ -682,34 +756,28 @@ impl SwapchainRuntime {
                 self.diagnostics.forward_flow_ms = ms[3];
                 self.diagnostics.backward_flow_ms = ms[4];
                 self.diagnostics.confidence_ms = ms[5];
+                self.diagnostics.stats_ms = ms[6];
                 self.diagnostics.scene_ms = ms[7];
                 self.diagnostics.invalidate_ms = ms[8];
                 self.diagnostics.motion_ms = ms[1..9].iter().sum();
                 self.diagnostics.reactive_ms = ms[9];
                 self.diagnostics.exposure_ms = ms[10];
-                self.diagnostics.guidance_ms = ms[9] + ms[10];
-                self.diagnostics.reconstruction_ms = ms[11];
-                self.diagnostics.overlay_ms = ms[12];
-                let temporal_ms = self.diagnostics.motion_ms
+                self.diagnostics.depth_ms = ms[11];
+                self.diagnostics.guidance_ms = ms[9..12].iter().sum();
+                self.diagnostics.reconstruction_ms = ms[12];
+                self.diagnostics.overlay_ms = ms[13];
+                let temporal_ms = self.diagnostics.capture_ms
+                    + self.diagnostics.motion_ms
                     + self.diagnostics.guidance_ms
                     + self.diagnostics.reconstruction_ms;
                 self.diagnostics.budget_warning =
                     temporal_ms > quality_budget(self.diagnostics.quality);
-                if self.temporal.history.frame_id >= 180 {
-                    if self.temporal.timings.len() == 18000 {
-                        self.temporal.timings.remove(0);
-                    }
-                    self.temporal.timings.push(ms);
-                    let mut totals = self
-                        .temporal
-                        .timings
-                        .iter()
-                        .map(|timing| timing[1..12].iter().sum::<f32>())
-                        .collect::<Vec<_>>();
-                    totals.sort_by(f32::total_cmp);
-                    self.diagnostics.p95_ms = totals[(totals.len() - 1) * 95 / 100];
-                    let median = totals[totals.len() / 2];
-                    self.diagnostics.budget_warning |= self.diagnostics.p95_ms > median * 1.35;
+                self.temporal
+                    .timings
+                    .record(self.temporal.history.frame_id, ms);
+                if let Some(summary) = self.temporal.timings.summary(self.diagnostics.quality) {
+                    self.diagnostics.p95_ms = summary.p95_ms;
+                    self.diagnostics.budget_warning |= !summary.within_budget;
                 }
             }
         }
@@ -919,7 +987,7 @@ impl SwapchainRuntime {
                         slot.command,
                         self.temporal.queries,
                         index as u32 * GPU_TIMESTAMPS as u32 + 11,
-                        3,
+                        4,
                     );
                     guidance.record_timed_with_timing_for_slot(
                         slot.command,
@@ -940,7 +1008,7 @@ impl SwapchainRuntime {
                 memory_barrier(&self.device, slot.command);
                 self.diagnostics.guidance_cpu_ms = cpu_start.elapsed().as_secs_f32() * 1_000.0;
             } else if self.temporal.queries != vk::QueryPool::null() {
-                for offset in 11..=13 {
+                for offset in 11..=14 {
                     self.device.cmd_write_timestamp(
                         slot.command,
                         vk::PipelineStageFlags::ALL_COMMANDS,
@@ -1068,7 +1136,7 @@ impl SwapchainRuntime {
                     slot.command,
                     vk::PipelineStageFlags::ALL_COMMANDS,
                     self.temporal.queries,
-                    index as u32 * GPU_TIMESTAMPS as u32 + 14,
+                    index as u32 * GPU_TIMESTAMPS as u32 + 15,
                 );
             }
             let cpu_start = Instant::now();
@@ -1089,7 +1157,7 @@ impl SwapchainRuntime {
                     slot.command,
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     self.temporal.queries,
-                    index as u32 * GPU_TIMESTAMPS as u32 + 15,
+                    index as u32 * GPU_TIMESTAMPS as u32 + 16,
                 );
             }
             self.device.end_command_buffer(slot.command)?;
@@ -1233,30 +1301,32 @@ impl Drop for SwapchainRuntime {
                 "invalidate",
                 "reactive",
                 "exposure",
+                "depth",
                 "reconstruction",
                 "overlay",
             ]
             .iter()
             .enumerate()
             {
-                let mut values = self
-                    .temporal
-                    .timings
-                    .iter()
-                    .map(|v| v[axis])
-                    .collect::<Vec<_>>();
-                values.sort_by(f32::total_cmp);
-                summary.push_str(&format!(
-                    " {name}: median={:.3} p95={:.3} ms",
-                    values[values.len() / 2],
-                    values[(values.len() - 1) * 95 / 100]
-                ));
+                if let Some((median, p95)) = self.temporal.timings.phase_summary(axis) {
+                    summary.push_str(&format!(" {name}: median={median:.3} p95={p95:.3} ms"));
+                }
             }
+            let total = self.temporal.timings.summary(self.diagnostics.quality);
             eprintln!(
-                "TuxScaling {}x{} GPU samples={}{}",
+                "TuxScaling {}x{} GPU samples={} temporal_median={} temporal_p95={} budget={}{}",
                 self.info.extent.width,
                 self.info.extent.height,
                 self.temporal.timings.len(),
+                total.map_or_else(
+                    || "incomplete".to_owned(),
+                    |value| format!("{:.3} ms", value.median_ms)
+                ),
+                total.map_or_else(
+                    || "incomplete".to_owned(),
+                    |value| format!("{:.3} ms", value.p95_ms)
+                ),
+                total.is_some_and(|value| value.within_budget),
                 summary
             );
         }
@@ -1276,7 +1346,8 @@ impl Drop for SwapchainRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::debug_mode_id;
+    use super::{GPU_PHASES, GpuTimingWindow, debug_mode_id};
+    use tuxscaling_config::MotionQuality;
 
     #[test]
     fn assigns_stable_debug_mode_ids_for_guidance_views() {
@@ -1285,5 +1356,52 @@ mod tests {
         assert_eq!(debug_mode_id("composition"), Some(9));
         assert_eq!(debug_mode_id("exposure"), Some(10));
         assert_eq!(debug_mode_id("unsupported"), None);
+    }
+
+    #[test]
+    fn timing_window_keeps_exactly_six_hundred_samples_after_warmup() {
+        let mut window = GpuTimingWindow::default();
+        let sample = [0.0; GPU_PHASES];
+
+        for frame_id in 0..779 {
+            window.record(frame_id, sample);
+        }
+        assert_eq!(window.len(), 599);
+        assert!(window.summary(MotionQuality::Balanced).is_none());
+
+        window.record(779, sample);
+        assert_eq!(window.len(), 600);
+        assert!(window.summary(MotionQuality::Balanced).is_some());
+    }
+
+    #[test]
+    fn timing_budget_includes_capture_and_excludes_overlay() {
+        let mut window = GpuTimingWindow::default();
+        let mut sample = [0.0; GPU_PHASES];
+        sample[0] = 2.6;
+        sample[GPU_PHASES - 1] = 100.0;
+
+        for frame_id in 180..780 {
+            window.record(frame_id, sample);
+        }
+
+        let summary = window.summary(MotionQuality::Performance).unwrap();
+        assert_eq!(summary.median_ms, 2.6);
+        assert!(!summary.within_budget);
+    }
+
+    #[test]
+    fn timing_budget_flags_an_unstable_p95() {
+        let mut window = GpuTimingWindow::default();
+        for frame_id in 180..780 {
+            let mut sample = [0.0; GPU_PHASES];
+            sample[0] = if frame_id < 680 { 1.0 } else { 2.0 };
+            window.record(frame_id, sample);
+        }
+
+        let summary = window.summary(MotionQuality::Ultra).unwrap();
+        assert_eq!(summary.median_ms, 1.0);
+        assert_eq!(summary.p95_ms, 2.0);
+        assert!(!summary.within_budget);
     }
 }
