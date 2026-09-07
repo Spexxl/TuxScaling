@@ -6,7 +6,7 @@ The Vulkan layer injects work immediately before presentation while preserving t
 
 The runtime captures supported swapchains, computes estimated optical flow and frame guidance, runs the reference reconstruction when the format supports storage images, and renders the Egui diagnostic panel over `vkcube` on RADV. In fullscreen X11/XWayland virtual-output mode, game-owned layer images remain at the requested game extent while the real swapchain images use the configured output extent. Unsupported formats and allocation failures bypass reconstruction while preserving presentation. If temporal recording fails after virtualization has started, the runtime attempts a spatial bilinear blit into the real output before presenting.
 
-The overlay displays `Virtual upscale`, `Native AA`, `Windowed 1:1`, or a direct fallback reason alongside game, processing, and output extents. The logical surface capabilities saved before a resize are restored to the application, while internal layer queries continue to use downstream physical capabilities. Present IDs and Google present timing structures survive incremental-present rectangle remapping.
+The overlay displays `Virtual upscale`, `Native AA`, `Windowed 1:1`, or a direct fallback reason alongside game, processing, and output extents. It also reports the window mode and selected monitor, for example `Promoted borderless` and `1920x1080 at 0,0`. The logical surface capabilities saved before a resize are restored to the application, while internal layer queries continue to use downstream physical capabilities. Present IDs and Google present timing structures survive incremental-present rectangle remapping.
 
 ## Ownership
 
@@ -45,7 +45,7 @@ Layer-owned objects must be destroyed before their downstream owner:
 3. Destroy remaining device-owned resources before `vkDestroyDevice` reaches the next layer.
 4. Remove instance state before `vkDestroyInstance` reaches the next layer.
 
-Swapchain recreation creates a new overlay state. Old state is released through the normal destroy path and never reused for a new format or extent.
+Swapchain recreation creates a new overlay state. A successful replacement retains the surface's one `BorderlessLease`; failed creation, capability validation, virtual-image allocation, or runtime initialization restores it exactly once before direct fallback. Old state is released through the normal destroy path and never reused for a new format or extent.
 
 ## Failure and ABI policy
 
@@ -62,7 +62,7 @@ The runtime milestone is complete only when all checks pass:
 - `vkcube` renders an Egui panel with the layer enabled;
 - validation layers report no synchronization or lifetime errors during create, resize, present, and destruction;
 - the WSI harness exercises two swapchains, grouped presents, resize, and resource destruction without global queue-idle stalls;
-- GPU tests cover known motion, scene cuts, occlusion confidence, and capture isolation.
+- GPU tests cover known motion, scene cuts, occlusion confidence, capture isolation, per-signal mask fallbacks, relative-depth support state, and the deterministic quality fixtures. The acceptance benchmark separates guidance from reconstruction and requires p95 no greater than 135 percent of median for each reported total.
 
 ## Scope boundary
 

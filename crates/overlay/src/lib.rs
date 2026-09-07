@@ -20,6 +20,8 @@ pub struct FrameDiagnostics {
     pub processing_extent: [u32; 2],
     pub output_extent: [u32; 2],
     pub presentation_mode: String,
+    pub window_mode: String,
+    pub monitor: String,
     pub frame_delta_ms: f32,
     pub frame_delta_raw_ms: f32,
     pub frame_delta_validated_ms: f32,
@@ -53,8 +55,10 @@ pub struct FrameDiagnostics {
     pub exposure_ms: f32,
     pub depth_ms: f32,
     pub guidance_ms: f32,
+    pub guidance_total_ms: f32,
     pub reconstruction_ms: f32,
     pub overlay_ms: f32,
+    pub full_injected_ms: f32,
     pub p95_ms: f32,
     pub budget_warning: bool,
 }
@@ -155,6 +159,10 @@ pub fn render_diagnostics(
                             diagnostics.output_extent[1],
                         ));
                         ui.label(format!("Mode: {}", diagnostics.presentation_mode));
+                        ui.label(format!(
+                            "Window: {} | Monitor: {}",
+                            diagnostics.window_mode, diagnostics.monitor
+                        ));
                     }
                     egui::CollapsingHeader::new("Advanced")
                         .default_open(false)
@@ -256,12 +264,15 @@ pub fn render_diagnostics(
                     ui.label("Motion: current -> previous, pixels");
                     ui.label("Hue: direction | Brightness: magnitude");
                     ui.label(format!(
-                        "GPU ms: capture {:.2} | flow {:.2} | guidance {:.2} | reconstruction {:.2} | overlay {:.2}",
+                        "GPU ms: capture {:.2} | guidance total {:.2} | reconstruction {:.2} | overlay {:.2}",
                         diagnostics.capture_ms,
-                        diagnostics.motion_ms,
-                        diagnostics.guidance_ms,
+                        diagnostics.guidance_total_ms,
                         diagnostics.reconstruction_ms,
                         diagnostics.overlay_ms
+                    ));
+                    ui.label(format!(
+                        "Injected total: {:.2} ms",
+                        diagnostics.full_injected_ms
                     ));
                     ui.label(format!(
                         "Passes ms: luma {:.2} | pyramid {:.2} | forward {:.2} | backward {:.2}",

@@ -7,20 +7,30 @@ use std::{
 use tuxscaling_vulkan::image_barrier;
 use x11rb::{
     connection::Connection,
-    protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt},
+    protocol::{
+        randr::ConnectionExt as RandrConnectionExt,
+        xproto::{ChangeWindowAttributesAux, ConnectionExt},
+    },
 };
 
 fn game_extent() -> vk::Extent2D {
-    match std::env::var("TUXSCALING_TEST_SCENARIO").as_deref() {
-        Ok("upscale") => vk::Extent2D {
+    game_extent_for(std::env::var("TUXSCALING_TEST_SCENARIO").ok().as_deref())
+}
+
+fn game_extent_for(scenario: Option<&str>) -> vk::Extent2D {
+    match scenario {
+        Some(
+            "upscale" | "windowed_promote" | "already_borderless" | "monitor_origin"
+            | "promotion_failure" | "temporal_failure",
+        ) => vk::Extent2D {
             width: 1280,
             height: 720,
         },
-        Ok("native") => vk::Extent2D {
+        Some("native" | "native_aa") => vk::Extent2D {
             width: 1920,
             height: 1080,
         },
-        Ok("aspect") => vk::Extent2D {
+        Some("aspect") => vk::Extent2D {
             width: 1024,
             height: 768,
         },
@@ -29,6 +39,37 @@ fn game_extent() -> vk::Extent2D {
             height: 300,
         },
     }
+}
+
+fn starts_borderless() -> bool {
+    matches!(
+        std::env::var("TUXSCALING_TEST_SCENARIO").as_deref(),
+        Ok("already_borderless")
+    )
+}
+
+fn uses_negative_monitor_origin() -> bool {
+    matches!(
+        std::env::var("TUXSCALING_TEST_SCENARIO").as_deref(),
+        Ok("monitor_origin")
+    )
+}
+
+fn native_monitor_rect() -> Option<(i32, i32, u32, u32)> {
+    let (connection, screen) = x11rb::connect(None).ok()?;
+    let root = connection.setup().roots.get(screen)?.root;
+    let reply = connection
+        .randr_get_monitors(root, true)
+        .ok()?
+        .reply()
+        .ok()?;
+    let monitor = reply.monitors.first()?;
+    Some((
+        i32::from(monitor.x),
+        i32::from(monitor.y),
+        u32::from(monitor.width),
+        u32::from(monitor.height),
+    ))
 }
 
 #[link(name = "X11")]
@@ -47,41 +88,12 @@ unsafe extern "C" {
         background: c_ulong,
     ) -> c_ulong;
     fn XStoreName(display: *mut c_void, window: c_ulong, name: *const c_char) -> c_int;
-    fn XInternAtom(display: *mut c_void, name: *const c_char, only_if_exists: c_int) -> c_ulong;
-    fn XChangeProperty(
-        display: *mut c_void,
-        window: c_ulong,
-        property: c_ulong,
-        property_type: c_ulong,
-        format: c_int,
-        mode: c_int,
-        data: *const u8,
-        element_count: c_int,
-    ) -> c_int;
     fn XMapWindow(display: *mut c_void, window: c_ulong) -> c_int;
     fn XResizeWindow(display: *mut c_void, window: c_ulong, width: c_uint, height: c_uint)
     -> c_int;
     fn XDestroyWindow(display: *mut c_void, window: c_ulong) -> c_int;
     fn XFlush(display: *mut c_void) -> c_int;
     fn XCloseDisplay(display: *mut c_void) -> c_int;
-}
-
-unsafe fn mark_fullscreen(display: *mut c_void, window: c_ulong) {
-    let state = unsafe { XInternAtom(display, c"_NET_WM_STATE".as_ptr(), 0) };
-    let fullscreen = unsafe { XInternAtom(display, c"_NET_WM_STATE_FULLSCREEN".as_ptr(), 0) };
-    let atom_type = unsafe { XInternAtom(display, c"ATOM".as_ptr(), 0) };
-    unsafe {
-        XChangeProperty(
-            display,
-            window,
-            state,
-            atom_type,
-            32,
-            0,
-            (&fullscreen as *const c_ulong).cast(),
-            1,
-        );
-    }
 }
 
 fn parse_frame_limit(value: Option<&str>) -> Option<u32> {
@@ -131,6 +143,25 @@ mod tests {
         assert_eq!(super::queue_index_for_swapchain(1, 1), 0);
         assert_eq!(super::queue_index_for_swapchain(1, 2), 1);
     }
+
+    #[test]
+    fn recognizes_native_output_window_scenarios() {
+        for scenario in [
+            "windowed_promote",
+            "already_borderless",
+            "native_aa",
+            "aspect",
+            "resize",
+            "monitor_origin",
+            "promotion_failure",
+            "temporal_failure",
+        ] {
+            assert!(
+                super::game_extent_for(Some(scenario)).width > 0,
+                "{scenario}"
+            );
+        }
+    }
 }
 
 struct Chain {
@@ -166,11 +197,22 @@ unsafe fn replace(
                     && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
             })
             .unwrap();
-        let extent = if caps.current_extent.width == u32::MAX
-            || std::env::var("TUXSCALING_TEST_FORCE_VIRTUAL")
+        let promotion_failure_recreate = std::env::var("TUXSCALING_TEST_SCENARIO").ok().as_deref()
+            == Some("promotion_failure")
+            && std::env::var("TUXSCALING_TEST_FORCE_RESIZE_FAILURE")
                 .ok()
                 .as_deref()
                 == Some("1")
+            && chain.handle != vk::SwapchainKHR::null();
+        let native_aa_direct =
+            std::env::var("TUXSCALING_TEST_SCENARIO").ok().as_deref() == Some("native_aa");
+        let extent = if caps.current_extent.width == u32::MAX
+            || (std::env::var("TUXSCALING_TEST_FORCE_VIRTUAL")
+                .ok()
+                .as_deref()
+                == Some("1")
+                && !promotion_failure_recreate
+                && !native_aa_direct)
         {
             extent
         } else {
@@ -267,22 +309,35 @@ unsafe fn run() {
         } else {
             2
         };
+        let scenario_active = std::env::var("TUXSCALING_TEST_SCENARIO").is_ok();
+        let borderless_monitor = starts_borderless().then(native_monitor_rect).flatten();
+        let initial_extent =
+            borderless_monitor.map_or_else(game_extent, |(_, _, width, height)| vk::Extent2D {
+                width,
+                height,
+            });
         let windows = (0..window_count)
             .map(|i| {
                 let w = XCreateSimpleWindow(
                     display,
                     XDefaultRootWindow(display),
-                    20 + i as c_int * 440,
-                    40,
-                    game_extent().width,
-                    game_extent().height,
+                    if let Some((x, _y, _, _)) = borderless_monitor {
+                        x + i as c_int * 440
+                    } else if uses_negative_monitor_origin() {
+                        -50 + i as c_int * 440
+                    } else {
+                        20 + i as c_int * 440
+                    },
+                    borderless_monitor.map_or(40, |(_, y, _, _)| y),
+                    initial_extent.width,
+                    initial_extent.height,
                     0,
                     0,
                     0,
                 );
                 XStoreName(display, w, c"TuxScaling WSI validation".as_ptr());
                 XFlush(display);
-                if std::env::var("TUXSCALING_TEST_SCENARIO").is_ok() {
+                if scenario_active {
                     let (connection, _) = x11rb::connect(None).unwrap();
                     connection
                         .change_window_attributes(
@@ -295,11 +350,21 @@ unsafe fn run() {
                     connection.flush().unwrap();
                 }
                 XMapWindow(display, w);
-                mark_fullscreen(display, w);
                 w
             })
             .collect::<Vec<_>>();
         XFlush(display);
+        let display_probe = tuxscaling_display::X11Display::connect().unwrap();
+        let original_windows = windows
+            .iter()
+            .map(|&window| {
+                (
+                    window,
+                    display_probe.window_rect(window).unwrap(),
+                    display_probe.is_fullscreen(window),
+                )
+            })
+            .collect::<Vec<_>>();
         let entry = ash::Entry::load().unwrap();
         let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
         let extensions = [
@@ -418,18 +483,19 @@ unsafe fn run() {
             );
         }
         let start = Instant::now();
-        if std::env::var("TUXSCALING_TEST_SCENARIO").is_ok() {
+        if scenario_active {
             let display = tuxscaling_display::X11Display::connect().unwrap();
             for &window in &windows {
                 let rect = display.window_rect(window).unwrap();
-                let expected = if std::env::var("TUXSCALING_TEST_FORCE_RESIZE_FAILURE").as_deref()
-                    == Ok("1")
+                let expected = if std::env::var("TUXSCALING_TEST_SCENARIO").ok().as_deref()
+                    == Some("native_aa")
                 {
                     game_extent()
                 } else {
+                    let monitor = display_probe.monitor_for_window(window).unwrap();
                     vk::Extent2D {
-                        width: 1920,
-                        height: 1080,
+                        width: monitor.rect.width,
+                        height: monitor.rect.height,
                     }
                 };
                 assert_eq!(
@@ -459,7 +525,15 @@ unsafe fn run() {
         while frame_limit.is_some_and(|limit| frame < limit)
             || frame_limit.is_none() && start.elapsed() < Duration::from_secs(seconds)
         {
-            if resize_interval > 0 && frame > 0 && frame.is_multiple_of(resize_interval) {
+            let promotion_failure_finished =
+                std::env::var("TUXSCALING_TEST_SCENARIO").ok().as_deref()
+                    == Some("promotion_failure")
+                    && resizes > 0;
+            if resize_interval > 0
+                && frame > 0
+                && frame.is_multiple_of(resize_interval)
+                && !promotion_failure_finished
+            {
                 let extent = if resizes % 2 == 0 {
                     vk::Extent2D {
                         width: 480,
@@ -614,6 +688,15 @@ unsafe fn run() {
             device.destroy_fence(chain.fence, None);
             swapchains.destroy_swapchain(chain.handle, None);
             surface_loader.destroy_surface(chain.surface, None);
+        }
+        XFlush(display);
+        if scenario_active {
+            let restored = tuxscaling_display::X11Display::connect().unwrap();
+            for (window, original, fullscreen) in &original_windows {
+                let current = restored.window_rect(*window).unwrap();
+                assert_eq!(current, *original, "window geometry was not restored");
+                assert_eq!(restored.is_fullscreen(*window), *fullscreen);
+            }
         }
         device.destroy_command_pool(pool, None);
         device.destroy_device(None);

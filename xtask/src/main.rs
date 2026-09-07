@@ -4,21 +4,26 @@ use std::process::{Command, ExitCode, Output};
 struct BenchmarkCase {
     scenario: &'static str,
     quality: &'static str,
+    processing_scale_percent: u32,
 }
 
 fn benchmark_cases() -> Vec<BenchmarkCase> {
-    ["upscale", "native"]
+    ["upscale", "native_aa"]
         .into_iter()
         .flat_map(|scenario| {
-            ["ultra", "high", "balanced", "performance"]
+            [100, 50]
                 .into_iter()
-                .map(move |quality| BenchmarkCase { scenario, quality })
+                .flat_map(move |processing_scale_percent| {
+                    ["ultra", "high", "balanced", "performance"]
+                        .into_iter()
+                        .map(move |quality| BenchmarkCase {
+                            scenario,
+                            quality,
+                            processing_scale_percent,
+                        })
+                })
         })
         .collect()
-}
-
-fn benchmark_processing_scale() -> f32 {
-    0.5
 }
 
 fn report(result: std::io::Result<Output>) -> bool {
@@ -58,6 +63,10 @@ fn main() -> ExitCode {
                 "tuxscaling-capture",
                 "-p",
                 "tuxscaling-motion",
+                "-p",
+                "tuxscaling-temporal",
+                "-p",
+                "tuxscaling-upscaler",
                 "--test",
                 "gpu",
                 "--",
@@ -91,7 +100,7 @@ fn main() -> ExitCode {
             let smoke_config = root.join("target/native-output-smoke.toml");
             std::fs::write(
                 &smoke_config,
-                "output_resolution = \"1920x1080\"\nprocessing_scale = 1.0\n",
+                "output_resolution = \"native\"\nprocessing_scale = 1.0\n",
             )
             .unwrap();
             let direct_config = root.join("target/native-aa-smoke.toml");
@@ -112,7 +121,7 @@ fn main() -> ExitCode {
                     .env("TUXSCALING_VIEW", "reconstructed")
                     .env(
                         "TUXSCALING_CONFIG",
-                        if scenario == "native" {
+                        if scenario == "native" || scenario == "native_aa" {
                             &direct_config
                         } else {
                             &smoke_config
@@ -130,17 +139,20 @@ fn main() -> ExitCode {
                 if resize_failure {
                     command.env("TUXSCALING_TEST_FORCE_RESIZE_FAILURE", "1");
                 }
-                if scenario == "resize" {
+                if scenario == "resize" || scenario == "promotion_failure" {
                     command.env("TUXSCALING_TEST_RESIZE_INTERVAL", "4");
                 }
                 report(command.output())
             };
             run_wsi("upscale", false, false)
-                && run_wsi("native", false, false)
+                && run_wsi("windowed_promote", false, false)
+                && run_wsi("already_borderless", false, false)
+                && run_wsi("native_aa", false, false)
                 && run_wsi("aspect", false, false)
-                && run_wsi("upscale", true, false)
-                && run_wsi("upscale", false, true)
                 && run_wsi("resize", false, false)
+                && run_wsi("monitor_origin", false, false)
+                && run_wsi("promotion_failure", false, true)
+                && run_wsi("temporal_failure", true, false)
         }
         "benchmark" => {
             if !run(
@@ -165,19 +177,21 @@ fn main() -> ExitCode {
                 .collect::<Vec<_>>();
             benchmark_cases().into_iter().all(|case| {
                 let config = root.join(format!(
-                    "target/benchmark-{}-{}.toml",
-                    case.scenario, case.quality
+                    "target/benchmark-{}-{}-{}.toml",
+                    case.scenario,
+                    case.quality,
+                    case.processing_scale_percent
                 ));
-                let output_resolution = if case.scenario == "native" {
+                let output_resolution = if case.scenario == "native_aa" {
                     "swapchain"
                 } else {
-                    "1920x1080"
+                    "native"
                 };
                 if std::fs::write(
                     &config,
                     format!(
                         "output_resolution = \"{output_resolution}\"\nprocessing_scale = {}\nmotion_quality = \"{}\"\n",
-                        benchmark_processing_scale(),
+                        case.processing_scale_percent as f32 / 100.0,
                         case.quality
                     ),
                 )
@@ -186,8 +200,8 @@ fn main() -> ExitCode {
                     return false;
                 }
                 eprintln!(
-                    "TuxScaling benchmark: scenario={} quality={} warmup=180 samples=600",
-                    case.scenario, case.quality
+                    "TuxScaling benchmark: scenario={} quality={} processing_scale={}% warmup=180 samples=600",
+                    case.scenario, case.quality, case.processing_scale_percent
                 );
                 let mut command = Command::new(root.join("target/debug/examples/wsi"));
                 validation(&mut command)
@@ -243,25 +257,26 @@ mod tests {
     #[test]
     fn benchmark_matrix_covers_each_quality_and_presentation_mode() {
         let cases = benchmark_cases();
-        assert_eq!(cases.len(), 8);
+        assert_eq!(cases.len(), 16);
         assert_eq!(
             cases
                 .iter()
                 .filter(|case| case.scenario == "upscale")
                 .count(),
-            4
+            8
         );
         assert_eq!(
             cases
                 .iter()
-                .filter(|case| case.scenario == "native")
+                .filter(|case| case.scenario == "native_aa")
                 .count(),
-            4
+            8
         );
-    }
-
-    #[test]
-    fn benchmark_uses_the_explicit_low_latency_processing_scale() {
-        assert_eq!(super::benchmark_processing_scale(), 0.5);
+        assert!(
+            cases
+                .iter()
+                .any(|case| case.processing_scale_percent == 100)
+        );
+        assert!(cases.iter().any(|case| case.processing_scale_percent == 50));
     }
 }

@@ -29,7 +29,7 @@ cargo xtask smoke
 
 The debug WSI harness sets `TUXSCALING_TEST_FORCE_VIRTUAL=1` so it can validate small logical game images against the discovered monitor output without depending on a window manager fullscreen transition. Release builds ignore this test-only override.
 
-The harness accepts `TUXSCALING_TEST_SCENARIO=upscale|native|aspect|resize`. These scenarios exercise 1280x720 to native output, equal-extent Native AA, centered aspect-fit bars, and swapchain recreation. `TUXSCALING_TEST_FORCE_RESIZE_FAILURE=1` verifies the direct-mode transaction fallback. Every other frame uses `vkAcquireNextImage2KHR` so both acquisition entry points stay covered.
+The harness accepts `TUXSCALING_TEST_SCENARIO=upscale|windowed_promote|already_borderless|native_aa|aspect|resize|monitor_origin|promotion_failure|temporal_failure`. These scenarios cover ordinary window promotion, already-borderless ownership, equal-extent Native AA, centered aspect-fit bars, swapchain recreation, negative monitor origins, promotion failure, and temporal failure. `TUXSCALING_TEST_FORCE_RESIZE_FAILURE=1` verifies the direct-mode transaction fallback. Every other frame uses `vkAcquireNextImage2KHR` so both acquisition entry points stay covered. Scenario runs snapshot and verify X11 geometry and fullscreen state after cleanup.
 
 Set `TUXSCALING_TEST_FORCE_TEMPORAL_FAILURE=1` in a debug run to exercise the mandatory spatial bilinear fallback used when temporal recording fails after virtual output has started.
 
@@ -64,9 +64,9 @@ debug_view = "original"
 
 `processing_scale` is optional internal work reduction after capture. It does not change the game resolution or the output resolution; its default is `1.0`. The legacy `render_scale` key is accepted during the migration.
 
-The fixed quality targets are Ultra (12 ms), High (8 ms), Balanced (4 ms), and Performance (2.5 ms) for temporal work at 1080p. The overlay reports capture, luma, pyramid, forward/backward flow, confidence, scene, invalidate, reactive, exposure, depth, reconstruction, and overlay timings. It warns when measured work exceeds the selected target; it never changes the preset automatically.
+The fixed quality targets are Ultra (12 ms), High (8 ms), Balanced (4 ms), and Performance (2.5 ms) for temporal work at 1080p. The overlay reports capture, luma, pyramid, forward/backward flow, confidence, scene, invalidate, reactive, exposure, depth, guidance total, reconstruction, overlay, and full injected timings. Logs report median and p95 for every phase plus guidance-only and full-injected totals. It warns when measured work exceeds the selected target; it never changes the preset automatically.
 
-Run the acceptance benchmark with `cargo xtask benchmark`. It uses one WSI swapchain, Vulkan validation, 180 warm-up frames, 600 measured frames, and an explicit `processing_scale = 0.5`; the normal configuration default remains `1.0`. Timings include capture through reconstruction and exclude the overlay.
+Run the acceptance benchmark with `cargo xtask benchmark`. It uses one WSI swapchain, Vulkan validation, 180 warm-up frames, 600 measured frames, both `processing_scale = 1.0` and `0.5`, all four motion qualities, and both 1280x720-to-native-monitor upscale and native-monitor Native AA scenarios. On a 1920x1080 monitor this is the 1280x720-to-1920x1080 matrix; the harness follows the active RandR monitor elsewhere. Guidance-only and full-injected median/p95 totals are emitted separately; the normal configuration default remains `1.0`.
 
 The RX 9060 XT/RADV reference run at 1920x1080 completed without validation errors:
 

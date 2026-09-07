@@ -15,7 +15,7 @@ Vulkan present
   -> downstream presentation
 ```
 
-Inputs are always estimated from captured color frames. TuxScaling does not intercept native DLSS, FSR, or XeSS calls and does not consume game-provided motion vectors, depth, exposure, camera matrices, or UI masks.
+Inputs are always estimated from captured color frames. The stable guidance package exposes motion in current-to-previous source pixels, confidence, disocclusion, reactive, exposure, relative depth, and transparency/composition signals. Each resource carries its extent, valid region, frame ID, signal state, and conservative fallback; stable jitter is intentionally unavailable. TuxScaling does not intercept native DLSS, FSR, or XeSS calls and does not consume game-provided motion vectors, depth, exposure, camera matrices, or UI masks.
 
 ## Workspace boundaries
 
@@ -46,4 +46,4 @@ Unsupported formats, unavailable backends, allocation failures, swapchain change
 
 ## Current milestone
 
-The current workspace captures supported swapchains, computes estimated optical flow and guidance on RADV, tracks temporal history, optionally reduces processing resolution, runs a reference reconstruction, and injects an egui diagnostic panel with X11/XWayland input. Fullscreen X11/XWayland virtualization separates the game's logical swapchain images from monitor-sized output images; native Wayland remains direct. `vkcube` and the WSI harness are the validation targets for grouped presents, resize, and synchronization. Vendor SDK adapters and production FSR/DLSS/XeSS integrations remain separate milestones. See [Vulkan Layer Runtime](vulkan-layer-runtime.md) for its maintenance contract.
+The current workspace captures supported swapchains, computes estimated optical flow and guidance on RADV, tracks temporal history, optionally reduces processing resolution, runs a reference reconstruction, and injects an egui diagnostic panel with X11/XWayland input. Native or fixed output resolution promotes an eligible X11/XWayland window through a reversible borderless lease while preserving the game's logical swapchain images; `swapchain` and native Wayland remain direct. `vkcube` and the WSI harness are the validation targets for grouped presents, resize, promotion, restoration, and synchronization. Vendor SDK adapters and production FSR/DLSS/XeSS integrations remain separate milestones. See [Vulkan Layer Runtime](vulkan-layer-runtime.md) for its maintenance contract.

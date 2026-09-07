@@ -50,6 +50,7 @@ pub struct SwapchainRuntimeCreateInfo {
     pub capture_enabled: bool,
     pub window: Option<u64>,
     pub fullscreen: bool,
+    pub monitor: Option<[i32; 4]>,
 }
 
 struct Slot {
@@ -98,6 +99,16 @@ impl GpuTimingWindow {
             .samples
             .iter()
             .map(|sample| sample[phase])
+            .collect::<Vec<_>>();
+        values.sort_by(f32::total_cmp);
+        summary_values(&values)
+    }
+
+    fn range_summary(&self, start: usize, end: usize) -> Option<(f32, f32)> {
+        let mut values = self
+            .samples
+            .iter()
+            .map(|sample| sample[start..end].iter().sum::<f32>())
             .collect::<Vec<_>>();
         values.sort_by(f32::total_cmp);
         summary_values(&values)
@@ -427,6 +438,7 @@ impl SwapchainRuntime {
             capture_enabled,
             window,
             fullscreen,
+            monitor,
         } = create;
         let config = if let Ok(path) = std::env::var("TUXSCALING_CONFIG") {
             let source = std::fs::read_to_string(path).map_err(|error| {
@@ -479,6 +491,18 @@ impl SwapchainRuntime {
             Err(_) => debug_view_id(config.debug_view),
         };
         let diagnostic_resolution = temporal.resolution;
+        let promoted_borderless =
+            diagnostic_resolution.game_extent != diagnostic_resolution.output_extent && fullscreen;
+        let monitor = monitor.map_or_else(
+            || {
+                format!(
+                    "{}x{}",
+                    diagnostic_resolution.output_extent.width,
+                    diagnostic_resolution.output_extent.height
+                )
+            },
+            |[x, y, width, height]| format!("{width}x{height} at {x},{y}"),
+        );
         Ok(Self {
             instance: instance.clone(),
             physical,
@@ -519,6 +543,15 @@ impl SwapchainRuntime {
                     "Windowed 1:1"
                 }
                 .into(),
+                window_mode: if promoted_borderless {
+                    "Promoted borderless"
+                } else if fullscreen {
+                    "Fullscreen"
+                } else {
+                    "Windowed"
+                }
+                .into(),
+                monitor,
                 game_extent: [
                     diagnostic_resolution.game_extent.width,
                     diagnostic_resolution.game_extent.height,
@@ -764,11 +797,12 @@ impl SwapchainRuntime {
                 self.diagnostics.exposure_ms = ms[10];
                 self.diagnostics.depth_ms = ms[11];
                 self.diagnostics.guidance_ms = ms[9..12].iter().sum();
+                self.diagnostics.guidance_total_ms = ms[1..12].iter().sum();
                 self.diagnostics.reconstruction_ms = ms[12];
                 self.diagnostics.overlay_ms = ms[13];
+                self.diagnostics.full_injected_ms = ms.iter().sum();
                 let temporal_ms = self.diagnostics.capture_ms
-                    + self.diagnostics.motion_ms
-                    + self.diagnostics.guidance_ms
+                    + self.diagnostics.guidance_total_ms
                     + self.diagnostics.reconstruction_ms;
                 self.diagnostics.budget_warning =
                     temporal_ms > quality_budget(self.diagnostics.quality);
@@ -1218,6 +1252,31 @@ impl SwapchainRuntime {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
+            let jitter = self.temporal.jitter.sample();
+            if let Some(capture) = &mut self.temporal.capture {
+                capture.record_scaled_from_with_jitter(
+                    &self.device,
+                    slot.command,
+                    self.game_images[index],
+                    self.temporal.resolution.game_extent,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    if self.game_images[index] == self.output_images[index] {
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                    } else {
+                        vk::ImageLayout::PRESENT_SRC_KHR
+                    },
+                    jitter,
+                );
+                if let Some(motion) = &mut self.temporal.motion {
+                    motion.record(
+                        slot.command,
+                        self.temporal.history.write_index(),
+                        false,
+                        self.mode,
+                    );
+                    compute_memory_barrier(&self.device, slot.command);
+                }
+            }
             if let Some(guidance) = &mut self.temporal.guidance {
                 // The temporal provider failed before prepare_frame could
                 // record its normal producer.  Emit the same coherent GPU
@@ -1313,11 +1372,21 @@ impl Drop for SwapchainRuntime {
                 }
             }
             let total = self.temporal.timings.summary(self.diagnostics.quality);
+            let guidance = self.temporal.timings.range_summary(1, 12);
+            let full_injected = self.temporal.timings.range_summary(0, GPU_PHASES);
             eprintln!(
-                "TuxScaling {}x{} GPU samples={} temporal_median={} temporal_p95={} budget={}{}",
+                "TuxScaling {}x{} GPU samples={} guidance_total={} full_injected={} temporal_median={} temporal_p95={} budget={}{}",
                 self.info.extent.width,
                 self.info.extent.height,
                 self.temporal.timings.len(),
+                guidance.map_or_else(
+                    || "incomplete".to_owned(),
+                    |value| format!("median={:.3} p95={:.3} ms", value.0, value.1)
+                ),
+                full_injected.map_or_else(
+                    || "incomplete".to_owned(),
+                    |value| format!("median={:.3} p95={:.3} ms", value.0, value.1)
+                ),
                 total.map_or_else(
                     || "incomplete".to_owned(),
                     |value| format!("{:.3} ms", value.median_ms)
@@ -1403,5 +1472,21 @@ mod tests {
         assert_eq!(summary.median_ms, 1.0);
         assert_eq!(summary.p95_ms, 2.0);
         assert!(!summary.within_budget);
+    }
+
+    #[test]
+    fn timing_summaries_separate_guidance_and_full_injected_cost() {
+        let mut window = GpuTimingWindow::default();
+        let mut sample = [0.0; GPU_PHASES];
+        sample[0] = 1.0;
+        sample[1..12].fill(2.0);
+        sample[12] = 3.0;
+        sample[13] = 4.0;
+        for frame_id in 180..780 {
+            window.record(frame_id, sample);
+        }
+
+        assert_eq!(window.range_summary(1, 12), Some((22.0, 22.0)));
+        assert_eq!(window.range_summary(0, GPU_PHASES), Some((30.0, 30.0)));
     }
 }
