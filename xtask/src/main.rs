@@ -1,5 +1,26 @@
 use std::process::{Command, ExitCode, Output};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BenchmarkCase {
+    scenario: &'static str,
+    quality: &'static str,
+}
+
+fn benchmark_cases() -> Vec<BenchmarkCase> {
+    ["upscale", "native"]
+        .into_iter()
+        .flat_map(|scenario| {
+            ["ultra", "high", "balanced", "performance"]
+                .into_iter()
+                .map(move |quality| BenchmarkCase { scenario, quality })
+        })
+        .collect()
+}
+
+fn benchmark_processing_scale() -> f32 {
+    0.5
+}
+
 fn report(result: std::io::Result<Output>) -> bool {
     match result {
         Ok(output) => {
@@ -121,6 +142,73 @@ fn main() -> ExitCode {
                 && run_wsi("upscale", false, true)
                 && run_wsi("resize", false, false)
         }
+        "benchmark" => {
+            if !run(
+                "cargo",
+                &[
+                    "build",
+                    "-p",
+                    "tuxscaling-layer",
+                    "--lib",
+                    "--example",
+                    "wsi",
+                ],
+            ) {
+                return ExitCode::FAILURE;
+            }
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap();
+            let inherited = std::env::var_os("LD_LIBRARY_PATH").unwrap_or_default();
+            let libraries = std::iter::once(root.join("target/debug"))
+                .chain(std::env::split_paths(&inherited))
+                .collect::<Vec<_>>();
+            benchmark_cases().into_iter().all(|case| {
+                let config = root.join(format!(
+                    "target/benchmark-{}-{}.toml",
+                    case.scenario, case.quality
+                ));
+                let output_resolution = if case.scenario == "native" {
+                    "swapchain"
+                } else {
+                    "1920x1080"
+                };
+                if std::fs::write(
+                    &config,
+                    format!(
+                        "output_resolution = \"{output_resolution}\"\nprocessing_scale = {}\nmotion_quality = \"{}\"\n",
+                        benchmark_processing_scale(),
+                        case.quality
+                    ),
+                )
+                .is_err()
+                {
+                    return false;
+                }
+                eprintln!(
+                    "TuxScaling benchmark: scenario={} quality={} warmup=180 samples=600",
+                    case.scenario, case.quality
+                );
+                let mut command = Command::new(root.join("target/debug/examples/wsi"));
+                validation(&mut command)
+                    .env("VK_ADD_LAYER_PATH", root.join("assets/vulkan-layer"))
+                    .env("LD_LIBRARY_PATH", std::env::join_paths(&libraries).unwrap())
+                    .env(
+                        "VK_INSTANCE_LAYERS",
+                        "VK_LAYER_TUXSCALING_overlay:VK_LAYER_KHRONOS_validation",
+                    )
+                    .env("TUXSCALING_VIEW", "reconstructed")
+                    .env("TUXSCALING_CONFIG", config)
+                    .env("TUXSCALING_TEST_SCENARIO", case.scenario)
+                    .env("TUXSCALING_TEST_RESIZE_INTERVAL", "0")
+                    .env("TUXSCALING_TEST_FORCE_VIRTUAL", "1")
+                    .env("TUXSCALING_TEST_FRAMES", "780")
+                    .env("TUXSCALING_TEST_SINGLE_WINDOW", "1")
+                    .env("TUXSCALING_TEST_FORCE_TEMPORAL_FAILURE", "0")
+                    .env("TUXSCALING_TEST_FORCE_RESIZE_FAILURE", "0");
+                report(command.output())
+            })
+        }
         "check" => {
             run("cargo", &["fmt", "--all", "--", "--check"])
                 && run("cargo", &["test", "--workspace"])
@@ -137,7 +225,7 @@ fn main() -> ExitCode {
                 )
         }
         _ => {
-            eprintln!("Usage: cargo xtask <check|gpu-check|smoke>");
+            eprintln!("Usage: cargo xtask <benchmark|check|gpu-check|smoke>");
             return ExitCode::from(2);
         }
     };
@@ -145,5 +233,35 @@ fn main() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::benchmark_cases;
+
+    #[test]
+    fn benchmark_matrix_covers_each_quality_and_presentation_mode() {
+        let cases = benchmark_cases();
+        assert_eq!(cases.len(), 8);
+        assert_eq!(
+            cases
+                .iter()
+                .filter(|case| case.scenario == "upscale")
+                .count(),
+            4
+        );
+        assert_eq!(
+            cases
+                .iter()
+                .filter(|case| case.scenario == "native")
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn benchmark_uses_the_explicit_low_latency_processing_scale() {
+        assert_eq!(super::benchmark_processing_scale(), 0.5);
     }
 }

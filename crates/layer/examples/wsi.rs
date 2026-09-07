@@ -90,6 +90,18 @@ fn parse_frame_limit(value: Option<&str>) -> Option<u32> {
         .filter(|value| *value > 0)
 }
 
+fn single_window(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn requires_grouped_presents(window_count: usize) -> bool {
+    window_count > 1
+}
+
+fn queue_index_for_swapchain(swapchain: usize, queue_count: usize) -> usize {
+    swapchain.min(queue_count.saturating_sub(1))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -98,6 +110,26 @@ mod tests {
         assert_eq!(super::parse_frame_limit(Some("0")), None);
         assert_eq!(super::parse_frame_limit(Some("invalid")), None);
         assert_eq!(super::parse_frame_limit(None), None);
+    }
+
+    #[test]
+    fn parses_single_window_benchmark_mode() {
+        assert!(super::single_window(Some("1")));
+        assert!(!super::single_window(Some("0")));
+        assert!(!super::single_window(None));
+    }
+
+    #[test]
+    fn skips_grouped_present_requirement_for_one_swapchain() {
+        assert!(!super::requires_grouped_presents(1));
+        assert!(super::requires_grouped_presents(2));
+    }
+
+    #[test]
+    fn shares_the_last_available_queue_between_swapchains() {
+        assert_eq!(super::queue_index_for_swapchain(0, 1), 0);
+        assert_eq!(super::queue_index_for_swapchain(1, 1), 0);
+        assert_eq!(super::queue_index_for_swapchain(1, 2), 1);
     }
 }
 
@@ -226,36 +258,47 @@ unsafe fn run() {
     unsafe {
         let display = XOpenDisplay(std::ptr::null());
         assert!(!display.is_null(), "an X11 or Xwayland display is required");
-        let windows = [0, 1].map(|i| {
-            let w = XCreateSimpleWindow(
-                display,
-                XDefaultRootWindow(display),
-                20 + i * 440,
-                40,
-                game_extent().width,
-                game_extent().height,
-                0,
-                0,
-                0,
-            );
-            XStoreName(display, w, c"TuxScaling WSI validation".as_ptr());
-            XFlush(display);
-            if std::env::var("TUXSCALING_TEST_SCENARIO").is_ok() {
-                let (connection, _) = x11rb::connect(None).unwrap();
-                connection
-                    .change_window_attributes(
-                        w as u32,
-                        &ChangeWindowAttributesAux::new().override_redirect(1),
-                    )
-                    .unwrap()
-                    .check()
-                    .unwrap();
-                connection.flush().unwrap();
-            }
-            XMapWindow(display, w);
-            mark_fullscreen(display, w);
-            w
-        });
+        let window_count: usize = if single_window(
+            std::env::var("TUXSCALING_TEST_SINGLE_WINDOW")
+                .ok()
+                .as_deref(),
+        ) {
+            1
+        } else {
+            2
+        };
+        let windows = (0..window_count)
+            .map(|i| {
+                let w = XCreateSimpleWindow(
+                    display,
+                    XDefaultRootWindow(display),
+                    20 + i as c_int * 440,
+                    40,
+                    game_extent().width,
+                    game_extent().height,
+                    0,
+                    0,
+                    0,
+                );
+                XStoreName(display, w, c"TuxScaling WSI validation".as_ptr());
+                XFlush(display);
+                if std::env::var("TUXSCALING_TEST_SCENARIO").is_ok() {
+                    let (connection, _) = x11rb::connect(None).unwrap();
+                    connection
+                        .change_window_attributes(
+                            w as u32,
+                            &ChangeWindowAttributesAux::new().override_redirect(1),
+                        )
+                        .unwrap()
+                        .check()
+                        .unwrap();
+                    connection.flush().unwrap();
+                }
+                XMapWindow(display, w);
+                mark_fullscreen(display, w);
+                w
+            })
+            .collect::<Vec<_>>();
         XFlush(display);
         let entry = ash::Entry::load().unwrap();
         let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
@@ -273,15 +316,18 @@ unsafe fn run() {
             .unwrap();
         let xlib = ash::khr::xlib_surface::Instance::new(&entry, &instance);
         let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
-        let surfaces = windows.map(|w| {
-            xlib.create_xlib_surface(
-                &vk::XlibSurfaceCreateInfoKHR::default()
-                    .dpy(display.cast())
-                    .window(w),
-                None,
-            )
-            .unwrap()
-        });
+        let surfaces = windows
+            .iter()
+            .map(|&w| {
+                xlib.create_xlib_surface(
+                    &vk::XlibSurfaceCreateInfoKHR::default()
+                        .dpy(display.cast())
+                        .window(w),
+                    None,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
         let physical = instance.enumerate_physical_devices().unwrap()[0];
         let families = instance.get_physical_device_queue_family_properties(physical);
         let family = families
@@ -298,8 +344,10 @@ unsafe fn run() {
             })
             .unwrap()
             .0 as u32;
-        let n = families[family as usize].queue_count.min(2) as usize;
-        let priorities = [1.0, 1.0];
+        let n = families[family as usize]
+            .queue_count
+            .min(window_count as u32) as usize;
+        let priorities = vec![1.0; n];
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
             .queue_priorities(&priorities[..n])];
@@ -313,12 +361,15 @@ unsafe fn run() {
             )
             .unwrap();
         let queue0 = device.get_device_queue(family, 0);
-        let queue1 = device.get_device_queue2(
-            &vk::DeviceQueueInfo2::default()
-                .queue_family_index(family)
-                .queue_index((n - 1) as u32),
-        );
-        let queue_handles = [queue0, queue1];
+        let queue_handles = (0..window_count)
+            .map(|swapchain| {
+                device.get_device_queue2(
+                    &vk::DeviceQueueInfo2::default()
+                        .queue_family_index(family)
+                        .queue_index(queue_index_for_swapchain(swapchain, n) as u32),
+                )
+            })
+            .collect::<Vec<_>>();
         let swapchains = ash::khr::swapchain::Device::new(&instance, &device);
         let pool = device
             .create_command_pool(
@@ -332,7 +383,7 @@ unsafe fn run() {
             .allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
                     .command_pool(pool)
-                    .command_buffer_count(2),
+                    .command_buffer_count(window_count as u32),
             )
             .unwrap();
         let mut chains = surfaces
@@ -369,7 +420,7 @@ unsafe fn run() {
         let start = Instant::now();
         if std::env::var("TUXSCALING_TEST_SCENARIO").is_ok() {
             let display = tuxscaling_display::X11Display::connect().unwrap();
-            for window in windows {
+            for &window in &windows {
                 let rect = display.window_rect(window).unwrap();
                 let expected = if std::env::var("TUXSCALING_TEST_FORCE_RESIZE_FAILURE").as_deref()
                     == Ok("1")
@@ -420,8 +471,8 @@ unsafe fn run() {
                         height: 300,
                     }
                 };
-                for w in windows {
-                    XResizeWindow(display, w, extent.width, extent.height);
+                for &window in &windows {
+                    XResizeWindow(display, window, extent.width, extent.height);
                 }
                 XFlush(display);
                 for chain in &mut chains {
@@ -437,8 +488,8 @@ unsafe fn run() {
                 }
                 resizes += 1;
             }
-            let mut indices = [0u32; 2];
-            let mut signals = [vk::Semaphore::null(); 2];
+            let mut indices = vec![0u32; chains.len()];
+            let mut signals = vec![vk::Semaphore::null(); chains.len()];
             for (i, chain) in chains.iter_mut().enumerate() {
                 device
                     .wait_for_fences(&[chain.fence], true, 10_000_000_000)
@@ -531,9 +582,9 @@ unsafe fn run() {
                     )
                     .unwrap();
             }
-            if frame.is_multiple_of(3) {
-                let handles = [chains[0].handle, chains[1].handle];
-                let mut results = [vk::Result::SUCCESS; 2];
+            if chains.len() > 1 && frame.is_multiple_of(3) {
+                let handles = chains.iter().map(|chain| chain.handle).collect::<Vec<_>>();
+                let mut results = vec![vk::Result::SUCCESS; chains.len()];
                 let info = vk::PresentInfoKHR::default()
                     .wait_semaphores(&signals)
                     .swapchains(&handles)
@@ -543,7 +594,7 @@ unsafe fn run() {
                 assert!(result == vk::Result::SUCCESS || result == vk::Result::SUBOPTIMAL_KHR);
                 grouped += 1;
             } else {
-                for i in 0..2 {
+                for i in 0..chains.len() {
                     let info = vk::PresentInfoKHR::default()
                         .wait_semaphores(&signals[i..i + 1])
                         .swapchains(std::slice::from_ref(&chains[i].handle))
@@ -567,14 +618,16 @@ unsafe fn run() {
         device.destroy_command_pool(pool, None);
         device.destroy_device(None);
         instance.destroy_instance(None);
-        for w in windows {
-            XDestroyWindow(display, w);
+        for window in windows {
+            XDestroyWindow(display, window);
         }
         XCloseDisplay(display);
         eprintln!(
             "WSI test complete: frames={frame}, grouped presents={grouped}, resize cycles={resizes}, queues={n}"
         );
-        assert!(grouped > 0);
+        if requires_grouped_presents(window_count) {
+            assert!(grouped > 0);
+        }
         if resize_interval > 0 {
             assert!(resizes > 0);
         }
