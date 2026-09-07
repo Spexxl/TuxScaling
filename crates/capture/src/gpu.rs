@@ -2,7 +2,7 @@
 use ash::vk;
 use tuxscaling_config::JitterMode;
 use tuxscaling_temporal::{JitterSample, SignalState};
-use tuxscaling_vulkan::{Image, image_barrier, memory_barrier};
+use tuxscaling_vulkan::{Image, compute_memory_barrier, image_barrier};
 
 const JITTER_PHASES: u32 = 8;
 
@@ -532,7 +532,7 @@ impl Capture {
                     self.color.extent.height.div_ceil(8),
                     1,
                 );
-                memory_barrier(device, command);
+                compute_memory_barrier(device, command);
                 image_barrier(
                     device,
                     command,

@@ -1,7 +1,9 @@
 #![allow(clippy::missing_safety_doc)]
 use ash::vk;
 use tuxscaling_motion::MotionEstimator;
-use tuxscaling_vulkan::{Buffer, Image, image_barrier, memory_barrier};
+use tuxscaling_vulkan::{
+    Buffer, Image, compute_memory_barrier, image_barrier, transfer_memory_barrier,
+};
 
 use crate::{
     DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResource,
@@ -482,7 +484,7 @@ impl GuidanceEstimator {
             );
             self.device
                 .cmd_fill_buffer(command, depth_model.handle, 0, depth_model.size, 0);
-            memory_barrier(&self.device, command);
+            transfer_memory_barrier(&self.device, command);
             if !self.initialized {
                 for image in [
                     &self.reactive,
@@ -556,7 +558,7 @@ impl GuidanceEstimator {
                     vk::ImageLayout::GENERAL,
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 );
-                memory_barrier(&self.device, command);
+                transfer_memory_barrier(&self.device, command);
             }
             self.device
                 .cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, self.pipeline);
@@ -599,7 +601,7 @@ impl GuidanceEstimator {
                 self.extent.height.div_ceil(8),
                 1,
             );
-            memory_barrier(&self.device, command);
+            compute_memory_barrier(&self.device, command);
             if let Some((query_pool, query_base)) = timestamps {
                 self.device.cmd_write_timestamp(
                     command,
@@ -617,7 +619,7 @@ impl GuidanceEstimator {
                 bytemuck::cast_slice(&params),
             );
             self.device.cmd_dispatch(command, 1, 1, 1);
-            memory_barrier(&self.device, command);
+            compute_memory_barrier(&self.device, command);
             if let Some((query_pool, query_base)) = timestamps {
                 self.device.cmd_write_timestamp(
                     command,
@@ -651,7 +653,7 @@ impl GuidanceEstimator {
                 );
                 self.device
                     .cmd_dispatch(command, width.div_ceil(8), height.div_ceil(8), 1);
-                memory_barrier(&self.device, command);
+                compute_memory_barrier(&self.device, command);
             }
             image_barrier(
                 &self.device,
@@ -704,7 +706,7 @@ impl GuidanceEstimator {
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 vk::ImageLayout::GENERAL,
             );
-            memory_barrier(&self.device, command);
+            compute_memory_barrier(&self.device, command);
             if let Some((query_pool, query_base)) = timestamps {
                 self.device.cmd_write_timestamp(
                     command,

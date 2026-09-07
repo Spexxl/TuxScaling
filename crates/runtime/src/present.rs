@@ -8,7 +8,7 @@ use tuxscaling_overlay::FrameDiagnostics;
 use tuxscaling_overlay_vulkan::{OverlayRenderer, SwapchainInfo};
 use tuxscaling_temporal::{DepthSemantics, FrameExtent, GuidanceReset, SignalState};
 use tuxscaling_upscaler::{ResolutionPlan, content_viewport};
-use tuxscaling_vulkan::{image_barrier, memory_barrier};
+use tuxscaling_vulkan::{compute_memory_barrier, image_barrier, transfer_memory_barrier};
 
 #[path = "pipeline.rs"]
 mod pipeline;
@@ -345,7 +345,7 @@ unsafe fn record_spatial_blit(
             },
             &[tuxscaling_vulkan::color_range()],
         );
-        memory_barrier(device, command);
+        transfer_memory_barrier(device, command);
         device.cmd_blit_image(
             command,
             source,
@@ -968,7 +968,7 @@ impl SwapchainRuntime {
                         self.mode,
                     );
                 }
-                memory_barrier(&self.device, slot.command);
+                compute_memory_barrier(&self.device, slot.command);
                 self.diagnostics.motion_cpu_ms = cpu_start.elapsed().as_secs_f32() * 1_000.0;
             } else if self.temporal.queries != vk::QueryPool::null() {
                 for offset in 2..=10 {
@@ -1005,7 +1005,7 @@ impl SwapchainRuntime {
                         index,
                     );
                 }
-                memory_barrier(&self.device, slot.command);
+                compute_memory_barrier(&self.device, slot.command);
                 self.diagnostics.guidance_cpu_ms = cpu_start.elapsed().as_secs_f32() * 1_000.0;
             } else if self.temporal.queries != vk::QueryPool::null() {
                 for offset in 11..=14 {
@@ -1224,7 +1224,7 @@ impl SwapchainRuntime {
                 // fallbacks on this command buffer so consumers never retain
                 // the previous frame's masks or exposure.
                 guidance.record_provider_failure_for_slot(slot.command, index);
-                memory_barrier(&self.device, slot.command);
+                compute_memory_barrier(&self.device, slot.command);
             }
             if self.game_images[index] != self.output_images[index] {
                 record_spatial_blit(

@@ -2,7 +2,7 @@
 
 use ash::vk;
 use tuxscaling_temporal::{DepthSemantics, GuidanceView};
-use tuxscaling_vulkan::{Image, image_barrier, memory_barrier};
+use tuxscaling_vulkan::{Image, compute_memory_barrier, image_barrier};
 
 pub fn scaled_extent(output: vk::Extent2D, scale: f32) -> vk::Extent2D {
     let scale = scale.clamp(0.5, 1.0);
@@ -324,7 +324,7 @@ impl ReferenceUpscaler {
                 self.output_extent.height.div_ceil(8),
                 1,
             );
-            memory_barrier(&self.device, command);
+            compute_memory_barrier(&self.device, command);
             image_barrier(
                 &self.device,
                 command,

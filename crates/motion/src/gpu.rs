@@ -1,6 +1,8 @@
 #![allow(clippy::missing_safety_doc)]
 use ash::vk;
-use tuxscaling_vulkan::{Buffer, Image, image_barrier, memory_barrier};
+use tuxscaling_vulkan::{
+    Buffer, Image, compute_memory_barrier, image_barrier, transfer_memory_barrier,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MotionQuality {
@@ -425,7 +427,7 @@ impl MotionEstimator {
             );
             self.device
                 .cmd_dispatch(command, width.div_ceil(8), height.div_ceil(8), 1);
-            memory_barrier(&self.device, command);
+            compute_memory_barrier(&self.device, command);
         }
     }
     pub unsafe fn record(
@@ -459,7 +461,7 @@ impl MotionEstimator {
         timestamps: Option<(vk::QueryPool, u32)>,
     ) {
         unsafe {
-            memory_barrier(&self.device, command);
+            compute_memory_barrier(&self.device, command);
             if !self.initialized {
                 for buffer in &self.luma {
                     self.device
@@ -479,7 +481,7 @@ impl MotionEstimator {
                         vk::ImageLayout::GENERAL,
                     );
                 }
-                memory_barrier(&self.device, command);
+                transfer_memory_barrier(&self.device, command);
             }
             self.device.cmd_bind_descriptor_sets(
                 command,
