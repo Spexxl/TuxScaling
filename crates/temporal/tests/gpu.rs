@@ -51,6 +51,12 @@ fn guidance_shader_contains_reprojected_mask_and_exposure_producers() {
 }
 
 #[test]
+fn guidance_reuses_the_motion_statistics_exposure() {
+    let shader = include_str!("../../../shaders/temporal/guidance.comp");
+    assert!(shader.contains("return metadata.exposure"));
+}
+
+#[test]
 fn guidance_shader_contains_relative_depth_and_gradient_rejection_producers() {
     let guidance = include_str!("../../../shaders/temporal/guidance.comp");
     for term in ["DepthPartials", "normal_equations"] {

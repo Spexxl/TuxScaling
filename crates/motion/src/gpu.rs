@@ -56,6 +56,13 @@ impl MotionQuality {
     }
 }
 
+fn patch_sample_step(quality: MotionQuality) -> u32 {
+    match quality {
+        MotionQuality::Ultra | MotionQuality::High => 1,
+        MotionQuality::Balanced | MotionQuality::Performance => 2,
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Level {
     pub width: u32,
@@ -540,7 +547,8 @@ impl MotionEstimator {
                         | ((self.quality as u32) << 8)
                         | ((profile.patch_radius as u32) << 16)
                         | ((profile.coarse_radius as u32) << 20)
-                        | ((profile.fine_radius as u32) << 24);
+                        | ((profile.fine_radius as u32) << 24)
+                        | (patch_sample_step(self.quality) << 28);
                     self.dispatch(command, 2, p, l.width.div_ceil(2), l.height.div_ceil(2));
                 }
                 if let Some((query_pool, query_base)) = timestamps {
@@ -650,6 +658,14 @@ impl Drop for MotionEstimator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn balanced_and_performance_sample_sparse_patch_lattices() {
+        assert_eq!(patch_sample_step(MotionQuality::Ultra), 1);
+        assert_eq!(patch_sample_step(MotionQuality::High), 1);
+        assert_eq!(patch_sample_step(MotionQuality::Balanced), 2);
+        assert_eq!(patch_sample_step(MotionQuality::Performance), 2);
+    }
 
     #[test]
     fn quality_profiles_trade_precision_for_work() {

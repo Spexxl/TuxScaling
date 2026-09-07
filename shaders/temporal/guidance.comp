@@ -115,6 +115,10 @@ bool reprojectable(ivec2 pixel, vec2 motion) {
 }
 
 void write_normal_equations(uvec2 q) {
+    uint groups_x = (p.width + 7u) / 8u;
+    uint group = gl_WorkGroupID.y * groups_x + gl_WorkGroupID.x;
+    uint sample_stride = max(p.reserved, 1u);
+    if (group % sample_stride != 0u) return;
     uint local = gl_LocalInvocationIndex;
     uint local_base = local * NORMAL_EQUATION_WORDS;
     for (uint i = 0u; i < NORMAL_EQUATION_WORDS; ++i) affine_terms[local_base + i] = 0.0;
@@ -145,8 +149,6 @@ void write_normal_equations(uvec2 q) {
     }
     barrier();
     if (local == 0u) {
-        uint groups_x = (p.width + 7u) / 8u;
-        uint group = gl_WorkGroupID.y * groups_x + gl_WorkGroupID.x;
         uint output_base = group * DEPTH_RECORD_WORDS;
         for (uint slot = 0u; slot < NORMAL_EQUATION_WORDS; ++slot) {
             float total = 0.0;
@@ -188,48 +190,7 @@ float flow_divergence(ivec2 pixel, vec2 motion) {
 }
 
 float exposure_from_percentile() {
-    // Task 2's persistent compact records contain 32 log-luminance bins per
-    // tile.  Reconstruct a global histogram, discard the 5th/95th tails, and
-    // use the exact compact log sum for the retained estimate.
-    uint bins[32];
-    for (uint bin=0u; bin<32u; ++bin) bins[bin] = 0u;
-    uint tiles_x = (p.width + 15u) / 16u;
-    uint tiles_y = (p.height + 15u) / 16u;
-    uint tile_count = tiles_x * tiles_y;
-    float total_log = 0.0;
-    uint total_count = 0u;
-    for (uint tile=0u; tile<tile_count; ++tile) {
-        uint base = tile * 68u;
-        total_log += uintBitsToFloat(statistics.partials[base + 66u]);
-        for (uint bin=0u; bin<32u; ++bin) bins[bin] += statistics.partials[base + bin];
-    }
-    for (uint bin=0u; bin<32u; ++bin) total_count += bins[bin];
-    if (total_count == 0u || isnan(total_log) || isinf(total_log)) {
-        float fallback = metadata.exposure;
-        return (finite(fallback) && fallback > 0.0) ? fallback : 1.0;
-    }
-    float trim_low = float(total_count) * 0.05;
-    float trim_high = float(total_count) * 0.05;
-    float trimmed_log = total_log;
-    for (uint bin=0u; bin<32u; ++bin) {
-        float count = float(bins[bin]);
-        float removed = min(count, trim_low);
-        float center = -12.0 + (float(bin) + 0.5) * 0.5;
-        trimmed_log -= removed * center;
-        trim_low -= removed;
-    }
-    for (uint reverse=0u; reverse<32u; ++reverse) {
-        uint bin = 31u - reverse;
-        float count = float(bins[bin]);
-        float removed = min(count, trim_high);
-        float center = -12.0 + (float(bin) + 0.5) * 0.5;
-        trimmed_log -= removed * center;
-        trim_high -= removed;
-    }
-    float kept = max(float(total_count) * 0.90, 1.0);
-    float mean_log = trimmed_log / kept;
-    float estimate = exp2(-mean_log);
-    return (finite(estimate) && estimate > 0.0) ? clamp(estimate, 0.0625, 16.0) : 1.0;
+    return metadata.exposure;
 }
 
 void write_fallback(ivec2 pixel) {

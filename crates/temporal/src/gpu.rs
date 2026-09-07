@@ -37,6 +37,12 @@ pub struct GuidanceEstimator {
     extent: vk::Extent2D,
 }
 
+fn depth_group_stride(extent: vk::Extent2D) -> u32 {
+    const MAX_DEPTH_GROUPS: u32 = 256;
+    let groups = extent.width.div_ceil(8) * extent.height.div_ceil(8);
+    groups.div_ceil(MAX_DEPTH_GROUPS).max(1)
+}
+
 impl GuidanceEstimator {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
@@ -586,7 +592,7 @@ impl GuidanceEstimator {
                 timing.smoothed.as_secs_f32().to_bits(),
                 u32::from(self.history_initialized),
                 u32::from(self.provider_failure),
-                0,
+                depth_group_stride(self.extent),
             ];
             self.device.cmd_push_constants(
                 command,
@@ -895,5 +901,29 @@ impl Drop for GuidanceEstimator {
                 .destroy_descriptor_set_layout(self.descriptor_layout, None);
             self.device.destroy_sampler(self.sampler, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::depth_group_stride;
+    use ash::vk;
+
+    #[test]
+    fn depth_reduction_bounds_sampled_workgroups() {
+        assert_eq!(
+            depth_group_stride(vk::Extent2D {
+                width: 64,
+                height: 48,
+            }),
+            1
+        );
+        assert_eq!(
+            depth_group_stride(vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            }),
+            127
+        );
     }
 }

@@ -31,6 +31,8 @@ const float AFFINE_INLIER_THRESHOLD = 2.25;
 const float EPSILON = 1e-5;
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
+uint group_sample_stride() { return max(p.reserved, 1u); }
+
 shared uint histogram[32];
 shared uint local_inliers;
 shared uint local_reliable;
@@ -125,11 +127,12 @@ void solve_global_affine() {
     uint groups_x = (p.width + 7u) / 8u;
     uint groups_y = (p.height + 7u) / 8u;
     uint group_count = groups_x * groups_y;
-    for (uint group = 0u; group < group_count; ++group) {
+    float sample_weight = float(group_sample_stride());
+    for (uint group = 0u; group < group_count; group += group_sample_stride()) {
         uint base = group * DEPTH_RECORD_WORDS;
         for (uint slot = 0u; slot < NORMAL_EQUATION_WORDS; ++slot) {
             float value = depth_partials.normal_equations[base + slot];
-            sums[slot] += finite(value) ? value : 0.0;
+            sums[slot] += finite(value) ? value * sample_weight : 0.0;
         }
     }
     for (uint slot = 0u; slot < 32u; ++slot) depth_model.model[slot] = 0.0;
@@ -255,7 +258,7 @@ float histogram_percentile(float total, float q) {
     uint groups_x = (p.width + 7u) / 8u;
     uint groups_y = (p.height + 7u) / 8u;
     for (uint bin = 0u; bin < 32u; ++bin) {
-        for (uint group = 0u; group < groups_x * groups_y; ++group) {
+        for (uint group = 0u; group < groups_x * groups_y; group += group_sample_stride()) {
             cumulative += depth_partials.normal_equations[group * DEPTH_RECORD_WORDS + bin + 32u];
         }
         if (cumulative > target) return (float(bin) + 0.5) / 32.0;
@@ -270,10 +273,11 @@ void finalize_percentiles() {
     uint group_count = groups_x * groups_y;
     float total = 0.0;
     float inliers = 0.0;
-    for (uint group = 0u; group < group_count; ++group) {
+    float sample_weight = float(group_sample_stride());
+    for (uint group = 0u; group < group_count; group += group_sample_stride()) {
         uint base = group * DEPTH_RECORD_WORDS;
-        inliers += max(depth_partials.normal_equations[base + 64u], 0.0);
-        total += max(depth_partials.normal_equations[base + 65u], 0.0);
+        inliers += max(depth_partials.normal_equations[base + 64u], 0.0) * sample_weight;
+        total += max(depth_partials.normal_equations[base + 65u], 0.0) * sample_weight;
     }
     float ratio = total > 0.0 ? inliers / total : 0.0;
     float percentile_5 = 0.0;

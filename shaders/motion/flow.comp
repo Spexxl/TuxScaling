@@ -32,8 +32,9 @@ float cost(ivec2 center,vec2 delta) {
     if(any(lessThan(t,vec2(0))) || any(greaterThan(t,vec2(p.width-1,p.height-1)))) return 1e10;
     float sum=0;
     int radius = int((p.direction >> 16) & 0xfu);
+    int step = max(int((p.direction >> 28) & 0x3u), 1);
     int samples = 0;
-    for(int y=-radius;y<=radius;y++) for(int x=-radius;x<=radius;x++) {
+    for(int y=-radius;y<=radius;y+=step) for(int x=-radius;x<=radius;x+=step) {
         ivec2 sample_position=center+ivec2(x,y);
         float luminance=source(sample_position)-target(vec2(sample_position)+delta);
         float gradient=source_gradient(sample_position)-target_gradient(vec2(sample_position)+delta);
