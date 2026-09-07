@@ -31,8 +31,7 @@ float cost(ivec2 center,vec2 delta) {
     vec2 t=vec2(center)+delta;
     if(any(lessThan(t,vec2(0))) || any(greaterThan(t,vec2(p.width-1,p.height-1)))) return 1e10;
     float sum=0;
-    int quality = int(p.direction >> 8);
-    int radius = quality == 3 ? 1 : quality == 2 ? 2 : quality == 1 ? 2 : 3;
+    int radius = int((p.direction >> 16) & 0xfu);
     int samples = 0;
     for(int y=-radius;y<=radius;y++) for(int x=-radius;x<=radius;x++) {
         ivec2 sample_position=center+ivec2(x,y);
@@ -63,9 +62,9 @@ void main() {
     }
     vec2 best=guess;
     float best_cost=cost(center,best), second=1e10;
-    int quality = int(p.direction >> 8);
-    int radius = p.coarsest!=0 ? (quality==3 ? 2 : quality==2 ? 3 : 4) :
-        (quality==3 ? 1 : quality==2 ? 1 : 2);
+    int coarse_radius = int((p.direction >> 20) & 0xfu);
+    int fine_radius = int((p.direction >> 24) & 0xfu);
+    int radius = p.coarsest != 0 ? coarse_radius : fine_radius;
     for(int y=-radius;y<=radius;y++) for(int x=-radius;x<=radius;x++) {
         vec2 candidate=guess+vec2(x,y);
         if(all(equal(candidate,guess))) continue;

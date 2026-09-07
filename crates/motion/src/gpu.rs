@@ -536,7 +536,11 @@ impl MotionEstimator {
                         mode,
                         profile.levels,
                     );
-                    p[15] = direction | ((self.quality as u32) << 8);
+                    p[15] = direction
+                        | ((self.quality as u32) << 8)
+                        | ((profile.patch_radius as u32) << 16)
+                        | ((profile.coarse_radius as u32) << 20)
+                        | ((profile.fine_radius as u32) << 24);
                     self.dispatch(command, 2, p, l.width.div_ceil(2), l.height.div_ceil(2));
                 }
                 if let Some((query_pool, query_base)) = timestamps {
@@ -656,6 +660,8 @@ mod tests {
         assert!(balanced.levels < ultra.levels);
         assert!(performance.patch_radius < balanced.patch_radius);
         assert!(performance.coarse_radius < ultra.coarse_radius);
+        assert_eq!(balanced.fine_radius, 1);
+        assert_eq!(performance.fine_radius, 1);
     }
 
     #[test]
