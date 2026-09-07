@@ -64,9 +64,22 @@ debug_view = "original"
 
 `processing_scale` is optional internal work reduction after capture. It does not change the game resolution or the output resolution; its default is `1.0`. The legacy `render_scale` key is accepted during the migration.
 
-The fixed quality targets are Ultra (12 ms), High (8 ms), Balanced (4 ms), and Performance (2.5 ms) for temporal work at 1080p. The overlay reports capture, luma, pyramid, forward/backward flow, confidence, scene, invalidate, reactive, exposure, reconstruction, and overlay timings. It warns when measured work exceeds the selected target; it never changes the preset automatically.
+The fixed quality targets are Ultra (12 ms), High (8 ms), Balanced (4 ms), and Performance (2.5 ms) for temporal work at 1080p. The overlay reports capture, luma, pyramid, forward/backward flow, confidence, scene, invalidate, reactive, exposure, depth, reconstruction, and overlay timings. It warns when measured work exceeds the selected target; it never changes the preset automatically.
 
-The current RADV reference measurement on the RX 9060 XT at 1920x1080, after 180 warm-up frames and 120 recorded samples, is: capture 0.028 ms, luma 0.014 ms, pyramid 0.007 ms, forward 1.532 ms, backward 1.552 ms, confidence 0.010 ms, scene 5.175 ms, invalidate 0.002 ms, reactive 0.024 ms, exposure 17.237 ms, reconstruction 0.105 ms, and overlay 0.002 ms. Each value is the median; the corresponding p95 values are capture 0.028, luma 0.015, pyramid 0.007, forward 1.560, backward 1.588, confidence 0.021, scene 5.231, invalidate 0.018, reactive 0.025, exposure 17.498, reconstruction 0.106, and overlay 0.002 ms. This reference run uses the default processing scale and records all passes without automatic quality changes.
+Run the acceptance benchmark with `cargo xtask benchmark`. It uses one WSI swapchain, Vulkan validation, 180 warm-up frames, 600 measured frames, and an explicit `processing_scale = 0.5`; the normal configuration default remains `1.0`. Timings include capture through reconstruction and exclude the overlay.
+
+The RX 9060 XT/RADV reference run at 1920x1080 completed without validation errors:
+
+| Presentation | Quality | Median | p95 |
+| --- | --- | ---: | ---: |
+| 1280x720 to 1920x1080 | Ultra | 9.751 ms | 10.413 ms |
+| 1280x720 to 1920x1080 | High | 5.372 ms | 5.578 ms |
+| 1280x720 to 1920x1080 | Balanced | 2.311 ms | 2.331 ms |
+| 1280x720 to 1920x1080 | Performance | 1.477 ms | 1.522 ms |
+| Native AA 1920x1080 | Ultra | 11.937 ms | 12.355 ms |
+| Native AA 1920x1080 | High | 6.598 ms | 6.685 ms |
+| Native AA 1920x1080 | Balanced | 3.125 ms | 3.160 ms |
+| Native AA 1920x1080 | Performance | 2.094 ms | 2.126 ms |
 
 ## Language and naming policy
 
