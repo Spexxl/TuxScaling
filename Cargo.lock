@@ -717,6 +717,9 @@ name = "tuxscaling-capture"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "bytemuck",
+ "tuxscaling-config",
+ "tuxscaling-temporal",
  "tuxscaling-vulkan",
 ]
 

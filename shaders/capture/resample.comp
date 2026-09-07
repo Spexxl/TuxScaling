@@ -1,0 +1,23 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D source_image;
+layout(binding = 1) uniform writeonly image2D output_image;
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    float jitter_x;
+    float jitter_y;
+} p;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(p.width) || pixel.y >= int(p.height)) {
+        return;
+    }
+    vec2 uv = (vec2(pixel) + 0.5 - vec2(p.jitter_x, p.jitter_y))
+        / vec2(p.width, p.height);
+    imageStore(output_image, pixel, texture(source_image, uv));
+}

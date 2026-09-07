@@ -20,6 +20,12 @@ impl Gpu {
         }
         .unwrap();
         let physical = unsafe { instance.enumerate_physical_devices() }.unwrap()[0];
+        let physical_features = unsafe { instance.get_physical_device_features(physical) };
+        let features = vk::PhysicalDeviceFeatures {
+            shader_storage_image_write_without_format: physical_features
+                .shader_storage_image_write_without_format,
+            ..Default::default()
+        };
         let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
         let family = families
             .iter()
@@ -34,7 +40,9 @@ impl Gpu {
         let device = unsafe {
             instance.create_device(
                 physical,
-                &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
+                &vk::DeviceCreateInfo::default()
+                    .queue_create_infos(&queues)
+                    .enabled_features(&features),
                 None,
             )
         }
