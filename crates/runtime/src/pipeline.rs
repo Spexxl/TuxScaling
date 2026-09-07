@@ -151,7 +151,7 @@ impl TemporalPipeline {
         }
         let guidance = if let (Some(capture), Some(motion)) = (&capture, &motion) {
             match unsafe {
-                GuidanceEstimator::new(
+                GuidanceEstimator::new_with_slots(
                     device,
                     &memory,
                     resolution.processing_extent,
@@ -161,6 +161,7 @@ impl TemporalPipeline {
                     motion.vectors.view,
                     motion.metadata.handle,
                     motion.stats.handle,
+                    image_count,
                 )
             } {
                 Ok(value) => Some(value),

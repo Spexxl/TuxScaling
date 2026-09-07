@@ -76,7 +76,27 @@ fn guidance_shader_contains_relative_depth_and_gradient_rejection_producers() {
     assert!(reconstruct.contains("depth_discontinuity"));
     assert!(!reconstruct.contains("* clamp(depth, 0.0, 1.0)"));
     let runtime = include_str!("../../../crates/runtime/src/present.rs");
-    assert!(runtime.contains("view_with_depth_state"));
+    assert!(runtime.contains("guidance.view("));
+}
+
+#[test]
+fn production_depth_status_stays_gpu_resident() {
+    let gpu = include_str!("../src/gpu.rs");
+    let runtime = include_str!("../../runtime/src/present.rs");
+    assert!(!gpu.contains("MemoryPropertyFlags::HOST_VISIBLE"));
+    assert!(!gpu.contains("map_memory"));
+    assert!(!gpu.contains("refresh_depth_status"));
+    assert!(!runtime.contains("refresh_depth_status"));
+}
+
+#[test]
+fn production_depth_status_is_slot_scoped() {
+    let gpu = include_str!("../src/gpu.rs");
+    let runtime = include_str!("../../runtime/src/present.rs");
+    assert!(gpu.contains("depth_models: Vec<Buffer>"));
+    assert!(gpu.contains("depth_descriptor_sets: Vec<vk::DescriptorSet>"));
+    assert!(runtime.contains("record_with_timing_for_slot"));
+    assert!(runtime.contains("record_provider_failure_for_slot"));
 }
 
 unsafe fn copy_upload(gpu: &Gpu, image: &Image, upload: &Buffer, extent: vk::Extent2D) {
@@ -809,7 +829,6 @@ unsafe fn guidance_masks_with_field_options(
             );
             memory_barrier(device, command);
         });
-        guidance.refresh_depth_status();
         let mut bytes = vec![0u8; readback.size as usize];
         readback.read(&mut bytes).unwrap();
         let exposure = f32::from_ne_bytes(
@@ -1271,8 +1290,10 @@ fn relative_depth_orders_independent_parallax_planes() {
         guidance_masks_with_field_options(extent, &previous, &current, None, Some(&motion), false)
     };
     assert!(depth.iter().all(|value| value.is_finite()));
-    assert_eq!(depth_state, SignalState::Estimated);
-    assert_eq!(depth_semantics, DepthSemantics::RelativeNearIsOne);
+    // The host view is intentionally conservative: support is decided by the
+    // GPU's slot-local reduction and is not inferred before execution.
+    assert_eq!(depth_state, SignalState::ConstantFallback);
+    assert_eq!(depth_semantics, DepthSemantics::FlatFallback);
     let score = tuxscaling_temporal::quality::depth_order(&depth, &expected);
     let foreground = (0..extent.height)
         .flat_map(|y| (0..extent.width).map(move |x| (x, y)))

@@ -21,18 +21,16 @@ pub struct GuidanceEstimator {
     transparency_history: Image,
     transparency_residual: Image,
     depth_partials: Buffer,
-    depth_model: Buffer,
+    depth_models: Vec<Buffer>,
     sampler: vk::Sampler,
     layout: vk::PipelineLayout,
     descriptor_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
+    depth_descriptor_sets: Vec<vk::DescriptorSet>,
     pipeline: vk::Pipeline,
     depth_pipeline: vk::Pipeline,
     initialized: bool,
     history_initialized: bool,
-    depth_estimated: bool,
-    depth_status_known: bool,
     provider_failure: bool,
     extent: vk::Extent2D,
 }
@@ -50,6 +48,43 @@ impl GuidanceEstimator {
         statistics_buffer: vk::Buffer,
         compact_statistics_buffer: vk::Buffer,
     ) -> Result<Self, vk::Result> {
+        unsafe {
+            Self::new_with_slots(
+                device,
+                memory,
+                extent,
+                current_view,
+                previous_view,
+                confidence_view,
+                motion_view,
+                statistics_buffer,
+                compact_statistics_buffer,
+                1,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn new_with_slots(
+        device: &ash::Device,
+        memory: &vk::PhysicalDeviceMemoryProperties,
+        extent: vk::Extent2D,
+        current_view: vk::ImageView,
+        previous_view: vk::ImageView,
+        confidence_view: vk::ImageView,
+        motion_view: vk::ImageView,
+        statistics_buffer: vk::Buffer,
+        compact_statistics_buffer: vk::Buffer,
+        slot_count: usize,
+    ) -> Result<Self, vk::Result> {
+        let slot_count = slot_count.max(1);
+        let descriptor_count =
+            u32::try_from(slot_count).map_err(|_| vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
+        let scaled_descriptor_count = |count: u32| {
+            count
+                .checked_mul(descriptor_count)
+                .ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+        };
         let storage = vk::ImageUsageFlags::STORAGE
             | vk::ImageUsageFlags::SAMPLED
             | vk::ImageUsageFlags::TRANSFER_SRC
@@ -95,26 +130,26 @@ impl GuidanceEstimator {
                     vk::MemoryPropertyFlags::DEVICE_LOCAL,
                 )
             }?,
-            depth_model: unsafe {
-                Buffer::new(
-                    device,
-                    memory,
-                    DEPTH_MODEL_WORDS * 4,
-                    depth_buffer_usage,
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                )
-            }?,
+            depth_models: (0..slot_count)
+                .map(|_| unsafe {
+                    Buffer::new(
+                        device,
+                        memory,
+                        DEPTH_MODEL_WORDS * 4,
+                        depth_buffer_usage,
+                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
             sampler: vk::Sampler::null(),
             layout: vk::PipelineLayout::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
-            descriptor_set: vk::DescriptorSet::null(),
+            depth_descriptor_sets: Vec::new(),
             pipeline: vk::Pipeline::null(),
             depth_pipeline: vk::Pipeline::null(),
             initialized: false,
             history_initialized: false,
-            depth_estimated: false,
-            depth_status_known: false,
             provider_failure: false,
             extent,
         };
@@ -152,31 +187,31 @@ impl GuidanceEstimator {
         result.descriptor_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(1)
+                    .max_sets(descriptor_count)
                     .pool_sizes(&[
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                            descriptor_count: 3,
+                            descriptor_count: scaled_descriptor_count(3)?,
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_IMAGE,
-                            descriptor_count: 8,
+                            descriptor_count: scaled_descriptor_count(8)?,
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_BUFFER,
-                            descriptor_count: 4,
+                            descriptor_count: scaled_descriptor_count(4)?,
                         },
                     ]),
                 None,
             )
         }?;
-        result.descriptor_set = unsafe {
+        result.depth_descriptor_sets = unsafe {
             device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(result.descriptor_pool)
-                    .set_layouts(&[result.descriptor_layout]),
+                    .set_layouts(&vec![result.descriptor_layout; slot_count]),
             )
-        }?[0];
+        }?;
         let sampled = [
             vk::DescriptorImageInfo::default()
                 .sampler(result.sampler)
@@ -191,95 +226,102 @@ impl GuidanceEstimator {
                 .image_view(result.transparency_history.view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
         ];
-        unsafe {
-            device.update_descriptor_sets(
-                &[
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(result.descriptor_set)
-                        .dst_binding(0)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .image_info(&sampled[0..1]),
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(result.descriptor_set)
-                        .dst_binding(1)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .image_info(&sampled[1..2]),
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(result.descriptor_set)
-                        .dst_binding(11)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .image_info(&sampled[2..3]),
-                ],
-                &[],
-            );
-        }
-        for (binding, view) in [
-            (2, confidence_view),
-            (3, result.reactive.view),
-            (4, result.disocclusion.view),
-            (5, result.exposure.view),
-            (6, result.depth.view),
-            (8, motion_view),
-            (9, result.transparency.view),
-            (12, result.transparency_residual.view),
-        ] {
-            let image = [vk::DescriptorImageInfo::default()
-                .image_view(view)
-                .image_layout(vk::ImageLayout::GENERAL)];
+        for &descriptor_set in &result.depth_descriptor_sets {
             unsafe {
                 device.update_descriptor_sets(
-                    &[vk::WriteDescriptorSet::default()
-                        .dst_set(result.descriptor_set)
-                        .dst_binding(binding)
-                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                        .image_info(&image)],
+                    &[
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(descriptor_set)
+                            .dst_binding(0)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .image_info(&sampled[0..1]),
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(descriptor_set)
+                            .dst_binding(1)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .image_info(&sampled[1..2]),
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(descriptor_set)
+                            .dst_binding(11)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .image_info(&sampled[2..3]),
+                    ],
                     &[],
                 );
+            }
+            for (binding, view) in [
+                (2, confidence_view),
+                (3, result.reactive.view),
+                (4, result.disocclusion.view),
+                (5, result.exposure.view),
+                (6, result.depth.view),
+                (8, motion_view),
+                (9, result.transparency.view),
+                (12, result.transparency_residual.view),
+            ] {
+                let image = [vk::DescriptorImageInfo::default()
+                    .image_view(view)
+                    .image_layout(vk::ImageLayout::GENERAL)];
+                unsafe {
+                    device.update_descriptor_sets(
+                        &[vk::WriteDescriptorSet::default()
+                            .dst_set(descriptor_set)
+                            .dst_binding(binding)
+                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                            .image_info(&image)],
+                        &[],
+                    );
+                }
             }
         }
         let stats = [vk::DescriptorBufferInfo::default()
             .buffer(statistics_buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
-        unsafe {
-            device.update_descriptor_sets(
-                &[vk::WriteDescriptorSet::default()
-                    .dst_set(result.descriptor_set)
-                    .dst_binding(7)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&stats)],
-                &[],
-            );
-        }
-        for (binding, buffer) in [(13, &result.depth_partials), (14, &result.depth_model)] {
-            let data = [vk::DescriptorBufferInfo::default()
-                .buffer(buffer.handle)
-                .offset(0)
-                .range(vk::WHOLE_SIZE)];
-            unsafe {
-                device.update_descriptor_sets(
-                    &[vk::WriteDescriptorSet::default()
-                        .dst_set(result.descriptor_set)
-                        .dst_binding(binding)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(&data)],
-                    &[],
-                );
-            }
-        }
         let compact_stats = [vk::DescriptorBufferInfo::default()
             .buffer(compact_statistics_buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
-        unsafe {
-            device.update_descriptor_sets(
-                &[vk::WriteDescriptorSet::default()
-                    .dst_set(result.descriptor_set)
-                    .dst_binding(10)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&compact_stats)],
-                &[],
-            );
+        for (descriptor_set, depth_model) in result
+            .depth_descriptor_sets
+            .iter()
+            .zip(result.depth_models.iter())
+        {
+            let partials = [vk::DescriptorBufferInfo::default()
+                .buffer(result.depth_partials.handle)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
+            let model = [vk::DescriptorBufferInfo::default()
+                .buffer(depth_model.handle)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
+            unsafe {
+                device.update_descriptor_sets(
+                    &[
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(*descriptor_set)
+                            .dst_binding(7)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(&stats),
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(*descriptor_set)
+                            .dst_binding(10)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(&compact_stats),
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(*descriptor_set)
+                            .dst_binding(13)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(&partials),
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(*descriptor_set)
+                            .dst_binding(14)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(&model),
+                    ],
+                    &[],
+                );
+            }
         }
         result.layout = unsafe {
             device.create_pipeline_layout(
@@ -348,7 +390,7 @@ impl GuidanceEstimator {
     }
 
     pub unsafe fn record(&mut self, command: vk::CommandBuffer, valid: bool) {
-        unsafe { self.record_with_timing(command, valid, FrameTiming::default()) };
+        unsafe { self.record_with_timing_for_slot(command, valid, FrameTiming::default(), 0) };
     }
 
     pub unsafe fn record_with_timing(
@@ -357,8 +399,18 @@ impl GuidanceEstimator {
         valid: bool,
         timing: FrameTiming,
     ) {
+        unsafe { self.record_with_timing_for_slot(command, valid, timing, 0) };
+    }
+
+    pub unsafe fn record_with_timing_for_slot(
+        &mut self,
+        command: vk::CommandBuffer,
+        valid: bool,
+        timing: FrameTiming,
+        slot: usize,
+    ) {
         self.provider_failure = false;
-        unsafe { self.record_inner(command, valid, timing, None) };
+        unsafe { self.record_inner(command, valid, timing, None, slot) };
     }
 
     pub unsafe fn record_timed(
@@ -368,13 +420,13 @@ impl GuidanceEstimator {
         query_pool: vk::QueryPool,
         query_base: u32,
     ) {
-        self.provider_failure = false;
         unsafe {
-            self.record_inner(
+            self.record_timed_with_timing(
                 command,
                 valid,
                 FrameTiming::default(),
-                Some((query_pool, query_base)),
+                query_pool,
+                query_base,
             )
         };
     }
@@ -387,8 +439,24 @@ impl GuidanceEstimator {
         query_pool: vk::QueryPool,
         query_base: u32,
     ) {
+        unsafe {
+            self.record_timed_with_timing_for_slot(
+                command, valid, timing, query_pool, query_base, 0,
+            )
+        };
+    }
+
+    pub unsafe fn record_timed_with_timing_for_slot(
+        &mut self,
+        command: vk::CommandBuffer,
+        valid: bool,
+        timing: FrameTiming,
+        query_pool: vk::QueryPool,
+        query_base: u32,
+        slot: usize,
+    ) {
         self.provider_failure = false;
-        unsafe { self.record_inner(command, valid, timing, Some((query_pool, query_base))) };
+        unsafe { self.record_inner(command, valid, timing, Some((query_pool, query_base)), slot) };
     }
 
     unsafe fn record_inner(
@@ -397,7 +465,10 @@ impl GuidanceEstimator {
         valid: bool,
         timing: FrameTiming,
         timestamps: Option<(vk::QueryPool, u32)>,
+        slot: usize,
     ) {
+        let slot = slot % self.depth_descriptor_sets.len();
+        let depth_model = &self.depth_models[slot];
         unsafe {
             // Every depth phase consumes a complete, deterministic set of
             // records.  Clearing the device-local scratch buffers also makes
@@ -409,13 +480,8 @@ impl GuidanceEstimator {
                 self.depth_partials.size,
                 0,
             );
-            self.device.cmd_fill_buffer(
-                command,
-                self.depth_model.handle,
-                0,
-                self.depth_model.size,
-                0,
-            );
+            self.device
+                .cmd_fill_buffer(command, depth_model.handle, 0, depth_model.size, 0);
             memory_barrier(&self.device, command);
             if !self.initialized {
                 for image in [
@@ -499,7 +565,7 @@ impl GuidanceEstimator {
                 vk::PipelineBindPoint::COMPUTE,
                 self.layout,
                 0,
-                &[self.descriptor_set],
+                &[self.depth_descriptor_sets[slot]],
                 &[],
             );
             if let Some((query_pool, query_base)) = timestamps {
@@ -642,38 +708,21 @@ impl GuidanceEstimator {
         }
         self.initialized = true;
         self.history_initialized = valid && !self.provider_failure;
-        // The reduction writes the definitive support bit only after the
-        // command has executed.  Keep the host contract conservative until a
-        // caller refreshes that bit after the submission fence completes.
-        self.depth_status_known = false;
-        self.depth_estimated = false;
     }
 
     /// Record coherent fallback values after a provider failure.
     pub unsafe fn record_provider_failure(&mut self, command: vk::CommandBuffer) {
-        self.provider_failure = true;
-        self.history_initialized = false;
-        self.depth_estimated = false;
-        self.depth_status_known = false;
-        unsafe { self.record_inner(command, false, FrameTiming::default(), None) };
+        unsafe { self.record_provider_failure_for_slot(command, 0) };
     }
 
-    /// Refresh the frame-level depth support bit after the submission that
-    /// produced it has completed.  The model buffer is host-visible and
-    /// coherent, so this is an asynchronous status channel rather than a
-    /// command-buffer readback.  Callers must wait for their submission fence
-    /// before invoking this method.
-    pub unsafe fn refresh_depth_status(&mut self) {
-        let mut bytes = [0u8; DEPTH_MODEL_WORDS as usize * 4];
-        if unsafe { self.depth_model.read(&mut bytes) }.is_err() {
-            self.depth_status_known = false;
-            self.depth_estimated = false;
-            return;
-        }
-        let supported = f32::from_ne_bytes(bytes[32..36].try_into().unwrap());
-        self.depth_status_known = supported.is_finite();
-        self.depth_estimated =
-            self.depth_status_known && supported >= 0.5 && !self.provider_failure;
+    pub unsafe fn record_provider_failure_for_slot(
+        &mut self,
+        command: vk::CommandBuffer,
+        slot: usize,
+    ) {
+        self.provider_failure = true;
+        self.history_initialized = false;
+        unsafe { self.record_inner(command, false, FrameTiming::default(), None, slot) };
     }
 
     /// Clear the host-side history marker when an external reset invalidates
@@ -698,35 +747,6 @@ impl GuidanceEstimator {
         timing: FrameTiming,
         reset: GuidanceReset,
     ) -> GuidanceView {
-        let depth_estimated =
-            valid && self.depth_status_known && self.depth_estimated && !self.provider_failure;
-        self.view_with_depth_state(
-            motion,
-            frame_id,
-            extent,
-            valid,
-            timing,
-            reset,
-            depth_estimated,
-        )
-    }
-
-    /// Construct a view with an explicit current-frame depth state. Runtime
-    /// callers use the conservative fallback before recording a new frame,
-    /// because the GPU support bit is not available until that submission has
-    /// completed. The regular [`Self::view`] method exposes the last completed
-    /// status after [`Self::refresh_depth_status`].
-    #[allow(clippy::too_many_arguments)]
-    pub fn view_with_depth_state(
-        &self,
-        motion: &MotionEstimator,
-        frame_id: u64,
-        extent: vk::Extent2D,
-        valid: bool,
-        timing: FrameTiming,
-        reset: GuidanceReset,
-        depth_state: bool,
-    ) -> GuidanceView {
         let extent = FrameExtent {
             width: extent.width,
             height: extent.height,
@@ -748,7 +768,12 @@ impl GuidanceEstimator {
                 || !self.history_initialized
                 || !matches!(reset, GuidanceReset::None),
         };
-        let depth_estimated = valid && depth_state && !self.provider_failure;
+        // The final affine/inlier decision is GPU-resident and is only known
+        // while the recorded command executes.  Host metadata remains
+        // conservative instead of inferring support from `valid` or a prior
+        // in-flight frame; the depth image itself writes exact fallback 1.0
+        // when the GPU evidence thresholds are not met.
+        let depth_estimated = false;
         let resource =
             |image: vk::Image, view: vk::ImageView, format: vk::Format, state: SignalState| {
                 GuidanceResource {
