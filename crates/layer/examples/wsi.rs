@@ -83,6 +83,24 @@ unsafe fn mark_fullscreen(display: *mut c_void, window: c_ulong) {
         );
     }
 }
+
+fn parse_frame_limit(value: Option<&str>) -> Option<u32> {
+    value
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parses_positive_frame_limits() {
+        assert_eq!(super::parse_frame_limit(Some("780")), Some(780));
+        assert_eq!(super::parse_frame_limit(Some("0")), None);
+        assert_eq!(super::parse_frame_limit(Some("invalid")), None);
+        assert_eq!(super::parse_frame_limit(None), None);
+    }
+}
+
 struct Chain {
     surface: vk::SurfaceKHR,
     handle: vk::SwapchainKHR,
@@ -374,6 +392,8 @@ unsafe fn run() {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(8);
+        let frame_limit =
+            parse_frame_limit(std::env::var("TUXSCALING_TEST_FRAMES").ok().as_deref());
         let mut frame = 0u32;
         let mut grouped = 0;
         let mut resizes = 0;
@@ -385,7 +405,9 @@ unsafe fn run() {
             .get_instance_proc_addr(instance.handle(), c"vkQueuePresentKHR".as_ptr())
             .unwrap();
         let present: vk::PFN_vkQueuePresentKHR = std::mem::transmute(present_proc);
-        while start.elapsed() < Duration::from_secs(seconds) {
+        while frame_limit.is_some_and(|limit| frame < limit)
+            || frame_limit.is_none() && start.elapsed() < Duration::from_secs(seconds)
+        {
             if resize_interval > 0 && frame > 0 && frame.is_multiple_of(resize_interval) {
                 let extent = if resizes % 2 == 0 {
                     vk::Extent2D {
