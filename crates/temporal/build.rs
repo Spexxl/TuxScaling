@@ -15,4 +15,16 @@ fn main() {
         .status()
         .expect("glslc is required; install the shader compiler before building");
     assert!(status.success(), "shader compilation failed: guidance");
+
+    let source = root.join("depth_reduce.comp");
+    println!("cargo:rerun-if-changed={}", source.display());
+    let status = Command::new("glslc")
+        .arg("--target-env=vulkan1.0")
+        .arg("-O")
+        .arg(&source)
+        .arg("-o")
+        .arg(out.join("depth_reduce.spv"))
+        .status()
+        .expect("glslc is required; install the shader compiler before building");
+    assert!(status.success(), "shader compilation failed: depth_reduce");
 }

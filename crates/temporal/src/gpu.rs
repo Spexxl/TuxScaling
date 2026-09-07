@@ -1,12 +1,15 @@
 #![allow(clippy::missing_safety_doc)]
 use ash::vk;
 use tuxscaling_motion::MotionEstimator;
-use tuxscaling_vulkan::{Image, image_barrier, memory_barrier};
+use tuxscaling_vulkan::{Buffer, Image, image_barrier, memory_barrier};
 
 use crate::{
     DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResource,
     GuidanceView, JitterSample, MotionDirection, MotionUnits, SignalState, ValidRegion,
 };
+
+const DEPTH_RECORD_WORDS: u64 = 80;
+const DEPTH_MODEL_WORDS: u64 = 32;
 
 pub struct GuidanceEstimator {
     device: ash::Device,
@@ -17,14 +20,18 @@ pub struct GuidanceEstimator {
     pub transparency: Image,
     transparency_history: Image,
     transparency_residual: Image,
+    depth_partials: Buffer,
+    depth_model: Buffer,
     sampler: vk::Sampler,
     layout: vk::PipelineLayout,
     descriptor_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set: vk::DescriptorSet,
     pipeline: vk::Pipeline,
+    depth_pipeline: vk::Pipeline,
     initialized: bool,
     history_initialized: bool,
+    depth_estimated: bool,
     provider_failure: bool,
     extent: vk::Extent2D,
 }
@@ -46,6 +53,10 @@ impl GuidanceEstimator {
             | vk::ImageUsageFlags::SAMPLED
             | vk::ImageUsageFlags::TRANSFER_SRC
             | vk::ImageUsageFlags::TRANSFER_DST;
+        let depth_groups =
+            u64::from(extent.width.div_ceil(8)) * u64::from(extent.height.div_ceil(8));
+        let depth_buffer_usage =
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
         let mut result = Self {
             device: device.clone(),
             reactive: unsafe { Image::new(device, memory, extent, vk::Format::R8_UNORM, storage) }?,
@@ -74,14 +85,34 @@ impl GuidanceEstimator {
             transparency_residual: unsafe {
                 Image::new(device, memory, extent, vk::Format::R8_UNORM, storage)
             }?,
+            depth_partials: unsafe {
+                Buffer::new(
+                    device,
+                    memory,
+                    depth_groups * DEPTH_RECORD_WORDS * 4,
+                    depth_buffer_usage,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                )
+            }?,
+            depth_model: unsafe {
+                Buffer::new(
+                    device,
+                    memory,
+                    DEPTH_MODEL_WORDS * 4,
+                    depth_buffer_usage,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                )
+            }?,
             sampler: vk::Sampler::null(),
             layout: vk::PipelineLayout::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
             descriptor_set: vk::DescriptorSet::null(),
             pipeline: vk::Pipeline::null(),
+            depth_pipeline: vk::Pipeline::null(),
             initialized: false,
             history_initialized: false,
+            depth_estimated: false,
             provider_failure: false,
             extent,
         };
@@ -95,13 +126,13 @@ impl GuidanceEstimator {
                 None,
             )
         }?;
-        let bindings = (0..=12)
+        let bindings = (0..=14)
             .map(|binding| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(binding)
                     .descriptor_type(if binding < 2 || binding == 11 {
                         vk::DescriptorType::COMBINED_IMAGE_SAMPLER
-                    } else if binding == 7 || binding == 10 {
+                    } else if binding == 7 || binding == 10 || binding == 13 || binding == 14 {
                         vk::DescriptorType::STORAGE_BUFFER
                     } else {
                         vk::DescriptorType::STORAGE_IMAGE
@@ -131,7 +162,7 @@ impl GuidanceEstimator {
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_BUFFER,
-                            descriptor_count: 2,
+                            descriptor_count: 4,
                         },
                     ]),
                 None,
@@ -218,6 +249,22 @@ impl GuidanceEstimator {
                 &[],
             );
         }
+        for (binding, buffer) in [(13, &result.depth_partials), (14, &result.depth_model)] {
+            let data = [vk::DescriptorBufferInfo::default()
+                .buffer(buffer.handle)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
+            unsafe {
+                device.update_descriptor_sets(
+                    &[vk::WriteDescriptorSet::default()
+                        .dst_set(result.descriptor_set)
+                        .dst_binding(binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&data)],
+                    &[],
+                );
+            }
+        }
         let compact_stats = [vk::DescriptorBufferInfo::default()
             .buffer(compact_statistics_buffer)
             .offset(0)
@@ -265,6 +312,33 @@ impl GuidanceEstimator {
         };
         unsafe { device.destroy_shader_module(module, None) };
         result.pipeline = match pipeline {
+            Ok(pipelines) => pipelines[0],
+            Err((_, error)) => return Err(error),
+        };
+        let depth_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/depth_reduce.spv"));
+        let depth_words = ash::util::read_spv(&mut std::io::Cursor::new(depth_bytes))
+            .map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        let depth_module = unsafe {
+            device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&depth_words),
+                None,
+            )
+        }?;
+        let depth_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(depth_module)
+            .name(c"main");
+        let depth_pipeline = unsafe {
+            device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(depth_stage)
+                    .layout(result.layout)],
+                None,
+            )
+        };
+        unsafe { device.destroy_shader_module(depth_module, None) };
+        result.depth_pipeline = match depth_pipeline {
             Ok(pipelines) => pipelines[0],
             Err((_, error)) => return Err(error),
         };
@@ -323,6 +397,24 @@ impl GuidanceEstimator {
         timestamps: Option<(vk::QueryPool, u32)>,
     ) {
         unsafe {
+            // Every depth phase consumes a complete, deterministic set of
+            // records.  Clearing the device-local scratch buffers also makes
+            // invalid/provider-failure frames safe before the first dispatch.
+            self.device.cmd_fill_buffer(
+                command,
+                self.depth_partials.handle,
+                0,
+                self.depth_partials.size,
+                0,
+            );
+            self.device.cmd_fill_buffer(
+                command,
+                self.depth_model.handle,
+                0,
+                self.depth_model.size,
+                0,
+            );
+            memory_barrier(&self.device, command);
             if !self.initialized {
                 for image in [
                     &self.reactive,
@@ -458,6 +550,33 @@ impl GuidanceEstimator {
             );
             self.device.cmd_dispatch(command, 1, 1, 1);
             memory_barrier(&self.device, command);
+
+            // Relative depth is deliberately a separate reduction pipeline:
+            // first solve the compact affine model, then accumulate robust
+            // residual percentiles, and finally normalize the output image.
+            self.device.cmd_bind_pipeline(
+                command,
+                vk::PipelineBindPoint::COMPUTE,
+                self.depth_pipeline,
+            );
+            for (mode, width, height) in [
+                (2u32, 1u32, 1u32),                            // compact affine solve
+                (3u32, self.extent.width, self.extent.height), // residual histogram
+                (4u32, 1u32, 1u32),                            // inlier/percentile final solve
+                (5u32, self.extent.width, self.extent.height), // normalized depth
+            ] {
+                params[3] = mode;
+                self.device.cmd_push_constants(
+                    command,
+                    self.layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    bytemuck::cast_slice(&params),
+                );
+                self.device
+                    .cmd_dispatch(command, width.div_ceil(8), height.div_ceil(8), 1);
+                memory_barrier(&self.device, command);
+            }
             image_barrier(
                 &self.device,
                 command,
@@ -521,12 +640,14 @@ impl GuidanceEstimator {
         }
         self.initialized = true;
         self.history_initialized = valid && !self.provider_failure;
+        self.depth_estimated = valid && !self.provider_failure;
     }
 
     /// Record coherent fallback values after a provider failure.
     pub unsafe fn record_provider_failure(&mut self, command: vk::CommandBuffer) {
         self.provider_failure = true;
         self.history_initialized = false;
+        self.depth_estimated = false;
         unsafe { self.record_inner(command, false, FrameTiming::default(), None) };
     }
 
@@ -573,6 +694,7 @@ impl GuidanceEstimator {
                 || !self.history_initialized
                 || !matches!(reset, GuidanceReset::None),
         };
+        let depth_estimated = valid && self.depth_estimated && !self.provider_failure;
         let resource =
             |image: vk::Image, view: vk::ImageView, format: vk::Format, state: SignalState| {
                 GuidanceResource {
@@ -638,7 +760,11 @@ impl GuidanceEstimator {
                 self.depth.handle,
                 self.depth.view,
                 vk::Format::R32_SFLOAT,
-                SignalState::ConstantFallback,
+                if depth_estimated {
+                    SignalState::Estimated
+                } else {
+                    SignalState::ConstantFallback
+                },
             ),
             transparency_composition: resource(
                 self.transparency.handle,
@@ -653,7 +779,11 @@ impl GuidanceEstimator {
             pre_exposure: 1.0,
             timing,
             jitter: JitterSample::default(),
-            depth_semantics: DepthSemantics::FlatFallback,
+            depth_semantics: if depth_estimated {
+                DepthSemantics::RelativeNearIsOne
+            } else {
+                DepthSemantics::FlatFallback
+            },
             direction: MotionDirection::CurrentToPrevious,
             units: MotionUnits::SourcePixels,
             requires_history_reset: metadata.requires_history_reset,
@@ -664,6 +794,7 @@ impl GuidanceEstimator {
 impl Drop for GuidanceEstimator {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_pipeline(self.depth_pipeline, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device

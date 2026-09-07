@@ -9,6 +9,16 @@ use tuxscaling_vulkan::{Buffer, Image, image_barrier, memory_barrier};
 mod support;
 use support::Gpu;
 
+type GuidanceOutputs = (
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<f32>,
+    f32,
+    [SignalState; 4],
+    bool,
+);
+
 #[test]
 fn guidance_shader_contains_reprojected_mask_and_exposure_producers() {
     let shader = include_str!("../../../shaders/temporal/guidance.comp");
@@ -36,6 +46,32 @@ fn guidance_shader_contains_reprojected_mask_and_exposure_producers() {
     assert!(runtime.contains("guidance.record_provider_failure"));
     assert!(runtime.contains("guidance.reset_history"));
     assert!(runtime.contains("guidance.clear_provider_failure"));
+}
+
+#[test]
+fn guidance_shader_contains_relative_depth_and_gradient_rejection_producers() {
+    let guidance = include_str!("../../../shaders/temporal/guidance.comp");
+    for term in ["DepthPartials", "normal_equations"] {
+        assert!(guidance.contains(term), "guidance shader is missing {term}");
+    }
+    let depth = include_str!("../../../shaders/temporal/depth_reduce.comp");
+    for term in [
+        "solve_affine",
+        "affine_inliers",
+        "global_motion",
+        "0.25",
+        "0.50",
+        "percentile_5",
+        "percentile_95",
+        "relative_parallax",
+        "FlatFallback",
+        "RelativeNearIsOne",
+    ] {
+        assert!(depth.contains(term), "depth shader is missing {term}");
+    }
+    let reconstruct = include_str!("../../../shaders/upscaler/reconstruct.comp");
+    assert!(reconstruct.contains("depth_discontinuity"));
+    assert!(!reconstruct.contains("* clamp(depth, 0.0, 1.0)"));
 }
 
 unsafe fn copy_upload(gpu: &Gpu, image: &Image, upload: &Buffer, extent: vk::Extent2D) {
@@ -198,6 +234,77 @@ unsafe fn clear_motion(gpu: &Gpu, motion: &Image, value: [f32; 4]) {
     }
 }
 
+fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mantissa = bits & 0x7f_ff_ff;
+    if exponent <= 0 {
+        if exponent < -10 {
+            return sign;
+        }
+        let shifted = (mantissa | 0x80_00_00) >> (1 - exponent);
+        return sign | ((shifted + 0x1000) >> 13) as u16;
+    }
+    if exponent >= 31 {
+        return sign | 0x7c00;
+    }
+    sign | ((exponent as u16) << 10) | ((mantissa + 0x1000) >> 13) as u16
+}
+
+unsafe fn clear_motion_field(gpu: &Gpu, motion: &Image, values: &[[f32; 2]], extent: vk::Extent2D) {
+    unsafe {
+        let device = &gpu.device;
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            bytes.extend_from_slice(&f32_to_f16(value[0]).to_ne_bytes());
+            bytes.extend_from_slice(&f32_to_f16(value[1]).to_ne_bytes());
+        }
+        let upload = Buffer::new(
+            device,
+            &gpu.memory,
+            bytes.len() as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .unwrap();
+        upload.write(&bytes).unwrap();
+        gpu.submit(|command| {
+            image_barrier(
+                device,
+                command,
+                motion.handle,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            );
+            device.cmd_copy_buffer_to_image(
+                command,
+                upload.handle,
+                motion.handle,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::BufferImageCopy::default()
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: extent.width,
+                        height: extent.height,
+                        depth: 1,
+                    })],
+            );
+            image_barrier(
+                device,
+                command,
+                motion.handle,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::GENERAL,
+            );
+        });
+    }
+}
+
 unsafe fn guidance_masks(
     extent: vk::Extent2D,
     previous_pixels: &[u8],
@@ -232,7 +339,16 @@ unsafe fn guidance_provider_failure(
     previous_pixels: &[u8],
     current_pixels: &[u8],
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>, f32, [SignalState; 4], bool) {
-    unsafe { guidance_masks_with_options(extent, previous_pixels, current_pixels, None, true) }
+    let (reactive, disocclusion, transparency, _depth, exposure, states, reset) =
+        unsafe { guidance_masks_with_options(extent, previous_pixels, current_pixels, None, true) };
+    (
+        reactive,
+        disocclusion,
+        transparency,
+        exposure,
+        states,
+        reset,
+    )
 }
 
 unsafe fn read_transparency(
@@ -376,7 +492,7 @@ unsafe fn guidance_two_frame_translated_history(
         paint(&mut frame1, 16, 28);
         paint(&mut frame2, 20, 32);
         for frame in [&mut frame0, &mut frame1, &mut frame2] {
-            for pixel in frame.chunks_exact_mut(4) {
+            for pixel in frame.as_chunks_mut::<4>().0 {
                 pixel[3] = 255;
             }
         }
@@ -508,7 +624,27 @@ unsafe fn guidance_masks_with_options(
     current_pixels: &[u8],
     forced_motion: Option<[f32; 4]>,
     provider_failure: bool,
-) -> (Vec<u8>, Vec<u8>, Vec<u8>, f32, [SignalState; 4], bool) {
+) -> GuidanceOutputs {
+    unsafe {
+        guidance_masks_with_field_options(
+            extent,
+            previous_pixels,
+            current_pixels,
+            forced_motion,
+            None,
+            provider_failure,
+        )
+    }
+}
+
+unsafe fn guidance_masks_with_field_options(
+    extent: vk::Extent2D,
+    previous_pixels: &[u8],
+    current_pixels: &[u8],
+    forced_motion: Option<[f32; 4]>,
+    forced_motion_field: Option<&[[f32; 2]]>,
+    provider_failure: bool,
+) -> GuidanceOutputs {
     unsafe {
         let gpu = Gpu::new();
         let device = &gpu.device;
@@ -548,6 +684,9 @@ unsafe fn guidance_masks_with_options(
         if let Some(forced_motion) = forced_motion {
             clear_motion(&gpu, &motion.vectors, forced_motion);
         }
+        if let Some(forced_motion_field) = forced_motion_field {
+            clear_motion_field(&gpu, &motion.vectors, forced_motion_field, extent);
+        }
         upload.write(previous_pixels).unwrap();
         copy_upload(&gpu, &previous, &upload, extent);
         let mut guidance = tuxscaling_temporal::GuidanceEstimator::new(
@@ -567,10 +706,11 @@ unsafe fn guidance_masks_with_options(
         let disocclusion_offset = count;
         let transparency_offset = count * 2;
         let exposure_offset = count * 3;
+        let depth_offset = exposure_offset + 4;
         let readback = Buffer::new(
             device,
             &gpu.memory,
-            exposure_offset + 4,
+            depth_offset + count * 4,
             vk::BufferUsageFlags::TRANSFER_DST,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )
@@ -637,6 +777,31 @@ unsafe fn guidance_masks_with_options(
                         depth: 1,
                     })],
             );
+            image_barrier(
+                device,
+                command,
+                guidance.depth.handle,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+            device.cmd_copy_image_to_buffer(
+                command,
+                guidance.depth.handle,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                readback.handle,
+                &[vk::BufferImageCopy::default()
+                    .buffer_offset(depth_offset)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: extent.width,
+                        height: extent.height,
+                        depth: 1,
+                    })],
+            );
             memory_barrier(device, command);
         });
         let mut bytes = vec![0u8; readback.size as usize];
@@ -646,6 +811,12 @@ unsafe fn guidance_masks_with_options(
                 .try_into()
                 .unwrap(),
         );
+        let depth = (0..count as usize)
+            .map(|index| {
+                let offset = depth_offset as usize + index * 4;
+                f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+            })
+            .collect::<Vec<_>>();
         let view = guidance.view(
             &motion,
             1,
@@ -662,6 +833,7 @@ unsafe fn guidance_masks_with_options(
             bytes[reactive_offset as usize..disocclusion_offset as usize].to_vec(),
             bytes[disocclusion_offset as usize..transparency_offset as usize].to_vec(),
             bytes[transparency_offset as usize..exposure_offset as usize].to_vec(),
+            depth,
             exposure,
             [
                 view.reactive.state,
@@ -950,7 +1122,7 @@ fn guidance_coverage_does_not_turn_low_confidence_into_disocclusion() {
         height: 48,
     };
     let (previous, mut current, _) = translated_flow_fixture(extent, 0, 0);
-    for pixel in current.chunks_exact_mut(4) {
+    for pixel in current.as_chunks_mut::<4>().0 {
         pixel[0] = 255 - pixel[0];
         pixel[1] = 255 - pixel[1];
         pixel[2] = 255 - pixel[2];
@@ -1039,4 +1211,105 @@ fn provider_failure_resets_history_before_the_next_valid_frame() {
     assert!(first > 1.5);
     assert!((fallback - 1.0).abs() <= f32::EPSILON);
     assert!(fresh > 1.5);
+}
+
+fn layered_parallax_flow_fixture(
+    extent: vk::Extent2D,
+) -> (Vec<u8>, Vec<u8>, Vec<[f32; 2]>, Vec<f32>) {
+    let count = (extent.width * extent.height) as usize;
+    let mut previous = vec![0u8; count * 4];
+    for y in 0..extent.height {
+        for x in 0..extent.width {
+            let value = flow_sample(x as f32 / 3.0, y as f32 / 3.0);
+            let index = (y * extent.width + x) as usize * 4;
+            previous[index..index + 4].copy_from_slice(&[value, value, value, 255]);
+        }
+    }
+    let mut current = previous.clone();
+    let mut motion = vec![[0.0, 0.0]; count];
+    let mut expected = vec![0.35; count];
+    for y in 0..extent.height {
+        for x in 0..extent.width {
+            let foreground = (extent.width / 4..extent.width * 3 / 4).contains(&x)
+                && (extent.height / 4..extent.height * 3 / 4).contains(&y);
+            let displacement = if foreground {
+                [-7.0, -3.0]
+            } else {
+                [-2.0, -1.0]
+            };
+            let index = (y * extent.width + x) as usize;
+            motion[index] = displacement;
+            expected[index] = if foreground { 1.0 } else { 0.35 };
+            let source_x = (x as i32 + displacement[0] as i32)
+                .clamp(0, extent.width.saturating_sub(1) as i32) as u32;
+            let source_y = (y as i32 + displacement[1] as i32)
+                .clamp(0, extent.height.saturating_sub(1) as i32) as u32;
+            let source = (source_y * extent.width + source_x) as usize * 4;
+            current[index * 4..index * 4 + 4].copy_from_slice(&previous[source..source + 4]);
+        }
+    }
+    (previous, current, motion, expected)
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn relative_depth_orders_independent_parallax_planes() {
+    let extent = vk::Extent2D {
+        width: 64,
+        height: 48,
+    };
+    let (previous, current, motion, expected) = layered_parallax_flow_fixture(extent);
+        let (_, _, _, depth, _, _, _) = unsafe {
+            guidance_masks_with_field_options(extent, &previous, &current, None, Some(&motion), false)
+        };
+        assert!(depth.iter().all(|value| value.is_finite()));
+    let score = tuxscaling_temporal::quality::depth_order(&depth, &expected);
+    let foreground = (0..extent.height)
+        .flat_map(|y| (0..extent.width).map(move |x| (x, y)))
+        .filter(|(x, y)| {
+            (extent.width / 4..extent.width * 3 / 4).contains(x)
+                && (extent.height / 4..extent.height * 3 / 4).contains(y)
+        })
+        .map(|(x, y)| depth[(y * extent.width + x) as usize])
+        .collect::<Vec<_>>();
+    let background = depth
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            let x = *index as u32 % extent.width;
+            let y = *index as u32 / extent.width;
+            !(extent.width / 4..extent.width * 3 / 4).contains(&x)
+                || !(extent.height / 4..extent.height * 3 / 4).contains(&y)
+        })
+        .map(|(_, value)| *value)
+        .collect::<Vec<_>>();
+    let foreground_mean = foreground.iter().sum::<f32>() / foreground.len() as f32;
+    let background_mean = background.iter().sum::<f32>() / background.len() as f32;
+    eprintln!(
+        "relative depth parallax: order={score:.3} foreground={foreground_mean:.3} background={background_mean:.3}"
+    );
+    assert!(score >= 0.85);
+    assert!(foreground_mean > background_mean + 0.10);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn relative_depth_uses_flat_fallback_below_global_motion_threshold() {
+    let extent = vk::Extent2D {
+        width: 64,
+        height: 48,
+    };
+    let (previous, current, _) = translated_flow_fixture(extent, 5, 0);
+    let (_, _, _, depth, _, states, _) = unsafe {
+        guidance_masks_with_options(
+            extent,
+            &previous,
+            &current,
+            Some([0.0, 0.0, 0.0, 0.0]),
+            false,
+        )
+    };
+    assert!(depth.iter().all(|value| *value == 1.0));
+    assert!(depth.iter().all(|value| value.is_finite()));
+    assert_eq!(states[0], SignalState::Estimated);
 }

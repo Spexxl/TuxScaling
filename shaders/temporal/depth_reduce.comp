@@ -1,0 +1,319 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D current_frame;
+layout(binding = 1) uniform sampler2D previous_frame;
+layout(r8, binding = 2) uniform readonly image2D confidence_image;
+layout(r32f, binding = 6) uniform image2D depth_image;
+layout(rg16f, binding = 8) uniform readonly image2D dense_motion;
+layout(std430, binding = 13) buffer DepthPartials { float normal_equations[]; } depth_partials;
+layout(std430, binding = 14) buffer DepthModel { float model[]; } depth_model;
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint valid;
+    uint mode;
+    float delta_seconds;
+    uint initialized;
+    uint provider_failure;
+    uint reserved;
+} p;
+
+const uint DEPTH_RECORD_WORDS = 80u;
+const uint NORMAL_EQUATION_WORDS = 32u;
+const float GLOBAL_MOTION_THRESHOLD = 0.25;
+const float AFFINE_INLIER_FRACTION = 0.50;
+// A robust inlier band tolerates the bounded bias from a minority plane while
+// still rejecting the several-pixel residual produced by independent parallax.
+const float AFFINE_INLIER_THRESHOLD = 2.25;
+const float EPSILON = 1e-5;
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+shared uint histogram[32];
+shared uint local_inliers;
+shared uint local_reliable;
+
+bool finite(float value) { return !isnan(value) && !isinf(value); }
+
+float luma_at(ivec2 pixel) {
+    ivec2 size = textureSize(current_frame, 0);
+    ivec2 q = clamp(pixel, ivec2(0), size - 1);
+    vec3 value = texelFetch(current_frame, q, 0).rgb;
+    if (any(isnan(value)) || any(isinf(value))) return 0.0;
+    return max(dot(clamp(value, vec3(0.0), vec3(1.0)), LUMA), 0.0);
+}
+
+vec2 safe_motion(ivec2 pixel) {
+    ivec2 size = imageSize(dense_motion);
+    vec2 value = imageLoad(dense_motion, clamp(pixel, ivec2(0), size - 1)).xy;
+    return any(isnan(value)) || any(isinf(value)) ? vec2(0.0) : value;
+}
+
+float safe_confidence(ivec2 pixel) {
+    ivec2 size = imageSize(confidence_image);
+    float value = imageLoad(confidence_image, clamp(pixel, ivec2(0), size - 1)).r;
+    return finite(value) ? clamp(value, 0.0, 1.0) : 0.0;
+}
+
+vec3 affine_coordinates(ivec2 pixel) {
+    return vec3(
+        (2.0 * (float(pixel.x) + 0.5) - float(p.width)) / max(float(p.width), 1.0),
+        (2.0 * (float(pixel.y) + 0.5) - float(p.height)) / max(float(p.height), 1.0),
+        1.0);
+}
+
+bool reprojectable(ivec2 pixel, vec2 motion) {
+    vec2 target = vec2(pixel) + motion;
+    return all(greaterThanEqual(target, vec2(0.0))) &&
+        all(lessThan(target, vec2(p.width, p.height)));
+}
+
+uint normal_index(uint row, uint column) {
+    uint a = min(row, column);
+    uint b = max(row, column);
+    return a * 6u - (a * (a - 1u)) / 2u + (b - a);
+}
+
+bool solve_affine_block(in float sums[32], uint feature_offset, uint rhs_offset, out vec3 result) {
+    float augmented[12];
+    for (uint row = 0u; row < 3u; ++row) {
+        for (uint column = 0u; column < 3u; ++column) {
+            augmented[row * 4u + column] = sums[normal_index(feature_offset + row, feature_offset + column)];
+        }
+        augmented[row * 4u + 3u] = sums[rhs_offset + row];
+    }
+    for (uint column = 0u; column < 3u; ++column) {
+        uint pivot = column;
+        float largest = abs(augmented[pivot * 4u + column]);
+        for (uint row = column + 1u; row < 3u; ++row) {
+            float candidate = abs(augmented[row * 4u + column]);
+            if (candidate > largest) {
+                largest = candidate;
+                pivot = row;
+            }
+        }
+        if (!finite(largest) || largest < EPSILON) {
+            result = vec3(0.0);
+            return false;
+        }
+        if (pivot != column) {
+            for (uint slot = column; slot < 4u; ++slot) {
+                float swap_value = augmented[column * 4u + slot];
+                augmented[column * 4u + slot] = augmented[pivot * 4u + slot];
+                augmented[pivot * 4u + slot] = swap_value;
+            }
+        }
+        float diagonal = augmented[column * 4u + column];
+        for (uint slot = column; slot < 4u; ++slot) augmented[column * 4u + slot] /= diagonal;
+        for (uint row = 0u; row < 3u; ++row) {
+            if (row == column) continue;
+            float scale = augmented[row * 4u + column];
+            for (uint slot = column; slot < 4u; ++slot) {
+                augmented[row * 4u + slot] -= scale * augmented[column * 4u + slot];
+            }
+        }
+    }
+    result = vec3(augmented[3], augmented[7], augmented[11]);
+    return finite(result.x) && finite(result.y) && finite(result.z);
+}
+
+void solve_global_affine() {
+    float sums[32];
+    for (uint slot = 0u; slot < NORMAL_EQUATION_WORDS; ++slot) sums[slot] = 0.0;
+    uint groups_x = (p.width + 7u) / 8u;
+    uint groups_y = (p.height + 7u) / 8u;
+    uint group_count = groups_x * groups_y;
+    for (uint group = 0u; group < group_count; ++group) {
+        uint base = group * DEPTH_RECORD_WORDS;
+        for (uint slot = 0u; slot < NORMAL_EQUATION_WORDS; ++slot) {
+            float value = depth_partials.normal_equations[base + slot];
+            sums[slot] += finite(value) ? value : 0.0;
+        }
+    }
+    for (uint slot = 0u; slot < 32u; ++slot) depth_model.model[slot] = 0.0;
+    float reliable = max(sums[30], 0.0);
+    float global_motion = reliable > 0.0 ? sums[29] / reliable : 0.0;
+    vec3 x_coefficients = vec3(0.0);
+    vec3 y_coefficients = vec3(0.0);
+    bool solved = p.valid != 0u && p.provider_failure == 0u && reliable >= 6.0 &&
+        finite(global_motion) && global_motion >= GLOBAL_MOTION_THRESHOLD &&
+        solve_affine_block(sums, 0u, 21u, x_coefficients) &&
+        solve_affine_block(sums, 3u, 24u, y_coefficients);
+    depth_model.model[0] = x_coefficients.x;
+    depth_model.model[1] = x_coefficients.y;
+    depth_model.model[2] = x_coefficients.z;
+    depth_model.model[3] = y_coefficients.x;
+    depth_model.model[4] = y_coefficients.y;
+    depth_model.model[5] = y_coefficients.z;
+    depth_model.model[6] = finite(global_motion) ? global_motion : 0.0;
+    depth_model.model[7] = reliable;
+    depth_model.model[8] = solved ? 1.0 : 0.0;
+    depth_model.model[9] = 0.0;
+    depth_model.model[10] = 0.0;
+    depth_model.model[11] = 1.0;
+    depth_model.model[12] = AFFINE_INLIER_THRESHOLD;
+}
+
+vec2 affine_flow(ivec2 pixel) {
+    vec3 basis = affine_coordinates(pixel);
+    return vec2(
+        dot(vec3(depth_model.model[0], depth_model.model[1], depth_model.model[2]), basis),
+        dot(vec3(depth_model.model[3], depth_model.model[4], depth_model.model[5]), basis));
+}
+
+float flow_divergence(ivec2 pixel, vec2 motion) {
+    float result = 0.0;
+    for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
+        result += length(safe_motion(pixel + ivec2(x, y)) - motion);
+    }
+    return clamp(result / 9.0 / 4.0, 0.0, 1.0);
+}
+
+float luminance_edge(ivec2 pixel) {
+    float horizontal = abs(luma_at(pixel + ivec2(1, 0)) - luma_at(pixel - ivec2(1, 0)));
+    float vertical = abs(luma_at(pixel + ivec2(0, 1)) - luma_at(pixel - ivec2(0, 1)));
+    return clamp(horizontal + vertical, 0.0, 1.0);
+}
+
+float temporal_stability(ivec2 pixel, vec2 motion) {
+    ivec2 size = textureSize(previous_frame, 0);
+    vec2 uv = (clamp(vec2(pixel) + motion, vec2(0.0), vec2(size) - vec2(1.0)) + 0.5) / vec2(size);
+    vec3 previous_sample = texture(previous_frame, uv).rgb;
+    if (any(isnan(previous_sample)) || any(isinf(previous_sample))) previous_sample = vec3(0.0);
+    float previous = dot(clamp(previous_sample, vec3(0.0), vec3(1.0)), LUMA);
+    float current = luma_at(pixel);
+    float difference = abs(current - previous);
+    return 1.0 - smoothstep(0.01, 0.35, difference);
+}
+
+float relative_parallax(ivec2 pixel, vec2 motion) {
+    // This is a residual parallax proxy, never camera-space or game depth.
+    float residual = clamp(length(motion - affine_flow(pixel)) / 6.0, 0.0, 1.0);
+    return smoothstep(0.25, 0.65, residual);
+}
+
+void write_residual_histogram(uvec2 q) {
+    uint local = gl_LocalInvocationIndex;
+    for (uint bin = local; bin < 32u; bin += 64u) histogram[bin] = 0u;
+    if (local == 0u) {
+        local_inliers = 0u;
+        local_reliable = 0u;
+    }
+    barrier();
+    bool reliable = false;
+    bool affine_inliers = false;
+    if (q.x < p.width && q.y < p.height && p.valid != 0u && p.provider_failure == 0u &&
+        depth_model.model[8] > 0.5) {
+        ivec2 pixel = ivec2(q);
+        vec2 motion = safe_motion(pixel);
+        reliable = safe_confidence(pixel) >= 0.20 && !any(isnan(motion)) && !any(isinf(motion)) &&
+            reprojectable(pixel, motion);
+        if (reliable) {
+            float residual = length(motion - affine_flow(pixel));
+            affine_inliers = residual <= depth_model.model[12];
+            float parallax = relative_parallax(pixel, motion);
+            float divergence = flow_divergence(pixel, motion);
+            float edge = luminance_edge(pixel);
+            float stability = temporal_stability(pixel, motion);
+            float temporal_change = 1.0 - stability;
+            float signal = clamp(0.90 * parallax + 0.05 * divergence +
+                0.03 * edge + 0.02 * temporal_change, 0.0, 1.0);
+            atomicAdd(histogram[uint(clamp(signal * 31.0, 0.0, 31.0))], 1u);
+            atomicAdd(local_reliable, 1u);
+            if (affine_inliers) atomicAdd(local_inliers, 1u);
+            imageStore(depth_image, pixel, vec4(signal));
+        }
+    }
+    if (q.x < p.width && q.y < p.height && !reliable) {
+        // Unsupported samples inherit the far side of the relative range;
+        // frame-level failure is handled separately as exact FlatFallback=1.
+        imageStore(depth_image, ivec2(q), vec4(0.0));
+    }
+    barrier();
+    if (local == 0u) {
+        uint groups_x = (p.width + 7u) / 8u;
+        uint group = gl_WorkGroupID.y * groups_x + gl_WorkGroupID.x;
+        uint base = group * DEPTH_RECORD_WORDS;
+        for (uint bin = 0u; bin < 32u; ++bin) {
+            depth_partials.normal_equations[base + 32u + bin] = float(histogram[bin]);
+        }
+        // The histogram is over all reliable samples; inliers are tracked
+        // separately so the exact 50% affine-support threshold remains visible.
+        depth_partials.normal_equations[base + 64u] = float(local_inliers);
+        depth_partials.normal_equations[base + 65u] = float(local_reliable);
+    }
+    barrier();
+}
+
+float histogram_percentile(float total, float q) {
+    float target = q * max(total - 1.0, 0.0);
+    float cumulative = 0.0;
+    uint groups_x = (p.width + 7u) / 8u;
+    uint groups_y = (p.height + 7u) / 8u;
+    for (uint bin = 0u; bin < 32u; ++bin) {
+        for (uint group = 0u; group < groups_x * groups_y; ++group) {
+            cumulative += depth_partials.normal_equations[group * DEPTH_RECORD_WORDS + bin + 32u];
+        }
+        if (cumulative > target) return (float(bin) + 0.5) / 32.0;
+    }
+    return 1.0;
+}
+
+void finalize_percentiles() {
+    if (gl_GlobalInvocationID.x != 0u || gl_GlobalInvocationID.y != 0u) return;
+    uint groups_x = (p.width + 7u) / 8u;
+    uint groups_y = (p.height + 7u) / 8u;
+    uint group_count = groups_x * groups_y;
+    float total = 0.0;
+    float inliers = 0.0;
+    for (uint group = 0u; group < group_count; ++group) {
+        uint base = group * DEPTH_RECORD_WORDS;
+        inliers += max(depth_partials.normal_equations[base + 64u], 0.0);
+        total += max(depth_partials.normal_equations[base + 65u], 0.0);
+    }
+    float ratio = total > 0.0 ? inliers / total : 0.0;
+    float percentile_5 = 0.0;
+    float percentile_95 = 1.0;
+    if (total > 0.0 && depth_model.model[8] > 0.5) {
+        percentile_5 = histogram_percentile(total, 0.05);
+        percentile_95 = histogram_percentile(total, 0.95);
+    }
+    bool supported = depth_model.model[8] > 0.5 && total > 0.0 &&
+        inliers >= total * AFFINE_INLIER_FRACTION && finite(percentile_5) && finite(percentile_95) &&
+        percentile_95 - percentile_5 > 0.02;
+    depth_model.model[8] = supported ? 1.0 : 0.0;
+    depth_model.model[9] = finite(ratio) ? ratio : 0.0;
+    depth_model.model[10] = supported ? percentile_5 : 0.0;
+    depth_model.model[11] = supported ? percentile_95 : 1.0;
+}
+
+void normalize_depth(uvec2 q) {
+    if (q.x >= p.width || q.y >= p.height) return;
+    ivec2 pixel = ivec2(q);
+    // FlatFallback is always exactly one; RelativeNearIsOne maps the robust
+    // relative signal so the nearest observed discontinuity approaches one.
+    if (p.valid == 0u || p.provider_failure != 0u || depth_model.model[8] < 0.5) {
+        imageStore(depth_image, pixel, vec4(1.0));
+        return;
+    }
+    float value = imageLoad(depth_image, pixel).r;
+    float range = depth_model.model[11] - depth_model.model[10];
+    float normalized = (finite(value) && finite(range) && range > 0.02)
+        ? clamp((value - depth_model.model[10]) / range, 0.0, 1.0)
+        : 1.0;
+    imageStore(depth_image, pixel, vec4(finite(normalized) ? mix(0.12, 1.0, normalized) : 1.0));
+}
+
+void main() {
+    if (p.mode == 2u) {
+        if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u) solve_global_affine();
+    } else if (p.mode == 3u) {
+        write_residual_histogram(gl_GlobalInvocationID.xy);
+    } else if (p.mode == 4u) {
+        finalize_percentiles();
+    } else if (p.mode == 5u) {
+        normalize_depth(gl_GlobalInvocationID.xy);
+    }
+}

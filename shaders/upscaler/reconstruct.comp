@@ -45,6 +45,23 @@ vec3 neighborhood_max(vec2 uv) {
     return result;
 }
 
+float depth_discontinuity(ivec2 pixel) {
+    ivec2 size = imageSize(depth_image);
+    ivec2 center_pixel = clamp(pixel, ivec2(0), size - 1);
+    float center = imageLoad(depth_image, center_pixel).r;
+    if (isnan(center) || isinf(center)) return 1.0;
+    float gradient = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 neighbour = clamp(center_pixel + ivec2(x, y), ivec2(0), size - 1);
+            float value = imageLoad(depth_image, neighbour).r;
+            if (isnan(value) || isinf(value)) return 1.0;
+            gradient = max(gradient, abs(value - center));
+        }
+    }
+    return clamp(gradient * 4.0, 0.0, 1.0);
+}
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (pixel.x >= int(p.width) || pixel.y >= int(p.height)) {
@@ -100,10 +117,11 @@ void main() {
     float reactive = imageLoad(reactive_image, input_pixel).r;
     float disocclusion = imageLoad(disocclusion_image, input_pixel).r;
     float exposure = max(imageLoad(exposure_image, ivec2(0)).r, 0.001);
-    float depth = imageLoad(depth_image, input_pixel).r;
+    float depth_edge = depth_discontinuity(input_pixel);
+    float depth_rejection = smoothstep(0.03, 0.20, depth_edge);
     float history_weight = (p.valid != 0 && p.reset == 0)
         ? clamp(0.08 + confidence * 0.82, 0.08, 0.9)
-            * (1.0 - reactive) * (1.0 - disocclusion) * clamp(depth, 0.0, 1.0)
+            * (1.0 - reactive) * (1.0 - disocclusion) * (1.0 - depth_rejection)
         : 0.0;
     vec3 resolved = mix(current.rgb * exposure, history, history_weight);
     imageStore(output_image, pixel, vec4(max(resolved, vec3(0.0)), current.a));

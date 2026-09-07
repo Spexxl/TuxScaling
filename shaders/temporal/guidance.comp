@@ -20,6 +20,11 @@ layout(r8,binding=9) uniform image2D transparency_image;
 layout(std430,binding=10) readonly buffer CompactStats { uint partials[]; } statistics;
 layout(binding=11) uniform sampler2D previous_transparency;
 layout(r8,binding=12) uniform image2D transparency_residual_image;
+// Each 8x8 workgroup writes one compact set of weighted normal equations.
+// The follow-up depth reduction solves the global affine model without any
+// atomics or device readback.
+layout(std430,binding=13) buffer DepthPartials { float normal_equations[]; } depth_partials;
+layout(std430,binding=14) buffer DepthModel { float model[]; } depth_model;
 
 layout(push_constant) uniform Params {
     uint width;
@@ -34,6 +39,10 @@ layout(push_constant) uniform Params {
 
 const float EPSILON = 1e-4;
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+const uint DEPTH_RECORD_WORDS = 80u;
+const uint NORMAL_EQUATION_WORDS = 32u;
+
+shared float affine_terms[64u * NORMAL_EQUATION_WORDS];
 
 bool finite(float value) { return !isnan(value) && !isinf(value); }
 
@@ -84,6 +93,71 @@ float local_variance(ivec2 pixel, float mean) {
         sum += pow(luminance(safe_current(n)) - mean, 2.0);
     }
     return sqrt(sum / 9.0);
+}
+
+uint normal_index(uint row, uint column) {
+    uint a = min(row, column);
+    uint b = max(row, column);
+    return a * 6u - (a * (a - 1u)) / 2u + (b - a);
+}
+
+vec3 affine_coordinates(ivec2 pixel) {
+    return vec3(
+        (2.0 * (float(pixel.x) + 0.5) - float(p.width)) / max(float(p.width), 1.0),
+        (2.0 * (float(pixel.y) + 0.5) - float(p.height)) / max(float(p.height), 1.0),
+        1.0);
+}
+
+bool reprojectable(ivec2 pixel, vec2 motion) {
+    vec2 target = vec2(pixel) + motion;
+    return all(greaterThanEqual(target, vec2(0.0))) &&
+        all(lessThan(target, vec2(p.width, p.height)));
+}
+
+void write_normal_equations(uvec2 q) {
+    uint local = gl_LocalInvocationIndex;
+    uint local_base = local * NORMAL_EQUATION_WORDS;
+    for (uint i = 0u; i < NORMAL_EQUATION_WORDS; ++i) affine_terms[local_base + i] = 0.0;
+    bool inside = q.x < p.width && q.y < p.height;
+    ivec2 pixel = ivec2(q);
+    vec2 motion = inside ? safe_motion(pixel) : vec2(0.0);
+    float confidence = inside ? safe_confidence(pixel) : 0.0;
+    bool reliable = inside && p.valid != 0u && p.provider_failure == 0u &&
+        confidence >= 0.20 && !any(isnan(motion)) && !any(isinf(motion)) &&
+        reprojectable(pixel, motion);
+    if (reliable) {
+        vec3 basis = affine_coordinates(pixel);
+        float weight = clamp(confidence, 0.1, 1.0);
+        for (uint row = 0u; row < 3u; ++row) {
+            for (uint column = row; column < 3u; ++column) {
+                float normal = weight * basis[row] * basis[column];
+                affine_terms[local_base + normal_index(row, column)] = normal;
+                affine_terms[local_base + normal_index(row + 3u, column + 3u)] = normal;
+            }
+            affine_terms[local_base + 21u + row] = weight * basis[row] * motion.x;
+            affine_terms[local_base + 24u + row] = weight * basis[row] * motion.y;
+        }
+        affine_terms[local_base + 27u] = weight * motion.x;
+        affine_terms[local_base + 28u] = weight * motion.y;
+        affine_terms[local_base + 29u] = weight * length(motion);
+        affine_terms[local_base + 30u] = weight;
+        affine_terms[local_base + 31u] = 1.0;
+    }
+    barrier();
+    if (local == 0u) {
+        uint groups_x = (p.width + 7u) / 8u;
+        uint group = gl_WorkGroupID.y * groups_x + gl_WorkGroupID.x;
+        uint output_base = group * DEPTH_RECORD_WORDS;
+        for (uint slot = 0u; slot < NORMAL_EQUATION_WORDS; ++slot) {
+            float total = 0.0;
+            for (uint lane = 0u; lane < 64u; ++lane) total += affine_terms[lane * NORMAL_EQUATION_WORDS + slot];
+            depth_partials.normal_equations[output_base + slot] = finite(total) ? total : 0.0;
+        }
+        for (uint slot = NORMAL_EQUATION_WORDS; slot < DEPTH_RECORD_WORDS; ++slot) {
+            depth_partials.normal_equations[output_base + slot] = 0.0;
+        }
+    }
+    barrier();
 }
 
 // Forward-flow occupancy is estimated by testing how many nearby dense-flow
@@ -168,6 +242,7 @@ void write_fallback(ivec2 pixel) {
 
 void main() {
     uvec2 q = gl_GlobalInvocationID.xy;
+    if (p.mode == 0u) write_normal_equations(q);
     if (q.x == 0u && q.y == 0u && p.mode == 1u) {
         float old_exposure = imageLoad(exposure_image, ivec2(0)).r;
         if (!finite(old_exposure) || old_exposure <= 0.0) old_exposure = 1.0;
