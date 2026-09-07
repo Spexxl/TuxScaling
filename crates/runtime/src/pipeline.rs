@@ -1,6 +1,7 @@
 use super::{Capture, SwapchainInfo};
 use ash::vk;
 use std::time::{Duration, Instant};
+use tuxscaling_capture::JitterState;
 use tuxscaling_config::Config;
 use tuxscaling_motion::{MotionEstimator, MotionQuality};
 use tuxscaling_temporal::{FrameTiming, GuidanceEstimator, GuidanceReset, History};
@@ -103,6 +104,7 @@ pub struct TemporalPipeline {
     pub(crate) timestamp_period: f32,
     pub(crate) timings: Vec<[f32; super::GPU_PHASES]>,
     pub(crate) config: Config,
+    pub(crate) jitter: JitterState,
 }
 
 impl TemporalPipeline {
@@ -242,6 +244,7 @@ impl TemporalPipeline {
             timestamp_period,
             timings: Vec::new(),
             config: config.clone(),
+            jitter: JitterState::new(config.jitter_mode),
         })
     }
 
@@ -280,6 +283,23 @@ impl TemporalPipeline {
             timestamp_period: 0.0,
             timings: Vec::new(),
             config: Config::default(),
+            jitter: JitterState::default(),
+        }
+    }
+
+    pub(crate) fn reset_history(&mut self, reason: GuidanceReset) {
+        self.reset_history_preserving_jitter(reason);
+        self.jitter.reset();
+    }
+
+    pub(crate) fn reset_history_preserving_jitter(&mut self, reason: GuidanceReset) {
+        self.history.reset();
+        self.reset_reason = reason;
+        if let Some(guidance) = &mut self.guidance {
+            guidance.reset_history();
+        }
+        if let Some(upscaler) = &mut self.upscaler {
+            upscaler.reset();
         }
     }
 }

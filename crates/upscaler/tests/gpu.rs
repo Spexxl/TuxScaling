@@ -521,4 +521,49 @@ fn disoccluded_reconstruction_does_not_exceed_bilinear_baseline() {
         "disoccluded reconstruction error: reconstructed={reconstructed_error:.6} bilinear={bilinear_error:.6}"
     );
     assert!(reconstructed_error <= bilinear_error + 0.001);
+
+    upscaler.reset();
+    first_guidance.jitter = JitterSample::default();
+    first_guidance.depth_semantics = DepthSemantics::FlatFallback;
+    second_guidance.jitter = JitterSample {
+        current: [0.25, 0.0],
+        previous: [0.0, 0.0],
+        phase: 1,
+    };
+    second_guidance.depth_semantics = DepthSemantics::FlatFallback;
+    unsafe {
+        upload_image(
+            &gpu,
+            &input,
+            &staging,
+            &frame(input_extent, false),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            input_extent,
+        );
+        gpu.submit(|command| {
+            upscaler.record(command, swapchain.handle, first_guidance, false, 0, 0, 0)
+        });
+        upload_image(
+            &gpu,
+            &input,
+            &staging,
+            &frame(input_extent, true),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            input_extent,
+        );
+        gpu.submit(|command| {
+            upscaler.record(command, swapchain.handle, second_guidance, true, 0, 0, 0)
+        });
+    }
+    let jittered = unsafe { read_output(&gpu, &upscaler, &readback) };
+    let different_pixels = reconstructed
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(jittered.as_chunks::<4>().0.iter())
+        .filter(|(baseline, jittered)| baseline != jittered)
+        .count();
+    assert!(different_pixels > 0);
 }

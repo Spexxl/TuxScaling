@@ -722,6 +722,9 @@ impl GuidanceEstimator {
     ) {
         self.provider_failure = true;
         self.history_initialized = false;
+        if !self.initialized {
+            return;
+        }
         unsafe { self.record_inner(command, false, FrameTiming::default(), None, slot) };
     }
 

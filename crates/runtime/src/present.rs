@@ -1,10 +1,12 @@
 #![allow(clippy::missing_safety_doc)]
 use ash::vk;
+use std::time::Instant;
 use tuxscaling_capture::Capture;
+use tuxscaling_config::DebugView;
 use tuxscaling_motion::MotionQuality;
 use tuxscaling_overlay::FrameDiagnostics;
 use tuxscaling_overlay_vulkan::{OverlayRenderer, SwapchainInfo};
-use tuxscaling_temporal::{FrameExtent, GuidanceReset};
+use tuxscaling_temporal::{DepthSemantics, FrameExtent, GuidanceReset, SignalState};
 use tuxscaling_upscaler::{ResolutionPlan, content_viewport};
 use tuxscaling_vulkan::{image_barrier, memory_barrier};
 
@@ -92,6 +94,51 @@ fn debug_mode_id(name: &str) -> Option<u32> {
         "exposure" => 10,
         _ => return None,
     })
+}
+
+fn debug_view_id(view: DebugView) -> u32 {
+    match view {
+        DebugView::Original => 0,
+        DebugView::Luminance => 1,
+        DebugView::Motion => 2,
+        DebugView::Confidence => 3,
+        DebugView::Reconstructed => 4,
+        DebugView::History => 5,
+        DebugView::Reactive => 6,
+        DebugView::Disocclusion => 7,
+        DebugView::Depth => 8,
+        DebugView::Composition => 9,
+        DebugView::Exposure => 10,
+    }
+}
+
+fn signal_name(state: SignalState) -> &'static str {
+    match state {
+        SignalState::Estimated => "Estimated",
+        SignalState::ConstantFallback => "ConstantFallback",
+        SignalState::Unavailable => "Unavailable",
+    }
+}
+
+fn depth_semantics_name(semantics: DepthSemantics) -> &'static str {
+    match semantics {
+        DepthSemantics::RelativeNearIsOne => "RelativeNearIsOne",
+        DepthSemantics::FlatFallback => "FlatFallback",
+    }
+}
+
+fn reset_name(reset: GuidanceReset) -> &'static str {
+    match reset {
+        GuidanceReset::None => "None",
+        GuidanceReset::Initialize => "Initialize",
+        GuidanceReset::Resize => "Resize",
+        GuidanceReset::SceneChange => "SceneChange",
+        GuidanceReset::CaptureInterrupted => "CaptureInterrupted",
+        GuidanceReset::Presentation => "Presentation",
+        GuidanceReset::LongPause => "LongPause",
+        GuidanceReset::PresetChanged => "PresetChanged",
+        GuidanceReset::ProviderFailure => "ProviderFailure",
+    }
 }
 
 fn motion_quality(quality: tuxscaling_config::MotionQuality) -> MotionQuality {
@@ -356,7 +403,7 @@ impl SwapchainRuntime {
                 eprintln!("TuxScaling: unsupported TUXSCALING_VIEW={value}");
                 vk::Result::ERROR_INITIALIZATION_FAILED
             })?,
-            Err(_) => config.debug_view as u32,
+            Err(_) => debug_view_id(config.debug_view),
         };
         let diagnostic_resolution = temporal.resolution;
         Ok(Self {
@@ -385,6 +432,9 @@ impl SwapchainRuntime {
                 .into(),
                 mode: mode_name(mode).into(),
                 quality: config.motion_quality,
+                jitter_mode: config.jitter_mode,
+                debug_view: config.debug_view,
+                reset_reason: reset_name(GuidanceReset::Initialize).into(),
                 processing_scale: config.processing_scale,
                 presentation_mode: if !capture_enabled {
                     "Fallback: unsupported capture"
@@ -414,6 +464,16 @@ impl SwapchainRuntime {
     }
     pub fn disable(&mut self) {
         self.enabled = false;
+        self.temporal.history.reset();
+        if let Some(guidance) = &mut self.temporal.guidance {
+            guidance.reset_history();
+        }
+        if let Some(upscaler) = &mut self.temporal.upscaler {
+            upscaler.reset();
+        }
+        self.temporal.reset_reason = GuidanceReset::CaptureInterrupted;
+        self.temporal.jitter.reset();
+        self.diagnostics.reset_reason = reset_name(GuidanceReset::CaptureInterrupted).into();
     }
     pub fn map_damage_rect(&self, rect: vk::Rect2D) -> vk::Rect2D {
         map_damage_rect(
@@ -525,6 +585,8 @@ impl SwapchainRuntime {
         }
         self.diagnostics.processing_scale = scale;
         self.temporal.reset_reason = GuidanceReset::PresetChanged;
+        self.temporal.jitter.reset();
+        self.diagnostics.jitter_mode = self.temporal.jitter.mode();
         if self.temporal.timestamp_period > 0.0 {
             self.temporal.queries = unsafe {
                 self.device.create_query_pool(
@@ -580,14 +642,7 @@ impl SwapchainRuntime {
             if let Some(motion) = &mut self.temporal.motion {
                 motion.set_quality(quality);
             }
-            self.temporal.history.reset();
-            self.temporal.reset_reason = GuidanceReset::PresetChanged;
-            if let Some(guidance) = &mut self.temporal.guidance {
-                guidance.reset_history();
-            }
-            if let Some(upscaler) = &mut self.temporal.upscaler {
-                upscaler.reset();
-            }
+            self.temporal.reset_history(GuidanceReset::PresetChanged);
             self.diagnostics.state = "Preset changed; history reset".into();
         }
         if self.temporal.query_ready[index] && self.temporal.queries != vk::QueryPool::null() {
@@ -662,11 +717,52 @@ impl SwapchainRuntime {
         let (timing, timing_reset) = self.temporal.timing.sample(self.temporal.pending_time);
         self.temporal.pending_timing = timing;
         self.diagnostics.frame_delta_ms = timing.raw.as_secs_f32() * 1_000.0;
+        self.diagnostics.frame_delta_raw_ms = timing.raw.as_secs_f32() * 1_000.0;
+        self.diagnostics.frame_delta_validated_ms = timing.validated.as_secs_f32() * 1_000.0;
+        self.diagnostics.frame_delta_smoothed_ms = timing.smoothed.as_secs_f32() * 1_000.0;
         if timing_reset.is_some() {
-            self.temporal.reset_reason = GuidanceReset::LongPause;
-            self.temporal.history.reset();
+            self.temporal.reset_history(GuidanceReset::LongPause);
         }
+        let cpu_overlay_start = Instant::now();
+        let frame = self.overlay.as_mut().unwrap().prepare(
+            queue,
+            self.pool,
+            index,
+            &mut self.diagnostics,
+        )?;
+        self.diagnostics.overlay_cpu_ms = cpu_overlay_start.elapsed().as_secs_f32() * 1_000.0;
+        if let Some(quality) = frame.requested_quality {
+            self.temporal.pending_quality = Some(motion_quality(quality));
+        }
+        if let Some(scale) = frame.requested_processing_scale {
+            self.temporal.pending_processing_scale = Some(scale);
+        }
+        if let Some(mode) = frame.requested_jitter_mode
+            && self.temporal.jitter.set_mode(mode)
+        {
+            self.temporal.config.jitter_mode = mode;
+            self.temporal.reset_history(GuidanceReset::PresetChanged);
+            self.diagnostics.state = "Jitter mode changed; history reset".into();
+        }
+        if let Some(view) = frame.requested_debug_view {
+            self.mode = debug_view_id(view);
+            self.diagnostics.debug_view = view;
+            self.diagnostics.mode = mode_name(self.mode).into();
+        }
+        let jitter = self.temporal.jitter.sample();
+        if self.temporal.jitter.take_phase_restart() {
+            self.temporal
+                .reset_history_preserving_jitter(GuidanceReset::PresetChanged);
+            self.diagnostics.state = "Jitter phase restarted; history reset".into();
+        }
+        self.diagnostics.jitter_mode = self.temporal.jitter.mode();
         let valid = self.temporal.history.valid(self.temporal.pending_time);
+        self.diagnostics.reset_reason = reset_name(if valid {
+            GuidanceReset::None
+        } else {
+            self.temporal.reset_reason
+        })
+        .into();
         if self.temporal.motion.is_some() {
             self.diagnostics.state = if valid {
                 "Estimated motion"
@@ -675,19 +771,47 @@ impl SwapchainRuntime {
             }
             .into();
         }
+        for state in [
+            &mut self.diagnostics.motion_state,
+            &mut self.diagnostics.confidence_state,
+            &mut self.diagnostics.reactive_state,
+            &mut self.diagnostics.disocclusion_state,
+            &mut self.diagnostics.exposure_state,
+            &mut self.diagnostics.depth_state,
+            &mut self.diagnostics.composition_state,
+            &mut self.diagnostics.jitter_state,
+        ] {
+            *state = "Unavailable".into();
+        }
+        self.diagnostics.depth_semantics = "FlatFallback".into();
         let guidance_view = match (&self.temporal.guidance, &self.temporal.motion) {
-            (Some(guidance), Some(motion)) => Some(guidance.view(
-                motion,
-                self.temporal.history.frame_id + 1,
-                self.temporal.resolution.processing_extent,
-                valid,
-                self.temporal.pending_timing,
-                if valid {
-                    GuidanceReset::None
-                } else {
-                    self.temporal.reset_reason
-                },
-            )),
+            (Some(guidance), Some(motion)) => {
+                let mut view = guidance.view(
+                    motion,
+                    self.temporal.history.frame_id + 1,
+                    self.temporal.resolution.processing_extent,
+                    valid,
+                    self.temporal.pending_timing,
+                    if valid {
+                        GuidanceReset::None
+                    } else {
+                        self.temporal.reset_reason
+                    },
+                );
+                view.jitter = jitter;
+                self.diagnostics.motion_state = signal_name(view.motion.state).into();
+                self.diagnostics.confidence_state = signal_name(view.confidence.state).into();
+                self.diagnostics.reactive_state = signal_name(view.reactive.state).into();
+                self.diagnostics.disocclusion_state = signal_name(view.disocclusion.state).into();
+                self.diagnostics.exposure_state = signal_name(view.exposure.state).into();
+                self.diagnostics.depth_state = signal_name(view.depth.state).into();
+                self.diagnostics.composition_state =
+                    signal_name(view.transparency_composition.state).into();
+                self.diagnostics.jitter_state = signal_name(view.jitter.signal_state()).into();
+                self.diagnostics.depth_semantics =
+                    depth_semantics_name(view.depth_semantics).into();
+                Some(view)
+            }
             _ => None,
         };
         let guidance_view = guidance_view.and_then(|view| {
@@ -702,18 +826,6 @@ impl SwapchainRuntime {
                 None
             }
         });
-        let frame = self.overlay.as_mut().unwrap().prepare(
-            queue,
-            self.pool,
-            index,
-            &mut self.diagnostics,
-        )?;
-        if let Some(quality) = frame.requested_quality {
-            self.temporal.pending_quality = Some(motion_quality(quality));
-        }
-        if let Some(scale) = frame.requested_processing_scale {
-            self.temporal.pending_processing_scale = Some(scale);
-        }
         unsafe {
             self.device
                 .reset_command_buffer(slot.command, vk::CommandBufferResetFlags::empty())?;
@@ -737,7 +849,8 @@ impl SwapchainRuntime {
                 );
             }
             if let Some(capture) = &mut self.temporal.capture {
-                capture.record_scaled_from(
+                let cpu_start = Instant::now();
+                capture.record_scaled_from_with_jitter(
                     &self.device,
                     slot.command,
                     self.game_images[index],
@@ -748,7 +861,9 @@ impl SwapchainRuntime {
                     } else {
                         vk::ImageLayout::PRESENT_SRC_KHR
                     },
+                    jitter,
                 );
+                self.diagnostics.capture_cpu_ms = cpu_start.elapsed().as_secs_f32() * 1_000.0;
             } else {
                 image_barrier(
                     &self.device,
@@ -767,6 +882,7 @@ impl SwapchainRuntime {
                 );
             }
             if let Some(motion) = &mut self.temporal.motion {
+                let cpu_start = Instant::now();
                 if self.temporal.queries != vk::QueryPool::null() {
                     motion.record_timed(
                         slot.command,
@@ -785,6 +901,7 @@ impl SwapchainRuntime {
                     );
                 }
                 memory_barrier(&self.device, slot.command);
+                self.diagnostics.motion_cpu_ms = cpu_start.elapsed().as_secs_f32() * 1_000.0;
             } else if self.temporal.queries != vk::QueryPool::null() {
                 for offset in 2..=10 {
                     self.device.cmd_write_timestamp(
@@ -796,6 +913,7 @@ impl SwapchainRuntime {
                 }
             }
             if let Some(guidance) = &mut self.temporal.guidance {
+                let cpu_start = Instant::now();
                 if self.temporal.queries != vk::QueryPool::null() {
                     self.device.cmd_reset_query_pool(
                         slot.command,
@@ -820,6 +938,7 @@ impl SwapchainRuntime {
                     );
                 }
                 memory_barrier(&self.device, slot.command);
+                self.diagnostics.guidance_cpu_ms = cpu_start.elapsed().as_secs_f32() * 1_000.0;
             } else if self.temporal.queries != vk::QueryPool::null() {
                 for offset in 11..=13 {
                     self.device.cmd_write_timestamp(
@@ -840,6 +959,7 @@ impl SwapchainRuntime {
                 );
             }
             if let (Some(upscaler), Some(guidance)) = (&mut self.temporal.upscaler, guidance_view) {
+                let cpu_start = Instant::now();
                 upscaler.record(
                     slot.command,
                     self.output_images[index],
@@ -856,6 +976,8 @@ impl SwapchainRuntime {
                         _ => 0,
                     },
                 );
+                self.diagnostics.reconstruction_cpu_ms =
+                    cpu_start.elapsed().as_secs_f32() * 1_000.0;
             } else if self.game_images[index] != self.output_images[index]
                 && let Some(capture) = &self.temporal.capture
             {
@@ -949,10 +1071,12 @@ impl SwapchainRuntime {
                     index as u32 * GPU_TIMESTAMPS as u32 + 14,
                 );
             }
+            let cpu_start = Instant::now();
             self.overlay
                 .as_mut()
                 .unwrap()
                 .record(slot.command, index, &frame)?;
+            self.diagnostics.overlay_cpu_ms = cpu_start.elapsed().as_secs_f32() * 1_000.0;
             image_barrier(
                 &self.device,
                 slot.command,
@@ -1005,14 +1129,7 @@ impl SwapchainRuntime {
             .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
         unsafe { self.device.wait_for_fences(&[slot.fence], true, u64::MAX) }?;
         eprintln!("TuxScaling: temporal processing failed ({reason:?}); using spatial fallback");
-        self.temporal.history.reset();
-        self.temporal.reset_reason = GuidanceReset::ProviderFailure;
-        if let Some(guidance) = &mut self.temporal.guidance {
-            guidance.reset_history();
-        }
-        if let Some(upscaler) = &mut self.temporal.upscaler {
-            upscaler.reset();
-        }
+        self.temporal.reset_history(GuidanceReset::ProviderFailure);
         self.diagnostics.state = "Temporal failure; spatial fallback".into();
         let frame = self
             .overlay
@@ -1093,10 +1210,7 @@ impl SwapchainRuntime {
         self.diagnostics.frame_id = self.temporal.history.frame_id;
     }
     pub fn presentation_failed(&mut self) {
-        self.temporal.history.reset();
-        if let Some(guidance) = &mut self.temporal.guidance {
-            guidance.reset_history();
-        }
+        self.temporal.reset_history(GuidanceReset::Presentation);
         self.output_presented.fill(false);
     }
     pub unsafe fn destroy(self, _device: &ash::Device) {

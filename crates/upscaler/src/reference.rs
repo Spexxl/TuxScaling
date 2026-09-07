@@ -1,7 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 use ash::vk;
-use tuxscaling_temporal::GuidanceView;
+use tuxscaling_temporal::{DepthSemantics, GuidanceView};
 use tuxscaling_vulkan::{Image, image_barrier, memory_barrier};
 
 pub fn scaled_extent(output: vk::Extent2D, scale: f32) -> vk::Extent2D {
@@ -178,7 +178,7 @@ impl ReferenceUpscaler {
                     .push_constant_ranges(&[vk::PushConstantRange {
                         stage_flags: vk::ShaderStageFlags::COMPUTE,
                         offset: 0,
-                        size: 36,
+                        size: 64,
                     }]),
                 None,
             )
@@ -300,6 +300,16 @@ impl ReferenceUpscaler {
                 u32::from(valid && !guidance.requires_history_reset),
                 u32::from(guidance.requires_history_reset),
                 debug_view,
+                u32::from(matches!(
+                    guidance.depth_semantics,
+                    DepthSemantics::RelativeNearIsOne
+                )),
+                guidance.jitter.current[0].to_bits(),
+                guidance.jitter.current[1].to_bits(),
+                guidance.jitter.previous[0].to_bits(),
+                guidance.jitter.previous[1].to_bits(),
+                guidance.pre_exposure.to_bits(),
+                guidance.timing.validated.as_secs_f32().to_bits(),
             ];
             self.device.cmd_push_constants(
                 command,
@@ -488,5 +498,28 @@ mod tests {
             }
         );
         assert_eq!(scaled_extent(output, 1.2), output);
+    }
+
+    #[test]
+    fn reconstruction_contract_consumes_timing_semantics_and_jitter() {
+        let shader = include_str!("../../../shaders/upscaler/reconstruct.comp");
+        for token in [
+            "current_jitter",
+            "previous_jitter",
+            "pre_exposure",
+            "depth_semantics",
+            "frame_delta",
+            "motion_image",
+            "reactive_image",
+            "disocclusion_image",
+            "exposure_image",
+            "depth_image",
+            "composition_image",
+        ] {
+            assert!(
+                shader.contains(token),
+                "reconstruction shader lacks {token}"
+            );
+        }
     }
 }

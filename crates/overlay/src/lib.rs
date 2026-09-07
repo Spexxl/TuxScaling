@@ -1,5 +1,5 @@
 use egui::{ClippedPrimitive, Context, RawInput, Rect, TexturesDelta, vec2};
-use tuxscaling_config::{DebugView, MotionQuality};
+use tuxscaling_config::{DebugView, JitterMode, MotionQuality};
 
 pub const CRATE_NAME: &str = "tuxscaling-overlay";
 
@@ -11,12 +11,34 @@ pub struct FrameDiagnostics {
     pub quality: MotionQuality,
     pub requested_quality: Option<MotionQuality>,
     pub requested_processing_scale: Option<f32>,
+    pub requested_jitter_mode: Option<JitterMode>,
+    pub requested_debug_view: Option<DebugView>,
+    pub jitter_mode: JitterMode,
+    pub debug_view: DebugView,
     pub processing_scale: f32,
     pub game_extent: [u32; 2],
     pub processing_extent: [u32; 2],
     pub output_extent: [u32; 2],
     pub presentation_mode: String,
     pub frame_delta_ms: f32,
+    pub frame_delta_raw_ms: f32,
+    pub frame_delta_validated_ms: f32,
+    pub frame_delta_smoothed_ms: f32,
+    pub reset_reason: String,
+    pub motion_state: String,
+    pub confidence_state: String,
+    pub reactive_state: String,
+    pub disocclusion_state: String,
+    pub exposure_state: String,
+    pub depth_state: String,
+    pub composition_state: String,
+    pub jitter_state: String,
+    pub depth_semantics: String,
+    pub capture_cpu_ms: f32,
+    pub motion_cpu_ms: f32,
+    pub guidance_cpu_ms: f32,
+    pub reconstruction_cpu_ms: f32,
+    pub overlay_cpu_ms: f32,
     pub capture_ms: f32,
     pub luma_ms: f32,
     pub pyramid_ms: f32,
@@ -75,6 +97,8 @@ pub fn render_diagnostics(
 ) -> OverlayFrame {
     diagnostics.requested_quality = None;
     diagnostics.requested_processing_scale = None;
+    diagnostics.requested_jitter_mode = None;
+    diagnostics.requested_debug_view = None;
     let output = context.run(
         RawInput {
             screen_rect: Some(Rect::from_min_size(
@@ -147,8 +171,77 @@ pub fn render_diagnostics(
                             ui.small(
                                 "This does not reduce the game's rendering workload.",
                             );
+                            let mut jitter_mode = diagnostics.jitter_mode;
+                            egui::ComboBox::from_label("Capture jitter")
+                                .selected_text(format_jitter_mode(jitter_mode))
+                                .show_ui(ui, |ui| {
+                                    for mode in [JitterMode::Off, JitterMode::ExperimentalHalton8] {
+                                        if ui
+                                            .selectable_value(
+                                                &mut jitter_mode,
+                                                mode,
+                                                format_jitter_mode(mode),
+                                            )
+                                            .changed()
+                                        {
+                                            diagnostics.requested_jitter_mode = Some(mode);
+                                        }
+                                    }
+                                });
+                            ui.small("Experimental jitter resamples captured color only.");
+                            let mut debug_view = diagnostics.debug_view;
+                            egui::ComboBox::from_label("Debug view")
+                                .selected_text(debug_view_label(debug_view))
+                                .show_ui(ui, |ui| {
+                                    for view in [
+                                        DebugView::Original,
+                                        DebugView::Luminance,
+                                        DebugView::Motion,
+                                        DebugView::Confidence,
+                                        DebugView::Reconstructed,
+                                        DebugView::History,
+                                        DebugView::Reactive,
+                                        DebugView::Disocclusion,
+                                        DebugView::Depth,
+                                        DebugView::Composition,
+                                        DebugView::Exposure,
+                                    ] {
+                                        if ui
+                                            .selectable_value(
+                                                &mut debug_view,
+                                                view,
+                                                debug_view_label(view),
+                                            )
+                                            .changed()
+                                        {
+                                            diagnostics.requested_debug_view = Some(view);
+                                        }
+                                    }
+                                });
                         });
                     ui.label(format!("Frame delta: {:.2} ms", diagnostics.frame_delta_ms));
+                    ui.label(format!(
+                        "Delta raw {:.2} | validated {:.2} | smoothed {:.2} ms",
+                        diagnostics.frame_delta_raw_ms,
+                        diagnostics.frame_delta_validated_ms,
+                        diagnostics.frame_delta_smoothed_ms
+                    ));
+                    ui.label(format!("Reset: {}", diagnostics.reset_reason));
+                    ui.label(format!(
+                        "Signals: motion {} | confidence {} | reactive {} | disocclusion {}",
+                        diagnostics.motion_state,
+                        diagnostics.confidence_state,
+                        diagnostics.reactive_state,
+                        diagnostics.disocclusion_state
+                    ));
+                    ui.label(format!(
+                        "Signals: exposure {} | depth {} ({}) | composition {} | jitter {}",
+                        diagnostics.exposure_state,
+                        diagnostics.depth_state,
+                        diagnostics.depth_semantics,
+                        diagnostics.composition_state,
+                        diagnostics.jitter_state
+                    ));
                     if diagnostics.budget_warning {
                         ui.colored_label(
                             egui::Color32::YELLOW,
@@ -183,6 +276,14 @@ pub fn render_diagnostics(
                         diagnostics.reactive_ms,
                         diagnostics.exposure_ms
                     ));
+                    ui.label(format!(
+                        "CPU ms: capture {:.2} | motion {:.2} | guidance {:.2} | reconstruction {:.2} | overlay {:.2}",
+                        diagnostics.capture_cpu_ms,
+                        diagnostics.motion_cpu_ms,
+                        diagnostics.guidance_cpu_ms,
+                        diagnostics.reconstruction_cpu_ms,
+                        diagnostics.overlay_cpu_ms
+                    ));
                     if diagnostics.p95_ms > 0.0 {
                         ui.label(format!("Temporal p95: {:.2} ms", diagnostics.p95_ms));
                     }
@@ -196,6 +297,8 @@ pub fn render_diagnostics(
         textures_delta: output.textures_delta,
         requested_quality: diagnostics.requested_quality,
         requested_processing_scale: diagnostics.requested_processing_scale,
+        requested_jitter_mode: diagnostics.requested_jitter_mode,
+        requested_debug_view: diagnostics.requested_debug_view,
     }
 }
 
@@ -208,6 +311,13 @@ fn format_quality(quality: MotionQuality) -> &'static str {
     }
 }
 
+fn format_jitter_mode(mode: JitterMode) -> &'static str {
+    match mode {
+        JitterMode::Off => "Off",
+        JitterMode::ExperimentalHalton8 => "Experimental Halton 8",
+    }
+}
+
 #[derive(Debug)]
 pub struct OverlayFrame {
     pub pixels_per_point: f32,
@@ -215,6 +325,8 @@ pub struct OverlayFrame {
     pub textures_delta: TexturesDelta,
     pub requested_quality: Option<MotionQuality>,
     pub requested_processing_scale: Option<f32>,
+    pub requested_jitter_mode: Option<JitterMode>,
+    pub requested_debug_view: Option<DebugView>,
 }
 
 pub fn render_smoke_frame(
@@ -249,6 +361,8 @@ pub fn render_smoke_frame(
         textures_delta: output.textures_delta,
         requested_quality: None,
         requested_processing_scale: None,
+        requested_jitter_mode: None,
+        requested_debug_view: None,
     }
 }
 
