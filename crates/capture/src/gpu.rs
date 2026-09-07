@@ -122,9 +122,47 @@ pub fn requires_scaling(source: vk::Extent2D, destination: vk::Extent2D) -> bool
     source != destination
 }
 
-pub struct Capture {
-    device: ash::Device,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureRoles {
+    pub source_extent: vk::Extent2D,
+    pub guidance_extent: vk::Extent2D,
+}
+
+pub const fn capture_roles(
+    game_extent: vk::Extent2D,
+    guidance_extent: vk::Extent2D,
+) -> CaptureRoles {
+    CaptureRoles {
+        source_extent: game_extent,
+        guidance_extent,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureMode {
+    DirectCopy,
+    Resample,
+}
+
+pub fn guidance_capture_mode(
+    source_extent: vk::Extent2D,
+    guidance_extent: vk::Extent2D,
+) -> CaptureMode {
+    if source_extent == guidance_extent {
+        CaptureMode::DirectCopy
+    } else {
+        CaptureMode::Resample
+    }
+}
+
+pub struct SourceCapture {
     pub color: Image,
+    initialized: bool,
+}
+
+pub struct GuidanceCapture {
+    device: ash::Device,
+    pub current: Image,
     pub previous: Image,
     resample_source: Image,
     sampler: vk::Sampler,
@@ -136,7 +174,128 @@ pub struct Capture {
     initialized: bool,
     resample_source_initialized: bool,
 }
-impl Capture {
+
+impl SourceCapture {
+    pub unsafe fn new(
+        device: &ash::Device,
+        memory: &vk::PhysicalDeviceMemoryProperties,
+        extent: vk::Extent2D,
+        format: vk::Format,
+    ) -> Result<Self, vk::Result> {
+        Ok(Self {
+            color: unsafe {
+                Image::new(
+                    device,
+                    memory,
+                    extent,
+                    format,
+                    vk::ImageUsageFlags::TRANSFER_SRC
+                        | vk::ImageUsageFlags::TRANSFER_DST
+                        | vk::ImageUsageFlags::SAMPLED
+                        | vk::ImageUsageFlags::STORAGE,
+                )
+            }?,
+            initialized: false,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn record_from(
+        &mut self,
+        device: &ash::Device,
+        command: vk::CommandBuffer,
+        source: vk::Image,
+        source_extent: vk::Extent2D,
+        layout: vk::ImageLayout,
+        final_layout: vk::ImageLayout,
+    ) {
+        let layers = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .layer_count(1);
+        unsafe {
+            image_barrier(
+                device,
+                command,
+                source,
+                layout,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+            image_barrier(
+                device,
+                command,
+                self.color.handle,
+                if self.initialized {
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                } else {
+                    vk::ImageLayout::UNDEFINED
+                },
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            );
+            if requires_scaling(source_extent, self.color.extent) {
+                device.cmd_blit_image(
+                    command,
+                    source,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    self.color.handle,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::ImageBlit::default()
+                        .src_subresource(layers)
+                        .dst_subresource(layers)
+                        .src_offsets([
+                            vk::Offset3D::default(),
+                            vk::Offset3D {
+                                x: source_extent.width as i32,
+                                y: source_extent.height as i32,
+                                z: 1,
+                            },
+                        ])
+                        .dst_offsets([
+                            vk::Offset3D::default(),
+                            vk::Offset3D {
+                                x: self.color.extent.width as i32,
+                                y: self.color.extent.height as i32,
+                                z: 1,
+                            },
+                        ])],
+                    vk::Filter::LINEAR,
+                );
+            } else {
+                device.cmd_copy_image(
+                    command,
+                    source,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    self.color.handle,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::ImageCopy::default()
+                        .src_subresource(layers)
+                        .dst_subresource(layers)
+                        .extent(vk::Extent3D {
+                            width: self.color.extent.width,
+                            height: self.color.extent.height,
+                            depth: 1,
+                        })],
+                );
+            }
+            image_barrier(
+                device,
+                command,
+                self.color.handle,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
+            image_barrier(
+                device,
+                command,
+                source,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                final_layout,
+            );
+        }
+        self.initialized = true;
+    }
+}
+
+impl GuidanceCapture {
     pub unsafe fn new(
         device: &ash::Device,
         memory: &vk::PhysicalDeviceMemoryProperties,
@@ -149,7 +308,7 @@ impl Capture {
             | vk::ImageUsageFlags::STORAGE;
         let mut result = Self {
             device: device.clone(),
-            color: unsafe { Image::new(device, memory, extent, format, usage) }?,
+            current: unsafe { Image::new(device, memory, extent, format, usage) }?,
             previous: unsafe { Image::new(device, memory, extent, format, usage) }?,
             resample_source: unsafe { Image::new(device, memory, extent, format, usage) }?,
             sampler: vk::Sampler::null(),
@@ -217,7 +376,7 @@ impl Capture {
             .image_view(result.resample_source.view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let storage = [vk::DescriptorImageInfo::default()
-            .image_view(result.color.view)
+            .image_view(result.current.view)
             .image_layout(vk::ImageLayout::GENERAL)];
         unsafe {
             device.update_descriptor_sets(
@@ -292,7 +451,7 @@ impl Capture {
         source: vk::Image,
         layout: vk::ImageLayout,
     ) {
-        let extent = self.color.extent;
+        let extent = self.current.extent;
         unsafe {
             self.record_scaled_from(
                 device,
@@ -344,7 +503,7 @@ impl Capture {
                 image_barrier(
                     device,
                     command,
-                    self.color.handle,
+                    self.current.handle,
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 );
@@ -360,7 +519,7 @@ impl Capture {
                     .layer_count(1);
                 device.cmd_copy_image(
                     command,
-                    self.color.handle,
+                    self.current.handle,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     self.previous.handle,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -368,15 +527,15 @@ impl Capture {
                         .src_subresource(layers)
                         .dst_subresource(layers)
                         .extent(vk::Extent3D {
-                            width: self.color.extent.width,
-                            height: self.color.extent.height,
+                            width: self.current.extent.width,
+                            height: self.current.extent.height,
                             depth: 1,
                         })],
                 );
                 image_barrier(
                     device,
                     command,
-                    self.color.handle,
+                    self.current.handle,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 );
@@ -496,7 +655,7 @@ impl Capture {
                 image_barrier(
                     device,
                     command,
-                    self.color.handle,
+                    self.current.handle,
                     if self.initialized {
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
                     } else {
@@ -514,8 +673,8 @@ impl Capture {
                     &[],
                 );
                 let params = [
-                    self.color.extent.width,
-                    self.color.extent.height,
+                    self.current.extent.width,
+                    self.current.extent.height,
                     jitter.current[0].to_bits(),
                     jitter.current[1].to_bits(),
                 ];
@@ -528,15 +687,15 @@ impl Capture {
                 );
                 device.cmd_dispatch(
                     command,
-                    self.color.extent.width.div_ceil(8),
-                    self.color.extent.height.div_ceil(8),
+                    self.current.extent.width.div_ceil(8),
+                    self.current.extent.height.div_ceil(8),
                     1,
                 );
                 compute_memory_barrier(device, command);
                 image_barrier(
                     device,
                     command,
-                    self.color.handle,
+                    self.current.handle,
                     vk::ImageLayout::GENERAL,
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 );
@@ -552,7 +711,7 @@ impl Capture {
                 image_barrier(
                     device,
                     command,
-                    self.color.handle,
+                    self.current.handle,
                     if self.initialized {
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
                     } else {
@@ -560,12 +719,12 @@ impl Capture {
                     },
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 );
-                if requires_scaling(source_extent, self.color.extent) {
+                if requires_scaling(source_extent, self.current.extent) {
                     device.cmd_blit_image(
                         command,
                         source,
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        self.color.handle,
+                        self.current.handle,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &[vk::ImageBlit::default()
                             .src_subresource(layers)
@@ -581,8 +740,8 @@ impl Capture {
                             .dst_offsets([
                                 vk::Offset3D::default(),
                                 vk::Offset3D {
-                                    x: self.color.extent.width as i32,
-                                    y: self.color.extent.height as i32,
+                                    x: self.current.extent.width as i32,
+                                    y: self.current.extent.height as i32,
                                     z: 1,
                                 },
                             ])],
@@ -593,14 +752,14 @@ impl Capture {
                         command,
                         source,
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        self.color.handle,
+                        self.current.handle,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &[vk::ImageCopy::default()
                             .src_subresource(layers)
                             .dst_subresource(layers)
                             .extent(vk::Extent3D {
-                                width: self.color.extent.width,
-                                height: self.color.extent.height,
+                                width: self.current.extent.width,
+                                height: self.current.extent.height,
                                 depth: 1,
                             })],
                     );
@@ -608,7 +767,7 @@ impl Capture {
                 image_barrier(
                     device,
                     command,
-                    self.color.handle,
+                    self.current.handle,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 );
@@ -625,7 +784,89 @@ impl Capture {
     }
 }
 
-impl Drop for Capture {
+pub struct Capture {
+    pub source: SourceCapture,
+    pub guidance: GuidanceCapture,
+}
+
+impl Capture {
+    pub unsafe fn new(
+        device: &ash::Device,
+        memory: &vk::PhysicalDeviceMemoryProperties,
+        game_extent: vk::Extent2D,
+        guidance_extent: vk::Extent2D,
+        format: vk::Format,
+    ) -> Result<Self, vk::Result> {
+        Ok(Self {
+            source: unsafe { SourceCapture::new(device, memory, game_extent, format) }?,
+            guidance: unsafe { GuidanceCapture::new(device, memory, guidance_extent, format) }?,
+        })
+    }
+
+    pub unsafe fn record(
+        &mut self,
+        device: &ash::Device,
+        command: vk::CommandBuffer,
+        source: vk::Image,
+    ) {
+        unsafe {
+            self.record_from(device, command, source, vk::ImageLayout::PRESENT_SRC_KHR);
+        }
+    }
+
+    pub unsafe fn record_from(
+        &mut self,
+        device: &ash::Device,
+        command: vk::CommandBuffer,
+        source: vk::Image,
+        layout: vk::ImageLayout,
+    ) {
+        let final_layout = if source == self.source.color.handle {
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        } else {
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        };
+        unsafe {
+            self.record_scaled_from_with_jitter(
+                device,
+                command,
+                source,
+                self.source.color.extent,
+                layout,
+                final_layout,
+                JitterSample::default(),
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn record_scaled_from_with_jitter(
+        &mut self,
+        device: &ash::Device,
+        command: vk::CommandBuffer,
+        source: vk::Image,
+        source_extent: vk::Extent2D,
+        layout: vk::ImageLayout,
+        final_layout: vk::ImageLayout,
+        jitter: JitterSample,
+    ) {
+        unsafe {
+            self.source
+                .record_from(device, command, source, source_extent, layout, final_layout);
+            self.guidance.record_scaled_from_with_jitter(
+                device,
+                command,
+                self.source.color.handle,
+                self.source.color.extent,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                jitter,
+            );
+        }
+    }
+}
+
+impl Drop for GuidanceCapture {
     fn drop(&mut self) {
         unsafe {
             self.device.destroy_pipeline(self.pipeline, None);
@@ -642,7 +883,47 @@ impl Drop for Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{CaptureMode, capture_roles, guidance_capture_mode};
+    use ash::vk;
     use tuxscaling_config::JitterMode;
+
+    #[test]
+    fn source_capture_stays_at_game_extent_and_guidance_has_its_own_extent() {
+        let roles = capture_roles(
+            vk::Extent2D {
+                width: 1279,
+                height: 719,
+            },
+            vk::Extent2D {
+                width: 959,
+                height: 539,
+            },
+        );
+
+        assert_eq!(roles.source_extent.width, 1279);
+        assert_eq!(roles.source_extent.height, 719);
+        assert_eq!(roles.guidance_extent.width, 959);
+        assert_eq!(roles.guidance_extent.height, 539);
+    }
+
+    #[test]
+    fn guidance_capture_selects_copy_at_full_scale_and_resampling_below_it() {
+        let game = vk::Extent2D {
+            width: 1280,
+            height: 720,
+        };
+        assert_eq!(guidance_capture_mode(game, game), CaptureMode::DirectCopy);
+        assert_eq!(
+            guidance_capture_mode(
+                game,
+                vk::Extent2D {
+                    width: 960,
+                    height: 540,
+                }
+            ),
+            CaptureMode::Resample
+        );
+    }
 
     #[test]
     fn identifies_when_capture_requires_scaling() {

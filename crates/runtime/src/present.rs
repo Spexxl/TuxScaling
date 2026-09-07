@@ -301,8 +301,8 @@ unsafe fn record_spatial_fallback(
         record_spatial_blit(
             device,
             command,
-            source.color.handle,
-            source.color.extent,
+            source.source.color.handle,
+            source.source.color.extent,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             output,
             output_layout,

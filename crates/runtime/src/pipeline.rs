@@ -122,7 +122,15 @@ impl TemporalPipeline {
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         let properties = unsafe { instance.get_physical_device_properties(physical) };
         let capture = if capture_enabled {
-            Some(unsafe { Capture::new(device, &memory, resolution.guidance_extent, info.format) }?)
+            Some(unsafe {
+                Capture::new(
+                    device,
+                    &memory,
+                    resolution.game_extent,
+                    resolution.guidance_extent,
+                    info.format,
+                )
+            }?)
         } else {
             None
         };
@@ -132,7 +140,7 @@ impl TemporalPipeline {
                     device,
                     &memory,
                     resolution.guidance_extent,
-                    capture.color.view,
+                    capture.guidance.current.view,
                     matches!(
                         info.format,
                         vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
@@ -155,8 +163,8 @@ impl TemporalPipeline {
                     device,
                     &memory,
                     resolution.guidance_extent,
-                    capture.color.view,
-                    capture.previous.view,
+                    capture.guidance.current.view,
+                    capture.guidance.previous.view,
                     motion.confidence.view,
                     motion.vectors.view,
                     motion.metadata.handle,
@@ -198,8 +206,8 @@ impl TemporalPipeline {
                     ReferenceUpscaler::new(
                         device,
                         &memory,
-                        capture.color.view,
-                        resolution.guidance_extent,
+                        capture.source.color.view,
+                        resolution.game_extent,
                         resolution.output_extent,
                         info.format,
                         view,

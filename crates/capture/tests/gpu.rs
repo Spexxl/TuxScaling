@@ -26,8 +26,14 @@ fn capture_excludes_later_overlay_writes() {
                 | vk::ImageUsageFlags::COLOR_ATTACHMENT,
         )
         .unwrap();
-        let mut capture =
-            Capture::new(device, &gpu.memory, extent, vk::Format::R8G8B8A8_UNORM).unwrap();
+        let mut capture = Capture::new(
+            device,
+            &gpu.memory,
+            extent,
+            extent,
+            vk::Format::R8G8B8A8_UNORM,
+        )
+        .unwrap();
         let download = Buffer::new(
             device,
             &gpu.memory,
@@ -78,7 +84,7 @@ fn capture_excludes_later_overlay_writes() {
             image_barrier(
                 device,
                 command,
-                capture.color.handle,
+                capture.source.color.handle,
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             );
@@ -95,7 +101,7 @@ fn capture_excludes_later_overlay_writes() {
                 });
             device.cmd_copy_image_to_buffer(
                 command,
-                capture.color.handle,
+                capture.source.color.handle,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 download.handle,
                 &[copy],
@@ -134,8 +140,14 @@ fn capture_resampling_applies_experimental_subpixel_jitter_without_changing_off(
                 | vk::ImageUsageFlags::COLOR_ATTACHMENT,
         )
         .unwrap();
-        let mut capture =
-            Capture::new(device, &gpu.memory, extent, vk::Format::R8G8B8A8_UNORM).unwrap();
+        let mut capture = Capture::new(
+            device,
+            &gpu.memory,
+            extent,
+            extent,
+            vk::Format::R8G8B8A8_UNORM,
+        )
+        .unwrap();
         let staging = Buffer::new(
             device,
             &gpu.memory,
@@ -182,13 +194,13 @@ fn capture_resampling_applies_experimental_subpixel_jitter_without_changing_off(
             image_barrier(
                 device,
                 command,
-                capture.color.handle,
+                capture.guidance.current.handle,
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             );
             device.cmd_copy_image_to_buffer(
                 command,
-                capture.color.handle,
+                capture.guidance.current.handle,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 download.handle,
                 &[copy],
@@ -196,7 +208,7 @@ fn capture_resampling_applies_experimental_subpixel_jitter_without_changing_off(
             image_barrier(
                 device,
                 command,
-                capture.color.handle,
+                capture.guidance.current.handle,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             );
