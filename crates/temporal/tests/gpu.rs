@@ -2,7 +2,7 @@
 
 use ash::vk;
 use tuxscaling_motion::MotionEstimator;
-use tuxscaling_temporal::{GuidanceReset, SignalState};
+use tuxscaling_temporal::{DepthSemantics, GuidanceReset, SignalState};
 use tuxscaling_vulkan::{Buffer, Image, image_barrier, memory_barrier};
 
 #[path = "../../../tests/support/gpu.rs"]
@@ -16,6 +16,8 @@ type GuidanceOutputs = (
     Vec<f32>,
     f32,
     [SignalState; 4],
+    SignalState,
+    DepthSemantics,
     bool,
 );
 
@@ -64,6 +66,7 @@ fn guidance_shader_contains_relative_depth_and_gradient_rejection_producers() {
         "percentile_5",
         "percentile_95",
         "relative_parallax",
+        "flow_jacobian_trace",
         "FlatFallback",
         "RelativeNearIsOne",
     ] {
@@ -72,6 +75,8 @@ fn guidance_shader_contains_relative_depth_and_gradient_rejection_producers() {
     let reconstruct = include_str!("../../../shaders/upscaler/reconstruct.comp");
     assert!(reconstruct.contains("depth_discontinuity"));
     assert!(!reconstruct.contains("* clamp(depth, 0.0, 1.0)"));
+    let runtime = include_str!("../../../crates/runtime/src/present.rs");
+    assert!(runtime.contains("view_with_depth_state"));
 }
 
 unsafe fn copy_upload(gpu: &Gpu, image: &Image, upload: &Buffer, extent: vk::Extent2D) {
@@ -339,7 +344,7 @@ unsafe fn guidance_provider_failure(
     previous_pixels: &[u8],
     current_pixels: &[u8],
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>, f32, [SignalState; 4], bool) {
-    let (reactive, disocclusion, transparency, _depth, exposure, states, reset) =
+    let (reactive, disocclusion, transparency, _depth, exposure, states, _, _, reset) =
         unsafe { guidance_masks_with_options(extent, previous_pixels, current_pixels, None, true) };
     (
         reactive,
@@ -804,6 +809,7 @@ unsafe fn guidance_masks_with_field_options(
             );
             memory_barrier(device, command);
         });
+        guidance.refresh_depth_status();
         let mut bytes = vec![0u8; readback.size as usize];
         readback.read(&mut bytes).unwrap();
         let exposure = f32::from_ne_bytes(
@@ -841,6 +847,8 @@ unsafe fn guidance_masks_with_field_options(
                 view.exposure.state,
                 view.transparency_composition.state,
             ],
+            view.depth.state,
+            view.depth_semantics,
             view.requires_history_reset,
         )
     }
@@ -1259,10 +1267,12 @@ fn relative_depth_orders_independent_parallax_planes() {
         height: 48,
     };
     let (previous, current, motion, expected) = layered_parallax_flow_fixture(extent);
-        let (_, _, _, depth, _, _, _) = unsafe {
-            guidance_masks_with_field_options(extent, &previous, &current, None, Some(&motion), false)
-        };
-        assert!(depth.iter().all(|value| value.is_finite()));
+    let (_, _, _, depth, _, _, depth_state, depth_semantics, _) = unsafe {
+        guidance_masks_with_field_options(extent, &previous, &current, None, Some(&motion), false)
+    };
+    assert!(depth.iter().all(|value| value.is_finite()));
+    assert_eq!(depth_state, SignalState::Estimated);
+    assert_eq!(depth_semantics, DepthSemantics::RelativeNearIsOne);
     let score = tuxscaling_temporal::quality::depth_order(&depth, &expected);
     let foreground = (0..extent.height)
         .flat_map(|y| (0..extent.width).map(move |x| (x, y)))
@@ -1300,7 +1310,7 @@ fn relative_depth_uses_flat_fallback_below_global_motion_threshold() {
         height: 48,
     };
     let (previous, current, _) = translated_flow_fixture(extent, 5, 0);
-    let (_, _, _, depth, _, states, _) = unsafe {
+    let (_, _, _, depth, _, states, depth_state, depth_semantics, _) = unsafe {
         guidance_masks_with_options(
             extent,
             &previous,
@@ -1312,4 +1322,34 @@ fn relative_depth_uses_flat_fallback_below_global_motion_threshold() {
     assert!(depth.iter().all(|value| *value == 1.0));
     assert!(depth.iter().all(|value| value.is_finite()));
     assert_eq!(states[0], SignalState::Estimated);
+    assert_eq!(depth_state, SignalState::ConstantFallback);
+    assert_eq!(depth_semantics, DepthSemantics::FlatFallback);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn relative_depth_uses_flat_fallback_below_affine_inlier_threshold() {
+    let extent = vk::Extent2D {
+        width: 64,
+        height: 48,
+    };
+    let (previous, current, _) = translated_flow_fixture(extent, 0, 0);
+    let motion = (0..extent.height)
+        .flat_map(|y| {
+            (0..extent.width).map(move |x| {
+                if (x + y) % 2 == 0 {
+                    [-1.0, 0.0]
+                } else {
+                    [-8.0, 0.0]
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let (_, _, _, depth, _, _, depth_state, depth_semantics, _) = unsafe {
+        guidance_masks_with_field_options(extent, &previous, &current, None, Some(&motion), false)
+    };
+    assert!(depth.iter().all(|value| *value == 1.0));
+    assert!(depth.iter().all(|value| value.is_finite()));
+    assert_eq!(depth_state, SignalState::ConstantFallback);
+    assert_eq!(depth_semantics, DepthSemantics::FlatFallback);
 }

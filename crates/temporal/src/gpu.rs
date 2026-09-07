@@ -32,6 +32,7 @@ pub struct GuidanceEstimator {
     initialized: bool,
     history_initialized: bool,
     depth_estimated: bool,
+    depth_status_known: bool,
     provider_failure: bool,
     extent: vk::Extent2D,
 }
@@ -100,7 +101,7 @@ impl GuidanceEstimator {
                     memory,
                     DEPTH_MODEL_WORDS * 4,
                     depth_buffer_usage,
-                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 )
             }?,
             sampler: vk::Sampler::null(),
@@ -113,6 +114,7 @@ impl GuidanceEstimator {
             initialized: false,
             history_initialized: false,
             depth_estimated: false,
+            depth_status_known: false,
             provider_failure: false,
             extent,
         };
@@ -640,7 +642,11 @@ impl GuidanceEstimator {
         }
         self.initialized = true;
         self.history_initialized = valid && !self.provider_failure;
-        self.depth_estimated = valid && !self.provider_failure;
+        // The reduction writes the definitive support bit only after the
+        // command has executed.  Keep the host contract conservative until a
+        // caller refreshes that bit after the submission fence completes.
+        self.depth_status_known = false;
+        self.depth_estimated = false;
     }
 
     /// Record coherent fallback values after a provider failure.
@@ -648,7 +654,26 @@ impl GuidanceEstimator {
         self.provider_failure = true;
         self.history_initialized = false;
         self.depth_estimated = false;
+        self.depth_status_known = false;
         unsafe { self.record_inner(command, false, FrameTiming::default(), None) };
+    }
+
+    /// Refresh the frame-level depth support bit after the submission that
+    /// produced it has completed.  The model buffer is host-visible and
+    /// coherent, so this is an asynchronous status channel rather than a
+    /// command-buffer readback.  Callers must wait for their submission fence
+    /// before invoking this method.
+    pub unsafe fn refresh_depth_status(&mut self) {
+        let mut bytes = [0u8; DEPTH_MODEL_WORDS as usize * 4];
+        if unsafe { self.depth_model.read(&mut bytes) }.is_err() {
+            self.depth_status_known = false;
+            self.depth_estimated = false;
+            return;
+        }
+        let supported = f32::from_ne_bytes(bytes[32..36].try_into().unwrap());
+        self.depth_status_known = supported.is_finite();
+        self.depth_estimated =
+            self.depth_status_known && supported >= 0.5 && !self.provider_failure;
     }
 
     /// Clear the host-side history marker when an external reset invalidates
@@ -673,6 +698,35 @@ impl GuidanceEstimator {
         timing: FrameTiming,
         reset: GuidanceReset,
     ) -> GuidanceView {
+        let depth_estimated =
+            valid && self.depth_status_known && self.depth_estimated && !self.provider_failure;
+        self.view_with_depth_state(
+            motion,
+            frame_id,
+            extent,
+            valid,
+            timing,
+            reset,
+            depth_estimated,
+        )
+    }
+
+    /// Construct a view with an explicit current-frame depth state. Runtime
+    /// callers use the conservative fallback before recording a new frame,
+    /// because the GPU support bit is not available until that submission has
+    /// completed. The regular [`Self::view`] method exposes the last completed
+    /// status after [`Self::refresh_depth_status`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn view_with_depth_state(
+        &self,
+        motion: &MotionEstimator,
+        frame_id: u64,
+        extent: vk::Extent2D,
+        valid: bool,
+        timing: FrameTiming,
+        reset: GuidanceReset,
+        depth_state: bool,
+    ) -> GuidanceView {
         let extent = FrameExtent {
             width: extent.width,
             height: extent.height,
@@ -694,7 +748,7 @@ impl GuidanceEstimator {
                 || !self.history_initialized
                 || !matches!(reset, GuidanceReset::None),
         };
-        let depth_estimated = valid && self.depth_estimated && !self.provider_failure;
+        let depth_estimated = valid && depth_state && !self.provider_failure;
         let resource =
             |image: vk::Image, view: vk::ImageView, format: vk::Format, state: SignalState| {
                 GuidanceResource {

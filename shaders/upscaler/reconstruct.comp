@@ -51,8 +51,10 @@ float depth_discontinuity(ivec2 pixel) {
     float center = imageLoad(depth_image, center_pixel).r;
     if (isnan(center) || isinf(center)) return 1.0;
     float gradient = 0.0;
-    for (int y = -1; y <= 1; ++y) {
-        for (int x = -1; x <= 1; ++x) {
+    // A two-pixel support band catches the complete narrow disocclusion
+    // boundary before history can leak across a depth step.
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
             ivec2 neighbour = clamp(center_pixel + ivec2(x, y), ivec2(0), size - 1);
             float value = imageLoad(depth_image, neighbour).r;
             if (isnan(value) || isinf(value)) return 1.0;

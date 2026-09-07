@@ -163,12 +163,14 @@ vec2 affine_flow(ivec2 pixel) {
         dot(vec3(depth_model.model[3], depth_model.model[4], depth_model.model[5]), basis));
 }
 
-float flow_divergence(ivec2 pixel, vec2 motion) {
-    float result = 0.0;
-    for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
-        result += length(safe_motion(pixel + ivec2(x, y)) - motion);
-    }
-    return clamp(result / 9.0 / 4.0, 0.0, 1.0);
+float flow_jacobian_trace(ivec2 pixel) {
+    vec2 horizontal = 0.5 * (safe_motion(pixel + ivec2(1, 0)) -
+        safe_motion(pixel - ivec2(1, 0)));
+    vec2 vertical = 0.5 * (safe_motion(pixel + ivec2(0, 1)) -
+        safe_motion(pixel - ivec2(0, 1)));
+    // The trace is the local flow divergence; endpoint variation alone is
+    // not a divergence cue and can be high on a uniform translating field.
+    return clamp(abs(horizontal.x + vertical.y) / 4.0, 0.0, 1.0);
 }
 
 float luminance_edge(ivec2 pixel) {
@@ -214,7 +216,7 @@ void write_residual_histogram(uvec2 q) {
             float residual = length(motion - affine_flow(pixel));
             affine_inliers = residual <= depth_model.model[12];
             float parallax = relative_parallax(pixel, motion);
-            float divergence = flow_divergence(pixel, motion);
+            float divergence = flow_jacobian_trace(pixel);
             float edge = luminance_edge(pixel);
             float stability = temporal_stability(pixel, motion);
             float temporal_change = 1.0 - stability;

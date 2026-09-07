@@ -576,6 +576,9 @@ impl SwapchainRuntime {
             vk::ImageLayout::UNDEFINED
         };
         unsafe { self.device.wait_for_fences(&[slot.fence], true, u64::MAX) }?;
+        if let Some(guidance) = &mut self.temporal.guidance {
+            unsafe { guidance.refresh_depth_status() };
+        }
         if let Some(quality) = self.temporal.pending_quality.take() {
             if let Some(motion) = &mut self.temporal.motion {
                 motion.set_quality(quality);
@@ -676,7 +679,7 @@ impl SwapchainRuntime {
             .into();
         }
         let guidance_view = match (&self.temporal.guidance, &self.temporal.motion) {
-            (Some(guidance), Some(motion)) => Some(guidance.view(
+            (Some(guidance), Some(motion)) => Some(guidance.view_with_depth_state(
                 motion,
                 self.temporal.history.frame_id + 1,
                 self.temporal.resolution.processing_extent,
@@ -687,6 +690,7 @@ impl SwapchainRuntime {
                 } else {
                     self.temporal.reset_reason
                 },
+                false,
             )),
             _ => None,
         };
