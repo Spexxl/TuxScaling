@@ -19,6 +19,7 @@ shared uint previous_total[32];
 shared uint total_good;
 shared uint total_samples;
 shared float total_current_log;
+shared float total_previous_log;
 
 void main() {
     uint bin = gl_LocalInvocationIndex;
@@ -36,35 +37,73 @@ void main() {
         uint good = 0;
         uint samples = 0;
         float current_log = 0.0;
+        float previous_log = 0.0;
         for (uint i = 0; i < partial_count; ++i) {
             uint base = i * 68u;
             good += partials[base + 64u];
             samples += partials[base + 65u];
             current_log += uintBitsToFloat(partials[base + 66u]);
+            previous_log += uintBitsToFloat(partials[base + 67u]);
         }
         total_good = good;
         total_samples = samples;
         total_current_log = current_log;
+        total_previous_log = previous_log;
     }
     barrier();
 
     if (bin == 0) {
         uint current_count = 0;
         uint previous_count = 0;
-        float distance = 0.0;
         for (uint i = 0; i < 32; ++i) {
             current_count += current_total[i];
             previous_count += previous_total[i];
-            distance += abs(float(current_total[i]) - float(previous_total[i]));
         }
+        // Normalize the current histogram by its robust global EV shift before
+        // comparing it with the previous histogram.  A flash/fade therefore
+        // moves bins but does not look like a new scene.
         float count = float(max(current_count, 1u));
-        float average_log = total_current_log / count;
+        float current_mean = total_current_log / count;
+        float previous_mean = total_previous_log / float(max(previous_count, 1u));
+        int raw_shift = int(round((previous_mean - current_mean) * 2.0));
+        // A bounded EV adaptation handles flash/fade; a larger jump remains a
+        // cut candidate instead of normalizing black-to-white into a match.
+        int shift = abs(raw_shift) <= 4 ? raw_shift : 0;
+        float distance = 0.0;
+        // The totals above are accumulated for the ratio; compare each current
+        // bin against its exposure-normalized previous counterpart.
+        for (int i = 0; i < 32; ++i) {
+            int previous_bin = clamp(i + shift, 0, 31);
+            distance += abs(float(current_total[i]) -
+                float(previous_total[previous_bin]));
+        }
         metadata.distance_l1 = distance / count;
         metadata.consistent = total_good;
         metadata.reserved = 0u;
-        metadata.exposure = p.valid != 0 ? exp2(-average_log) : 1.0;
+        // Approximate a clipped log-luminance mean from the compact histogram,
+        // retaining the exact per-tile log sums for sub-bin precision.
+        float trim_low = float(current_count) * 0.05;
+        float trim_high = float(current_count) * 0.05;
+        float trimmed_log = total_current_log;
+        for (int i = 0; i < 32; ++i) {
+            float removed = min(float(current_total[i]), trim_low);
+            float center = -12.0 + (float(i) + 0.5) * 0.5;
+            trimmed_log -= removed * center;
+            trim_low -= removed;
+        }
+        for (int reverse = 0; reverse < 32; ++reverse) {
+            int i = 31 - reverse;
+            float removed = min(float(current_total[i]), trim_high);
+            float center = -12.0 + (float(i) + 0.5) * 0.5;
+            trimmed_log -= removed * center;
+            trim_high -= removed;
+        }
+        float kept = max(float(current_count) * 0.90, 1.0);
+        metadata.exposure = p.valid != 0 ? exp2(-trimmed_log / kept) : 1.0;
+        float motion_consistency = float(total_good) /
+            float(max(total_samples, 1u));
         metadata.scene_cut = (p.valid == 0 ||
             (metadata.distance_l1 > p.scene_distance_threshold &&
-             float(total_good) / float(max(total_samples, 1u)) < p.scene_consistency_threshold)) ? 1u : 0u;
+             motion_consistency < p.scene_consistency_threshold)) ? 1u : 0u;
     }
 }

@@ -586,6 +586,32 @@ fn expected_exposure(pixels: &[u8], width: u32, height: u32) -> f32 {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
+fn bounded_flash_and_fade_are_not_scene_cuts() {
+    let width = 128;
+    let height = 96;
+    let previous = pattern(width, height, 0, 0);
+    for multiplier in [1.5_f32, 0.65_f32] {
+        let current = previous
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|pixel| {
+                [
+                    (f32::from(pixel[0]) * multiplier).min(255.0) as u8,
+                    (f32::from(pixel[1]) * multiplier).min(255.0) as u8,
+                    (f32::from(pixel[2]) * multiplier).min(255.0) as u8,
+                    255,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let (_, _, cut, exposure) = unsafe { pair(width, height, &previous, &current) };
+        eprintln!("exposure multiplier={multiplier} estimated={exposure:.3} cut={cut}");
+        assert_eq!(cut, 0);
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
 fn parallel_exposure_is_finite_and_accurate_for_uniform_and_gradient_frames() {
     let width = 128;
     let height = 96;

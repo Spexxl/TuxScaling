@@ -1,4 +1,5 @@
 #version 450
+
 layout(local_size_x=8, local_size_y=8) in;
 layout(binding=0) uniform sampler2D current_frame;
 layout(binding=1) uniform sampler2D previous_frame;
@@ -13,38 +14,236 @@ layout(std430,binding=7) readonly buffer MotionStats {
     float distance_l1;
     uint reserved;
     float exposure;
-};
+} metadata;
+layout(rg16f,binding=8) uniform readonly image2D dense_motion;
+layout(r8,binding=9) uniform image2D transparency_image;
+layout(std430,binding=10) readonly buffer CompactStats { uint partials[]; } statistics;
+layout(binding=11) uniform sampler2D previous_transparency;
+
 layout(push_constant) uniform Params {
     uint width;
     uint height;
     uint valid;
     uint mode;
+    float delta_seconds;
+    uint initialized;
+    uint provider_failure;
+    uint reserved;
 } p;
 
+const float EPSILON = 1e-4;
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+bool finite(float value) { return !isnan(value) && !isinf(value); }
+
 float luminance(vec3 color) {
-    return dot(clamp(color, 0.0, 1.0), vec3(0.2126, 0.7152, 0.0722));
+    return max(dot(max(color, vec3(0.0)), LUMA), EPSILON);
+}
+
+vec3 safe_current(ivec2 pixel) {
+    vec3 value = texelFetch(current_frame, clamp(pixel, ivec2(0), ivec2(p.width, p.height)-1), 0).rgb;
+    if (any(isnan(value)) || any(isinf(value))) return vec3(0.0);
+    return clamp(value, vec3(0.0), vec3(1.0));
+}
+
+vec2 safe_motion(ivec2 pixel) {
+    ivec2 size = imageSize(dense_motion);
+    vec2 value = imageLoad(dense_motion, clamp(pixel, ivec2(0), size - 1)).xy;
+    if (any(isnan(value)) || any(isinf(value))) return vec2(0.0);
+    return value;
+}
+
+float safe_confidence(ivec2 pixel) {
+    ivec2 size = imageSize(confidence_image);
+    float value = imageLoad(confidence_image, clamp(pixel, ivec2(0), size - 1)).r;
+    return (isnan(value) || isinf(value)) ? 0.0 : clamp(value, 0.0, 1.0);
+}
+
+vec3 reproject_previous(ivec2 pixel, vec2 motion) {
+    vec2 target = vec2(pixel) + motion;
+    vec2 size = vec2(textureSize(previous_frame, 0));
+    // Motion is current-to-previous in source pixels.  Sampling the previous
+    // frame at this dense target is deliberately done before residuals.
+    vec2 uv = (clamp(target, vec2(0.0), size - vec2(1.0)) + 0.5) / size;
+    vec3 value = texture(previous_frame, uv).rgb;
+    if (any(isnan(value)) || any(isinf(value))) return vec3(0.0);
+    return clamp(value, vec3(0.0), vec3(1.0));
+}
+
+vec3 chroma(vec3 value) {
+    float sum = max(value.r + value.g + value.b, EPSILON);
+    return value / sum;
+}
+
+float local_variance(ivec2 pixel, float mean) {
+    ivec2 size = imageSize(dense_motion);
+    float sum = 0.0;
+    for (int y=-1; y<=1; ++y) for (int x=-1; x<=1; ++x) {
+        ivec2 n = clamp(pixel + ivec2(x,y), ivec2(0), size - 1);
+        sum += pow(luminance(safe_current(n)) - mean, 2.0);
+    }
+    return sqrt(sum / 9.0);
+}
+
+// Forward-flow occupancy is estimated by testing how many nearby dense-flow
+// samples cover the reprojected target.  It is independent of confidence;
+// confidence is only one of the later disocclusion cues.
+float forward_occupancy(ivec2 pixel, vec2 target) {
+    ivec2 size = imageSize(dense_motion);
+    float occupancy = 0.0;
+    for (int y=-2; y<=2; ++y) for (int x=-2; x<=2; ++x) {
+        ivec2 n = clamp(pixel + ivec2(x,y), ivec2(0), size - 1);
+        vec2 projected = vec2(n) + safe_motion(n);
+        float kernel = exp(-0.65 * dot(projected - target, projected - target));
+        occupancy = max(occupancy, kernel * safe_confidence(n));
+    }
+    return clamp(occupancy, 0.0, 1.0);
+}
+
+float flow_divergence(ivec2 pixel, vec2 motion) {
+    ivec2 size = imageSize(dense_motion);
+    float divergence = 0.0;
+    for (int y=-1; y<=1; ++y) for (int x=-1; x<=1; ++x) {
+        ivec2 n = clamp(pixel + ivec2(x,y), ivec2(0), size - 1);
+        divergence += length(safe_motion(n) - motion);
+    }
+    return clamp(divergence / 9.0, 0.0, 1.0);
+}
+
+float exposure_from_percentile() {
+    // Task 2's persistent compact records contain 32 log-luminance bins per
+    // tile.  Reconstruct a global histogram, discard the 5th/95th tails, and
+    // use the exact compact log sum for the retained estimate.
+    uint bins[32];
+    for (uint bin=0u; bin<32u; ++bin) bins[bin] = 0u;
+    uint tiles_x = (p.width + 15u) / 16u;
+    uint tiles_y = (p.height + 15u) / 16u;
+    uint tile_count = tiles_x * tiles_y;
+    float total_log = 0.0;
+    uint total_count = 0u;
+    for (uint tile=0u; tile<tile_count; ++tile) {
+        uint base = tile * 68u;
+        total_log += uintBitsToFloat(statistics.partials[base + 66u]);
+        for (uint bin=0u; bin<32u; ++bin) bins[bin] += statistics.partials[base + bin];
+    }
+    for (uint bin=0u; bin<32u; ++bin) total_count += bins[bin];
+    if (total_count == 0u || isnan(total_log) || isinf(total_log)) {
+        float fallback = metadata.exposure;
+        return (finite(fallback) && fallback > 0.0) ? fallback : 1.0;
+    }
+    float trim_low = float(total_count) * 0.05;
+    float trim_high = float(total_count) * 0.05;
+    float trimmed_log = total_log;
+    for (uint bin=0u; bin<32u; ++bin) {
+        float count = float(bins[bin]);
+        float removed = min(count, trim_low);
+        float center = -12.0 + (float(bin) + 0.5) * 0.5;
+        trimmed_log -= removed * center;
+        trim_low -= removed;
+    }
+    for (uint reverse=0u; reverse<32u; ++reverse) {
+        uint bin = 31u - reverse;
+        float count = float(bins[bin]);
+        float removed = min(count, trim_high);
+        float center = -12.0 + (float(bin) + 0.5) * 0.5;
+        trimmed_log -= removed * center;
+        trim_high -= removed;
+    }
+    float kept = max(float(total_count) * 0.90, 1.0);
+    float mean_log = trimmed_log / kept;
+    float estimate = exp2(-mean_log);
+    return (finite(estimate) && estimate > 0.0) ? clamp(estimate, 0.0625, 16.0) : 1.0;
+}
+
+void write_fallback(ivec2 pixel) {
+    imageStore(reactive_image, pixel, vec4(0.0));
+    imageStore(disocclusion_image, pixel, vec4(0.0));
+    imageStore(transparency_image, pixel, vec4(0.0));
+    imageStore(depth_image, pixel, vec4(1.0));
 }
 
 void main() {
     uvec2 q = gl_GlobalInvocationID.xy;
-    if (q.x == 0 && q.y == 0) {
-        imageStore(exposure_image, ivec2(0), vec4(exposure));
+    if (q.x == 0u && q.y == 0u && p.mode == 1u) {
+        float old_exposure = imageLoad(exposure_image, ivec2(0)).r;
+        if (!finite(old_exposure) || old_exposure <= 0.0) old_exposure = 1.0;
+        float estimate = exposure_from_percentile();
+        float delta = (finite(p.delta_seconds) && p.delta_seconds > 0.0) ? p.delta_seconds : (1.0 / 60.0);
+        float adaptation = 1.0 - exp(-4.0 * delta);
+        float adapted = (p.valid == 0u || p.provider_failure != 0u) ? 1.0 :
+            (p.initialized == 0u ? estimate : mix(old_exposure, estimate, clamp(adaptation, 0.0, 1.0)));
+        imageStore(exposure_image, ivec2(0), vec4(finite(adapted) ? adapted : 1.0));
     }
-    if (p.mode == 1) {
-        return;
-    }
+    if (p.mode == 1u) return;
     if (q.x >= p.width || q.y >= p.height) return;
     ivec2 pixel = ivec2(q);
-    ivec2 confidence_pixel = min(pixel, imageSize(confidence_image) - 1);
-    float confidence = imageLoad(confidence_image, confidence_pixel).r;
-    float disocclusion = 1.0 - confidence;
-    float reactive = 1.0;
-    if (p.valid != 0) {
-        vec3 current = texelFetch(current_frame, pixel, 0).rgb;
-        vec3 previous = texelFetch(previous_frame, pixel, 0).rgb;
-        reactive = clamp(length(current - previous) * 4.0 + disocclusion * 0.35, 0.0, 1.0);
+    if (p.valid == 0u || p.provider_failure != 0u) {
+        write_fallback(pixel);
+        return;
+    }
+
+    vec2 motion = safe_motion(pixel);
+    vec2 target = vec2(pixel) + motion;
+    vec2 previous_size = vec2(textureSize(previous_frame, 0));
+    bool inside = all(greaterThanEqual(target, vec2(0.0))) &&
+        all(lessThanEqual(target, previous_size - vec2(1.0)));
+    vec3 current = safe_current(pixel);
+    vec3 previous = reproject_previous(pixel, motion);
+    float current_exposure = (finite(metadata.exposure) && metadata.exposure > 0.0) ? metadata.exposure : 1.0;
+    float previous_exposure = imageLoad(exposure_image, ivec2(0)).r;
+    if (!finite(previous_exposure) || previous_exposure <= 0.0) previous_exposure = 1.0;
+    if (p.initialized == 0u) previous_exposure = current_exposure;
+    // Exposure-compensated residuals prevent a global flash/fade from becoming
+    // reactive while retaining chroma changes that indicate composition.
+    vec3 current_normalized = current * current_exposure;
+    vec3 previous_normalized = previous * previous_exposure;
+    float current_luma = luminance(current_normalized);
+    float previous_luma = luminance(previous_normalized);
+    float luminance_residual = abs(log2(current_luma) - log2(previous_luma));
+    float chroma_residual = length(chroma(current_normalized) - chroma(previous_normalized));
+    float confidence = safe_confidence(pixel);
+    float scene_consistency = clamp(float(metadata.consistent) /
+        max(float(p.width * p.height), 1.0), 0.0, 1.0);
+
+    float occupancy = forward_occupancy(pixel, target);
+    float holes = 1.0 - occupancy;
+    float divergence = flow_divergence(pixel, motion);
+    float boundary = inside ? 0.0 : 1.0;
+    float confidence_cue = 1.0 - confidence;
+    float appearance_hole = smoothstep(0.03, 0.25,
+        luminance_residual + chroma_residual);
+    // Holes, divergence, confidence, and bounds are separate cues: this is
+    // intentionally not the old disocclusion = 1-confidence shortcut.
+    float disocclusion = clamp(0.58 * holes * appearance_hole +
+        0.20 * divergence * appearance_hole + 0.16 * confidence_cue * appearance_hole +
+        0.45 * boundary + 0.04 * (1.0 - scene_consistency) * holes * appearance_hole,
+        0.0, 1.0);
+
+    float reactive = clamp(1.5 * luminance_residual + 2.5 * chroma_residual +
+        0.30 * disocclusion, 0.0, 1.0);
+
+    float current_mean = luminance(current);
+    float variance = local_variance(pixel, current_mean);
+    float previous_residual = texture(previous_transparency,
+        (clamp(target, vec2(0.0), previous_size - vec2(1.0)) + 0.5) / previous_size).r;
+    float white_distance = length(vec3(1.0) - current);
+    float source_delta = length(current - previous);
+    // A translucent white composition moves toward white by roughly the same
+    // amount as its remaining distance to white; an opaque white reveal has
+    // no such remaining distance and is assigned to disocclusion instead.
+    float alpha_like = smoothstep(0.02, 0.80, white_distance) *
+        exp(-4.0 * abs(source_delta - white_distance));
+    float dominant_disagreement = clamp(divergence, 0.0, 1.0);
+    float composition = clamp(0.35 * previous_residual + 0.16 * variance +
+        0.62 * alpha_like + 0.18 * dominant_disagreement + 0.08 * reactive, 0.0, 1.0);
+    if (!inside) composition *= 0.5;
+    if (any(isnan(current_normalized)) || any(isinf(current_normalized)) ||
+        any(isnan(previous_normalized)) || any(isinf(previous_normalized))) {
+        write_fallback(pixel);
+        return;
     }
     imageStore(reactive_image, pixel, vec4(reactive));
     imageStore(disocclusion_image, pixel, vec4(disocclusion));
+    imageStore(transparency_image, pixel, vec4(composition));
     imageStore(depth_image, pixel, vec4(1.0));
 }

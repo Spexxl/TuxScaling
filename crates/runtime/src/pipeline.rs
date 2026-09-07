@@ -158,7 +158,9 @@ impl TemporalPipeline {
                     capture.color.view,
                     capture.previous.view,
                     motion.confidence.view,
+                    motion.vectors.view,
                     motion.metadata.handle,
+                    motion.stats.handle,
                 )
             } {
                 Ok(value) => Some(value),

@@ -15,6 +15,7 @@ pub struct GuidanceEstimator {
     pub exposure: Image,
     pub depth: Image,
     pub transparency: Image,
+    transparency_history: Image,
     sampler: vk::Sampler,
     layout: vk::PipelineLayout,
     descriptor_layout: vk::DescriptorSetLayout,
@@ -22,10 +23,13 @@ pub struct GuidanceEstimator {
     descriptor_set: vk::DescriptorSet,
     pipeline: vk::Pipeline,
     initialized: bool,
+    history_initialized: bool,
+    provider_failure: bool,
     extent: vk::Extent2D,
 }
 
 impl GuidanceEstimator {
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         device: &ash::Device,
         memory: &vk::PhysicalDeviceMemoryProperties,
@@ -33,7 +37,9 @@ impl GuidanceEstimator {
         current_view: vk::ImageView,
         previous_view: vk::ImageView,
         confidence_view: vk::ImageView,
+        motion_view: vk::ImageView,
         statistics_buffer: vk::Buffer,
+        compact_statistics_buffer: vk::Buffer,
     ) -> Result<Self, vk::Result> {
         let storage = vk::ImageUsageFlags::STORAGE
             | vk::ImageUsageFlags::SAMPLED
@@ -61,6 +67,9 @@ impl GuidanceEstimator {
             transparency: unsafe {
                 Image::new(device, memory, extent, vk::Format::R8_UNORM, storage)
             }?,
+            transparency_history: unsafe {
+                Image::new(device, memory, extent, vk::Format::R8_UNORM, storage)
+            }?,
             sampler: vk::Sampler::null(),
             layout: vk::PipelineLayout::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
@@ -68,6 +77,8 @@ impl GuidanceEstimator {
             descriptor_set: vk::DescriptorSet::null(),
             pipeline: vk::Pipeline::null(),
             initialized: false,
+            history_initialized: false,
+            provider_failure: false,
             extent,
         };
         result.sampler = unsafe {
@@ -80,13 +91,13 @@ impl GuidanceEstimator {
                 None,
             )
         }?;
-        let bindings = (0..8)
+        let bindings = (0..12)
             .map(|binding| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(binding)
-                    .descriptor_type(if binding < 2 {
+                    .descriptor_type(if binding < 2 || binding == 11 {
                         vk::DescriptorType::COMBINED_IMAGE_SAMPLER
-                    } else if binding == 7 {
+                    } else if binding == 7 || binding == 10 {
                         vk::DescriptorType::STORAGE_BUFFER
                     } else {
                         vk::DescriptorType::STORAGE_IMAGE
@@ -108,15 +119,15 @@ impl GuidanceEstimator {
                     .pool_sizes(&[
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                            descriptor_count: 2,
+                            descriptor_count: 3,
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_IMAGE,
-                            descriptor_count: 5,
+                            descriptor_count: 7,
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_BUFFER,
-                            descriptor_count: 1,
+                            descriptor_count: 2,
                         },
                     ]),
                 None,
@@ -138,6 +149,10 @@ impl GuidanceEstimator {
                 .sampler(result.sampler)
                 .image_view(previous_view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            vk::DescriptorImageInfo::default()
+                .sampler(result.sampler)
+                .image_view(result.transparency_history.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
         ];
         unsafe {
             device.update_descriptor_sets(
@@ -152,6 +167,11 @@ impl GuidanceEstimator {
                         .dst_binding(1)
                         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                         .image_info(&sampled[1..2]),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(result.descriptor_set)
+                        .dst_binding(11)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&sampled[2..3]),
                 ],
                 &[],
             );
@@ -162,6 +182,8 @@ impl GuidanceEstimator {
             (4, result.disocclusion.view),
             (5, result.exposure.view),
             (6, result.depth.view),
+            (8, motion_view),
+            (9, result.transparency.view),
         ] {
             let image = [vk::DescriptorImageInfo::default()
                 .image_view(view)
@@ -191,6 +213,20 @@ impl GuidanceEstimator {
                 &[],
             );
         }
+        let compact_stats = [vk::DescriptorBufferInfo::default()
+            .buffer(compact_statistics_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        unsafe {
+            device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(result.descriptor_set)
+                    .dst_binding(10)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&compact_stats)],
+                &[],
+            );
+        }
         result.layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
@@ -198,7 +234,7 @@ impl GuidanceEstimator {
                     .push_constant_ranges(&[vk::PushConstantRange {
                         stage_flags: vk::ShaderStageFlags::COMPUTE,
                         offset: 0,
-                        size: 16,
+                        size: 32,
                     }]),
                 None,
             )
@@ -231,7 +267,17 @@ impl GuidanceEstimator {
     }
 
     pub unsafe fn record(&mut self, command: vk::CommandBuffer, valid: bool) {
-        unsafe { self.record_inner(command, valid, None) };
+        unsafe { self.record_with_timing(command, valid, FrameTiming::default()) };
+    }
+
+    pub unsafe fn record_with_timing(
+        &mut self,
+        command: vk::CommandBuffer,
+        valid: bool,
+        timing: FrameTiming,
+    ) {
+        self.provider_failure = false;
+        unsafe { self.record_inner(command, valid, timing, None) };
     }
 
     pub unsafe fn record_timed(
@@ -241,13 +287,34 @@ impl GuidanceEstimator {
         query_pool: vk::QueryPool,
         query_base: u32,
     ) {
-        unsafe { self.record_inner(command, valid, Some((query_pool, query_base))) };
+        self.provider_failure = false;
+        unsafe {
+            self.record_inner(
+                command,
+                valid,
+                FrameTiming::default(),
+                Some((query_pool, query_base)),
+            )
+        };
+    }
+
+    pub unsafe fn record_timed_with_timing(
+        &mut self,
+        command: vk::CommandBuffer,
+        valid: bool,
+        timing: FrameTiming,
+        query_pool: vk::QueryPool,
+        query_base: u32,
+    ) {
+        self.provider_failure = false;
+        unsafe { self.record_inner(command, valid, timing, Some((query_pool, query_base))) };
     }
 
     unsafe fn record_inner(
         &mut self,
         command: vk::CommandBuffer,
         valid: bool,
+        timing: FrameTiming,
         timestamps: Option<(vk::QueryPool, u32)>,
     ) {
         unsafe {
@@ -258,6 +325,7 @@ impl GuidanceEstimator {
                     &self.exposure,
                     &self.depth,
                     &self.transparency,
+                    &self.transparency_history,
                 ] {
                     image_barrier(
                         &self.device,
@@ -279,6 +347,37 @@ impl GuidanceEstimator {
                         .level_count(1)
                         .layer_count(1)],
                 );
+                self.device.cmd_clear_color_image(
+                    command,
+                    self.exposure.handle,
+                    vk::ImageLayout::GENERAL,
+                    &vk::ClearColorValue {
+                        float32: [1.0, 0.0, 0.0, 0.0],
+                    },
+                    &[vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1)],
+                );
+                self.device.cmd_clear_color_image(
+                    command,
+                    self.transparency_history.handle,
+                    vk::ImageLayout::GENERAL,
+                    &vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 0.0],
+                    },
+                    &[vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1)],
+                );
+                image_barrier(
+                    &self.device,
+                    command,
+                    self.transparency_history.handle,
+                    vk::ImageLayout::GENERAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                );
                 memory_barrier(&self.device, command);
             }
             self.device
@@ -299,7 +398,16 @@ impl GuidanceEstimator {
                     query_base,
                 );
             }
-            let mut params = [self.extent.width, self.extent.height, u32::from(valid), 0];
+            let mut params = [
+                self.extent.width,
+                self.extent.height,
+                u32::from(valid),
+                0,
+                timing.smoothed.as_secs_f32().to_bits(),
+                u32::from(self.history_initialized),
+                u32::from(self.provider_failure),
+                0,
+            ];
             self.device.cmd_push_constants(
                 command,
                 self.layout,
@@ -322,7 +430,6 @@ impl GuidanceEstimator {
                     query_base + 1,
                 );
             }
-            params[2] = u32::from(valid);
             params[3] = 1;
             self.device.cmd_push_constants(
                 command,
@@ -332,6 +439,58 @@ impl GuidanceEstimator {
                 bytemuck::cast_slice(&params),
             );
             self.device.cmd_dispatch(command, 1, 1, 1);
+            memory_barrier(&self.device, command);
+            image_barrier(
+                &self.device,
+                command,
+                self.transparency.handle,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+            image_barrier(
+                &self.device,
+                command,
+                self.transparency_history.handle,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            );
+            self.device.cmd_copy_image(
+                command,
+                self.transparency.handle,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                self.transparency_history.handle,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::ImageCopy::default()
+                    .src_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .dst_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .extent(vk::Extent3D {
+                        width: self.extent.width,
+                        height: self.extent.height,
+                        depth: 1,
+                    })],
+            );
+            image_barrier(
+                &self.device,
+                command,
+                self.transparency_history.handle,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
+            image_barrier(
+                &self.device,
+                command,
+                self.transparency.handle,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::ImageLayout::GENERAL,
+            );
             memory_barrier(&self.device, command);
             if let Some((query_pool, query_base)) = timestamps {
                 self.device.cmd_write_timestamp(
@@ -343,6 +502,15 @@ impl GuidanceEstimator {
             }
         }
         self.initialized = true;
+        if valid && !self.provider_failure {
+            self.history_initialized = true;
+        }
+    }
+
+    /// Record coherent fallback values after a provider failure.
+    pub unsafe fn record_provider_failure(&mut self, command: vk::CommandBuffer) {
+        self.provider_failure = true;
+        unsafe { self.record_inner(command, false, FrameTiming::default(), None) };
     }
 
     pub fn view(
@@ -358,14 +526,21 @@ impl GuidanceEstimator {
             width: extent.width,
             height: extent.height,
         };
+        let reset = if self.provider_failure {
+            GuidanceReset::ProviderFailure
+        } else {
+            reset
+        };
         let metadata = GuidanceMetadata {
             frame_id,
             extent,
             valid: true,
             valid_region: ValidRegion::full(extent),
             reset,
-            is_zero: !valid,
-            requires_history_reset: !valid || !matches!(reset, GuidanceReset::None),
+            is_zero: !valid || self.provider_failure,
+            requires_history_reset: !valid
+                || self.provider_failure
+                || !matches!(reset, GuidanceReset::None),
         };
         let resource =
             |image: vk::Image, view: vk::ImageView, format: vk::Format, state: SignalState| {
@@ -382,7 +557,7 @@ impl GuidanceEstimator {
                 motion.vectors.handle,
                 motion.vectors.view,
                 vk::Format::R16G16_SFLOAT,
-                if valid {
+                if valid && !self.provider_failure {
                     SignalState::Estimated
                 } else {
                     SignalState::ConstantFallback
@@ -392,7 +567,7 @@ impl GuidanceEstimator {
                 motion.confidence.handle,
                 motion.confidence.view,
                 vk::Format::R8_UNORM,
-                if valid {
+                if valid && !self.provider_failure {
                     SignalState::Estimated
                 } else {
                     SignalState::ConstantFallback
@@ -402,19 +577,31 @@ impl GuidanceEstimator {
                 self.disocclusion.handle,
                 self.disocclusion.view,
                 vk::Format::R8_UNORM,
-                SignalState::Estimated,
+                if self.provider_failure {
+                    SignalState::ConstantFallback
+                } else {
+                    SignalState::Estimated
+                },
             ),
             reactive: resource(
                 self.reactive.handle,
                 self.reactive.view,
                 vk::Format::R8_UNORM,
-                SignalState::Estimated,
+                if self.provider_failure {
+                    SignalState::ConstantFallback
+                } else {
+                    SignalState::Estimated
+                },
             ),
             exposure: resource(
                 self.exposure.handle,
                 self.exposure.view,
                 vk::Format::R32_SFLOAT,
-                SignalState::Estimated,
+                if self.provider_failure {
+                    SignalState::ConstantFallback
+                } else {
+                    SignalState::Estimated
+                },
             ),
             depth: resource(
                 self.depth.handle,
@@ -426,7 +613,11 @@ impl GuidanceEstimator {
                 self.transparency.handle,
                 self.transparency.view,
                 vk::Format::R8_UNORM,
-                SignalState::ConstantFallback,
+                if self.provider_failure {
+                    SignalState::ConstantFallback
+                } else {
+                    SignalState::Estimated
+                },
             ),
             pre_exposure: 1.0,
             timing,

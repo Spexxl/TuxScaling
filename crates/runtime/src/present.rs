@@ -797,14 +797,15 @@ impl SwapchainRuntime {
                         index as u32 * GPU_TIMESTAMPS as u32 + 11,
                         3,
                     );
-                    guidance.record_timed(
+                    guidance.record_timed_with_timing(
                         slot.command,
                         valid,
+                        self.temporal.pending_timing,
                         self.temporal.queries,
                         index as u32 * GPU_TIMESTAMPS as u32 + 11,
                     );
                 } else {
-                    guidance.record(slot.command, valid);
+                    guidance.record_with_timing(slot.command, valid, self.temporal.pending_timing);
                 }
                 memory_barrier(&self.device, slot.command);
             } else if self.temporal.queries != vk::QueryPool::null() {
