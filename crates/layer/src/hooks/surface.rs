@@ -21,7 +21,7 @@ unsafe fn create_xlib_surface_inner(
                     window: unsafe { (*create_info).window },
                     logical_extent: None,
                     logical_capabilities: None,
-                    original_window: None,
+                    borderless_lease: None,
                 },
             );
     }
@@ -61,7 +61,7 @@ unsafe fn create_xcb_surface_inner(
                     window: unsafe { (*create_info).window as u64 },
                     logical_extent: None,
                     logical_capabilities: None,
-                    original_window: None,
+                    borderless_lease: None,
                 },
             );
     }
@@ -219,13 +219,10 @@ unsafe fn destroy_surface_inner(
         .unwrap_or_else(|error| error.into_inner())
         .remove(&surface);
     if let Some(surface_state) = surface_state
-        && let Some(original) = surface_state.original_window
+        && let Some(lease) = surface_state.borderless_lease
         && let Ok(display) = tuxscaling_display::X11Display::connect()
     {
-        let _ = display.resize_window(
-            surface_state.window,
-            tuxscaling_display::Monitor::new(original),
-        );
+        let _ = display.restore(lease);
     }
     let Some(proc) = (unsafe { downstream(instance, c"vkDestroySurfaceKHR") }) else {
         return;

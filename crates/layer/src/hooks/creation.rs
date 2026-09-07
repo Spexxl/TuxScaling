@@ -2,8 +2,7 @@ use super::*;
 
 #[derive(Clone, Copy)]
 struct ResizedWindow {
-    window: u64,
-    original: tuxscaling_display::Rect,
+    lease: tuxscaling_display::BorderlessLease,
 }
 
 fn virtual_swapchain_supported(info: &vk::SwapchainCreateInfoKHR<'_>) -> bool {
@@ -33,30 +32,14 @@ fn clear_surface_virtualization(surface: vk::SurfaceKHR) {
     {
         state.logical_extent = None;
         state.logical_capabilities = None;
-        state.original_window = None;
-    }
-}
-
-fn release_previous_virtual_swapchain(old_swapchain: vk::SwapchainKHR, surface: vk::SurfaceKHR) {
-    let should_restore = swapchains()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get(&old_swapchain)
-        .is_some_and(|state| {
-            let state = state.lock().unwrap_or_else(|error| error.into_inner());
-            state.surface == surface && state.virtual_images.is_some()
-        });
-    if should_restore {
-        super::lifetime::restore_surface_window(surface);
-        clear_surface_virtualization(surface);
+        state.borderless_lease = None;
     }
 }
 
 impl ResizedWindow {
     fn restore(self) {
         if let Ok(display) = tuxscaling_display::X11Display::connect() {
-            let _ =
-                display.resize_window(self.window, tuxscaling_display::Monitor::new(self.original));
+            let _ = display.restore(self.lease);
         }
     }
 }
@@ -130,7 +113,7 @@ fn virtual_output_extent(
             Some(vk::Extent2D { width, height })
         }
     };
-    let surface = match surfaces()
+    let surface_state = match surfaces()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(&surface)
@@ -153,7 +136,7 @@ fn virtual_output_extent(
             return None;
         }
     };
-    let target_info = match display.target_for_window(surface.window) {
+    let target_info = match display.target_for_window(surface_state.window) {
         Ok(target) => target,
         Err(error) => {
             if debug_test {
@@ -162,10 +145,7 @@ fn virtual_output_extent(
             return None;
         }
     };
-    let force_test_virtual = debug_test;
-    if !force_test_virtual && !target_info.is_fullscreen() {
-        return None;
-    }
+    let existing_lease = surface_state.borderless_lease;
     let target = target.unwrap_or(vk::Extent2D {
         width: target_info.monitor.rect.width,
         height: target_info.monitor.rect.height,
@@ -175,28 +155,18 @@ fn virtual_output_extent(
     }
     if cfg!(debug_assertions)
         && std::env::var("TUXSCALING_TEST_FORCE_RESIZE_FAILURE").as_deref() == Ok("1")
+        && existing_lease.is_some()
     {
+        super::lifetime::restore_surface_window(surface);
         eprintln!("TuxScaling: injected fullscreen resize failure; using direct presentation");
         return None;
     }
-    display
-        .resize_window(
-            surface.window,
-            tuxscaling_display::Monitor::new(tuxscaling_display::Rect::new(
-                target_info.monitor.rect.x,
-                target_info.monitor.rect.y,
-                target.width,
-                target.height,
-            )),
-        )
-        .ok()?;
-    Some((
-        target,
-        ResizedWindow {
-            window: surface.window,
-            original: target_info.window.rect,
-        },
-    ))
+    let lease = if let Some(lease) = existing_lease {
+        lease
+    } else {
+        display.promote_borderless(surface_state.window).ok()?
+    };
+    Some((target, ResizedWindow { lease }))
 }
 
 unsafe fn has_present_fences(mut next: *const c_void) -> bool {
@@ -577,9 +547,6 @@ unsafe fn create_swapchain_inner(
         .get(&device)
         .cloned();
     let original = unsafe { &*create_info };
-    if original.old_swapchain != vk::SwapchainKHR::null() {
-        release_previous_virtual_swapchain(original.old_swapchain, original.surface);
-    }
     let mut modified = *original;
     let logical_capabilities = state.as_ref().and_then(|state| unsafe {
         let get: vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR =
@@ -777,8 +744,8 @@ unsafe fn create_swapchain_inner(
                         .and_modify(|surface| {
                             surface.logical_extent = Some(original.image_extent);
                             surface.logical_capabilities = logical_capabilities;
-                            if surface.original_window.is_none() {
-                                surface.original_window = Some(resized_window.original);
+                            if surface.borderless_lease.is_none() {
+                                surface.borderless_lease = Some(resized_window.lease);
                             }
                         });
                     virtual_images = Some(images);
@@ -817,6 +784,10 @@ unsafe fn create_swapchain_inner(
             .get(&original.surface)
             .map(|surface| surface.window);
         let was_virtual = virtual_window.is_some();
+        let monitor = virtual_window.map(|window| {
+            let rect = window.lease.monitor.rect;
+            [rect.x, rect.y, rect.width as i32, rect.height as i32]
+        });
         let overlay = unsafe {
             OverlaySwapchain::new(
                 &device_state.instance,
@@ -839,6 +810,7 @@ unsafe fn create_swapchain_inner(
                                 .ok()
                         })
                         .is_some_and(|target| target.is_fullscreen()),
+                    monitor,
                 },
                 device_state.set_loader_data,
             )

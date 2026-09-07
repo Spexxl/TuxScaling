@@ -55,21 +55,21 @@ unsafe fn destroy_swapchain_inner(
 }
 
 pub(super) fn restore_surface_window(surface: vk::SurfaceKHR) {
-    let Some((window, original)) = surfaces()
+    let Some(lease) = surfaces()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_mut(&surface)
         .and_then(|state| {
-            let original = state.original_window.take()?;
+            let lease = state.borderless_lease.take()?;
             state.logical_extent = None;
             state.logical_capabilities = None;
-            Some((state.window, original))
+            Some(lease)
         })
     else {
         return;
     };
     if let Ok(display) = tuxscaling_display::X11Display::connect() {
-        let _ = display.resize_window(window, tuxscaling_display::Monitor::new(original));
+        let _ = display.restore(lease);
     }
 }
 

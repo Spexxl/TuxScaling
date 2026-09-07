@@ -5,9 +5,13 @@ use x11rb::{
     connection::Connection,
     protocol::{
         randr::ConnectionExt as RandrConnectionExt,
-        xproto::{AtomEnum, ConfigureWindowAux, ConnectionExt as XprotoConnectionExt, Window},
+        xproto::{
+            AtomEnum, ConfigureWindowAux, ConnectionExt as XprotoConnectionExt, PropMode, Window,
+        },
+        xproto::{ClientMessageEvent, EventMask},
     },
     rust_connection::RustConnection,
+    wrapper::ConnectionExt as _,
 };
 
 pub const CRATE_NAME: &str = "tuxscaling-display";
@@ -30,12 +34,19 @@ impl Rect {
         }
     }
 
+    pub const fn is_valid(self) -> bool {
+        self.width != 0 && self.height != 0
+    }
+
     fn intersection_area(self, other: Self) -> u64 {
-        let left = self.x.max(other.x);
-        let top = self.y.max(other.y);
-        let right = (self.x + self.width as i32).min(other.x + other.width as i32);
-        let bottom = (self.y + self.height as i32).min(other.y + other.height as i32);
-        u64::from((right - left).max(0) as u32) * u64::from((bottom - top).max(0) as u32)
+        let left = i64::from(self.x).max(i64::from(other.x));
+        let top = i64::from(self.y).max(i64::from(other.y));
+        let right = (i64::from(self.x) + i64::from(self.width))
+            .min(i64::from(other.x) + i64::from(other.width));
+        let bottom = (i64::from(self.y) + i64::from(self.height))
+            .min(i64::from(other.y) + i64::from(other.height));
+        u64::try_from((right - left).max(0)).unwrap_or(0)
+            * u64::try_from((bottom - top).max(0)).unwrap_or(0)
     }
 }
 
@@ -55,6 +66,29 @@ pub struct X11Window {
     pub id: u64,
     pub rect: Rect,
     pub fullscreen: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowSnapshot {
+    pub rect: Rect,
+    pub fullscreen: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BorderlessLease {
+    pub window: u64,
+    pub original: WindowSnapshot,
+    pub monitor: Monitor,
+}
+
+impl BorderlessLease {
+    pub const fn added_fullscreen(self) -> bool {
+        !self.original.fullscreen
+    }
+
+    pub const fn should_remove_fullscreen(self, current_fullscreen: bool) -> bool {
+        self.added_fullscreen() && current_fullscreen
+    }
 }
 
 impl X11Window {
@@ -88,9 +122,13 @@ impl DisplayTarget {
 }
 
 pub fn select_monitor(window: Rect, monitors: &[Monitor]) -> Option<Monitor> {
+    if !window.is_valid() {
+        return None;
+    }
     monitors
         .iter()
         .copied()
+        .filter(|monitor| monitor.rect.is_valid())
         .max_by_key(|monitor| window.intersection_area(monitor.rect))
         .filter(|monitor| window.intersection_area(monitor.rect) > 0)
 }
@@ -231,10 +269,92 @@ impl X11Display {
             .is_some_and(|mut atoms| atoms.any(|atom| atom == fullscreen))
     }
 
-    pub fn resize_window(&self, window: u64, monitor: Monitor) -> Result<(), DisplayError> {
-        let rect = monitor.rect;
-        if rect.width == 0 || rect.height == 0 {
-            return Err(DisplayError::Monitor);
+    fn set_fullscreen(&self, window: u64, enabled: bool) -> Result<(), DisplayError> {
+        let state = self
+            .connection
+            .intern_atom(false, b"_NET_WM_STATE")
+            .map_err(operation)?
+            .reply()
+            .map_err(operation)?
+            .atom;
+        let fullscreen = self
+            .connection
+            .intern_atom(false, b"_NET_WM_STATE_FULLSCREEN")
+            .map_err(operation)?
+            .reply()
+            .map_err(operation)?
+            .atom;
+        self.connection
+            .send_event(
+                false,
+                self.root,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                ClientMessageEvent::new(
+                    32,
+                    window as Window,
+                    state,
+                    [u32::from(enabled), fullscreen, 0, 0, 0],
+                ),
+            )
+            .map_err(operation)?
+            .check()
+            .map_err(operation)?;
+        self.connection.flush().map_err(operation)
+    }
+
+    fn reconcile_fullscreen_property(
+        &self,
+        window: u64,
+        enabled: bool,
+    ) -> Result<(), DisplayError> {
+        let state = self
+            .connection
+            .intern_atom(false, b"_NET_WM_STATE")
+            .map_err(operation)?
+            .reply()
+            .map_err(operation)?
+            .atom;
+        let fullscreen = self
+            .connection
+            .intern_atom(false, b"_NET_WM_STATE_FULLSCREEN")
+            .map_err(operation)?
+            .reply()
+            .map_err(operation)?
+            .atom;
+        let atoms = self
+            .connection
+            .get_property(false, window as Window, state, AtomEnum::ATOM, 0, 1024)
+            .map_err(operation)?
+            .reply()
+            .map_err(operation)?
+            .value32()
+            .map(|values| {
+                values
+                    .filter(|atom| *atom != fullscreen)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut atoms = atoms;
+        if enabled {
+            atoms.push(fullscreen);
+        }
+        self.connection
+            .change_property32(
+                PropMode::REPLACE,
+                window as Window,
+                state,
+                AtomEnum::ATOM,
+                &atoms,
+            )
+            .map_err(operation)?
+            .check()
+            .map_err(operation)?;
+        self.connection.flush().map_err(operation)
+    }
+
+    fn configure_rect(&self, window: u64, rect: Rect) -> Result<(), DisplayError> {
+        if !rect.is_valid() {
+            return Err(DisplayError::Geometry);
         }
         self.connection
             .configure_window(
@@ -250,11 +370,70 @@ impl X11Display {
             .map_err(operation)?;
         self.connection.flush().map_err(operation)
     }
+
+    pub fn promote_borderless(&self, window: u64) -> Result<BorderlessLease, DisplayError> {
+        let current = self.describe_window(window)?;
+        if !current.rect.is_valid() {
+            return Err(DisplayError::Geometry);
+        }
+        let monitor = self.monitor_for_window(window)?;
+        if !monitor.rect.is_valid() {
+            return Err(DisplayError::Monitor);
+        }
+        let lease = BorderlessLease {
+            window,
+            original: WindowSnapshot {
+                rect: current.rect,
+                fullscreen: current.fullscreen,
+            },
+            monitor,
+        };
+        if lease.added_fullscreen() {
+            self.set_fullscreen(window, true)?;
+        }
+        if let Err(error) = self.configure_rect(window, monitor.rect) {
+            if lease.added_fullscreen() {
+                let _ = self.set_fullscreen(window, false);
+            }
+            return Err(error);
+        }
+        Ok(lease)
+    }
+
+    pub fn restore(&self, lease: BorderlessLease) -> Result<(), DisplayError> {
+        let current_fullscreen = self.is_fullscreen(lease.window);
+        if lease.should_remove_fullscreen(current_fullscreen) {
+            self.set_fullscreen(lease.window, false)?;
+        }
+        self.configure_rect(lease.window, lease.original.rect)?;
+        let restored_fullscreen = self.is_fullscreen(lease.window);
+        if lease.original.fullscreen && !restored_fullscreen {
+            self.set_fullscreen(lease.window, true)?;
+            if !self.is_fullscreen(lease.window) {
+                self.reconcile_fullscreen_property(lease.window, true)?;
+            }
+        } else if lease.added_fullscreen() && restored_fullscreen {
+            self.set_fullscreen(lease.window, false)?;
+            if self.is_fullscreen(lease.window) {
+                self.reconcile_fullscreen_property(lease.window, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn resize_window(&self, window: u64, monitor: Monitor) -> Result<(), DisplayError> {
+        if !monitor.rect.is_valid() {
+            return Err(DisplayError::Monitor);
+        }
+        self.configure_rect(window, monitor.rect)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DisplayTarget, Monitor, Rect, X11Window, select_monitor};
+    use super::{
+        BorderlessLease, DisplayTarget, Monitor, Rect, WindowSnapshot, X11Window, select_monitor,
+    };
 
     #[test]
     fn selects_the_monitor_with_the_largest_window_intersection() {
@@ -288,5 +467,37 @@ mod tests {
         window.fullscreen = false;
         window.rect = monitor.rect;
         assert!(DisplayTarget::new(window, monitor).is_fullscreen());
+    }
+
+    #[test]
+    fn borderless_lease_snapshots_geometry_and_fullscreen_ownership() {
+        let original = WindowSnapshot {
+            rect: Rect::new(-1200, 80, 1280, 720),
+            fullscreen: false,
+        };
+        let monitor = Monitor::new(Rect::new(-1920, 0, 1920, 1080));
+        let lease = BorderlessLease {
+            window: 42,
+            original,
+            monitor,
+        };
+
+        assert_eq!(lease.window, 42);
+        assert!(lease.added_fullscreen());
+        assert!(lease.should_remove_fullscreen(true));
+        assert!(!lease.should_remove_fullscreen(false));
+    }
+
+    #[test]
+    fn zero_sized_windows_and_monitors_are_rejected() {
+        assert!(!Rect::new(0, 0, 0, 100).is_valid());
+        assert!(!Rect::new(0, 0, 100, 0).is_valid());
+        assert_eq!(
+            select_monitor(
+                Rect::new(0, 0, 1280, 720),
+                &[Monitor::new(Rect::new(0, 0, 0, 1080))]
+            ),
+            None
+        );
     }
 }
