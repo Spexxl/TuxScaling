@@ -308,7 +308,7 @@ impl ReferenceUpscaler {
                 guidance.jitter.current[1].to_bits(),
                 guidance.jitter.previous[0].to_bits(),
                 guidance.jitter.previous[1].to_bits(),
-                guidance.pre_exposure.to_bits(),
+                guidance.pre_exposure.value.to_bits(),
                 guidance.timing.validated.as_secs_f32().to_bits(),
             ];
             self.device.cmd_push_constants(

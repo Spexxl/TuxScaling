@@ -3,7 +3,8 @@
 use ash::vk;
 use tuxscaling_temporal::{
     DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResource,
-    GuidanceView, JitterSample, MotionDirection, MotionUnits, SignalState, ValidRegion,
+    GuidanceScalar, GuidanceView, JitterSample, MotionDirection, MotionUnits, SignalState,
+    ValidRegion,
 };
 use tuxscaling_upscaler::ReferenceUpscaler;
 use tuxscaling_vulkan::{Buffer, Image, image_barrier, memory_barrier};
@@ -166,7 +167,7 @@ fn guidance(
             vk::Format::R8_UNORM,
             SignalState::ConstantFallback,
         ),
-        pre_exposure: 1.0,
+        pre_exposure: GuidanceScalar::constant_fallback(1.0),
         timing: FrameTiming::default(),
         jitter: JitterSample::default(),
         depth_semantics: DepthSemantics::RelativeNearIsOne,
@@ -260,6 +261,7 @@ fn disoccluded_reconstruction_does_not_exceed_bilinear_baseline() {
         | vk::ImageUsageFlags::TRANSFER_DST
         | vk::ImageUsageFlags::SAMPLED
         | vk::ImageUsageFlags::STORAGE;
+    let swapchain_usage = image_usage | vk::ImageUsageFlags::COLOR_ATTACHMENT;
     let input = unsafe {
         Image::new(
             device,
@@ -276,7 +278,7 @@ fn disoccluded_reconstruction_does_not_exceed_bilinear_baseline() {
             &gpu.memory,
             output_extent,
             vk::Format::R8G8B8A8_UNORM,
-            image_usage,
+            swapchain_usage,
         )
     }
     .unwrap();
@@ -390,6 +392,15 @@ fn disoccluded_reconstruction_does_not_exceed_bilinear_baseline() {
             vk::ImageLayout::UNDEFINED,
             [0.0, 0.0, 0.0, 1.0],
         );
+        gpu.submit(|command| {
+            image_barrier(
+                &gpu.device,
+                command,
+                swapchain.handle,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            );
+        });
         for (image, value) in [
             (&motion, [0.0, 0.0, 0.0, 0.0]),
             (&confidence, [1.0, 0.0, 0.0, 0.0]),

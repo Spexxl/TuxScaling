@@ -14,6 +14,14 @@ fn confidence_reads_a_separate_dense_motion_source() {
     assert!(!shader.contains("imageLoad(motion_image,n)"));
 }
 
+#[test]
+fn flow_cost_uses_two_axis_luminance_gradients() {
+    let shader = include_str!("../../../shaders/motion/flow.comp");
+    assert!(shader.contains("vec2 source_gradient"));
+    assert!(shader.contains("vec2 target_gradient"));
+    assert!(shader.contains("length(source_gradient"));
+}
+
 fn noise(a: i32, b: i32) -> f32 {
     let mut v = (a as u32).wrapping_mul(1664525) ^ (b as u32).wrapping_mul(1013904223) ^ 0x91e10da5;
     v ^= v >> 16;

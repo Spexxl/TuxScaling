@@ -26,6 +26,8 @@ pub mod quality {
         pub depth: Vec<f32>,
         pub exposure_ev: f32,
         pub scene_cut: bool,
+        pub timing_valid: bool,
+        pub long_pause: bool,
     }
 
     pub type Sequence = SequenceFixture;
@@ -123,6 +125,8 @@ pub mod quality {
             depth: vec![1.0; len],
             exposure_ev: 0.0,
             scene_cut: false,
+            timing_valid: true,
+            long_pause: false,
         }
     }
 
@@ -178,7 +182,94 @@ pub mod quality {
             depth: vec![1.0; len],
             exposure_ev: 0.0,
             scene_cut: false,
+            timing_valid: true,
+            long_pause: false,
         }
+    }
+
+    fn transformed(
+        width: u32,
+        height: u32,
+        angle: f32,
+        scale: f32,
+        dx: f32,
+        dy: f32,
+        seed: u32,
+    ) -> SequenceFixture {
+        let previous = scene(width, height, seed);
+        let (sin, cos) = angle.sin_cos();
+        let cx = (width.saturating_sub(1) as f32) * 0.5;
+        let cy = (height.saturating_sub(1) as f32) * 0.5;
+        let mut current = Vec::with_capacity(previous.len());
+        let mut motion = Vec::with_capacity(previous.len());
+        let mut valid = Vec::with_capacity(previous.len());
+        for y in 0..height {
+            for x in 0..width {
+                let px = x as f32 - cx;
+                let py = y as f32 - cy;
+                let source_x_unclamped = cx + (cos * px + sin * py) / scale - dx;
+                let source_y_unclamped = cy + (-sin * px + cos * py) / scale - dy;
+                let source_x = source_x_unclamped
+                    .round()
+                    .clamp(0.0, width.saturating_sub(1) as f32);
+                let source_y = source_y_unclamped
+                    .round()
+                    .clamp(0.0, height.saturating_sub(1) as f32);
+                current.push(previous[source_y as usize * width as usize + source_x as usize]);
+                motion.push([source_x_unclamped - x as f32, source_y_unclamped - y as f32]);
+                valid.push(
+                    source_x_unclamped >= 0.0
+                        && source_x_unclamped < width as f32
+                        && source_y_unclamped >= 0.0
+                        && source_y_unclamped < height as f32,
+                );
+            }
+        }
+        let len = previous.len();
+        let (_, occlusion, transparency, hud) = empty_labels(len);
+        SequenceFixture {
+            width,
+            height,
+            previous,
+            current,
+            motion,
+            valid,
+            occlusion,
+            transparency,
+            hud,
+            depth: vec![1.0; len],
+            exposure_ev: 0.0,
+            scene_cut: false,
+            timing_valid: true,
+            long_pause: false,
+        }
+    }
+
+    pub fn subpixel_translation(width: u32, height: u32) -> SequenceFixture {
+        base_translation(width, height, 1.5, -0.75, 11)
+    }
+
+    pub fn rotation(width: u32, height: u32) -> SequenceFixture {
+        transformed(width, height, 0.035, 1.0, 0.5, -0.25, 12)
+    }
+
+    pub fn zoom(width: u32, height: u32) -> SequenceFixture {
+        transformed(width, height, 0.0, 1.045, -1.0, 0.75, 13)
+    }
+
+    pub fn independent_objects(width: u32, height: u32) -> SequenceFixture {
+        let mut result = base_translation(width, height, 2.0, -1.0, 14);
+        for y in height / 4..(height * 3 / 4).max(height / 4 + 1) {
+            for x in width / 3..(width * 2 / 3).max(width / 3 + 1) {
+                let index = y as usize * width as usize + x as usize;
+                result.motion[index] = [-5.0, 3.0];
+                let source_x = (x as i32 - 5).clamp(0, width.saturating_sub(1) as i32) as usize;
+                let source_y = (y as i32 + 3).clamp(0, height.saturating_sub(1) as i32) as usize;
+                result.current[index] = result.previous[source_y * width as usize + source_x];
+                result.valid[index] = x >= 5 && y + 3 < height;
+            }
+        }
+        result
     }
 
     /// Two planes with independent translations and deterministic depth.
@@ -211,6 +302,41 @@ pub mod quality {
                 let index = y as usize * width as usize + x as usize;
                 result.current[index] = [1.0, 1.0, 1.0, 1.0];
                 result.occlusion[index] = true;
+            }
+        }
+        result
+    }
+
+    pub fn reveal_occlusion(width: u32, height: u32) -> SequenceFixture {
+        occlusion(width, height)
+    }
+
+    pub fn thin_geometry(width: u32, height: u32) -> SequenceFixture {
+        let mut result = base_translation(width, height, 1.0, 0.0, 15);
+        let x = width / 2;
+        for y in height / 8..(height * 7 / 8).max(height / 8 + 1) {
+            let index = y as usize * width as usize + x as usize;
+            result.current[index] = [1.0, 1.0, 1.0, 1.0];
+            result.occlusion[index] = true;
+        }
+        result
+    }
+
+    pub fn particles(width: u32, height: u32) -> SequenceFixture {
+        let mut result = base_translation(width, height, 1.0, 0.0, 16);
+        for (x, y) in [
+            (width / 4, height / 4),
+            (width / 2, height / 3),
+            (width * 3 / 4, height * 2 / 3),
+        ] {
+            for offset_y in 0..2 {
+                for offset_x in 0..2 {
+                    let px = (x + offset_x).min(width.saturating_sub(1));
+                    let py = (y + offset_y).min(height.saturating_sub(1));
+                    let index = py as usize * width as usize + px as usize;
+                    result.current[index] = [0.9, 0.95, 1.0, 1.0];
+                    result.transparency[index] = true;
+                }
             }
         }
         result
@@ -276,6 +402,18 @@ pub mod quality {
         let mut result = base_translation(width, height, 0.0, 0.0, 9);
         result.current = scene(width, height, 10);
         result.scene_cut = true;
+        result
+    }
+
+    pub fn pause(width: u32, height: u32) -> SequenceFixture {
+        let mut result = base_translation(width, height, 0.0, 0.0, 17);
+        result.long_pause = true;
+        result
+    }
+
+    pub fn invalid_timing(width: u32, height: u32) -> SequenceFixture {
+        let mut result = base_translation(width, height, 0.0, 0.0, 18);
+        result.timing_valid = false;
         result
     }
 

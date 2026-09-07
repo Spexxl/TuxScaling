@@ -7,7 +7,8 @@ use tuxscaling_vulkan::{
 
 use crate::{
     DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResource,
-    GuidanceView, JitterSample, MotionDirection, MotionUnits, SignalState, ValidRegion,
+    GuidanceScalar, GuidanceView, JitterSample, MotionDirection, MotionUnits, SignalState,
+    ValidRegion,
 };
 
 const DEPTH_RECORD_WORDS: u64 = 80;
@@ -738,9 +739,6 @@ impl GuidanceEstimator {
     ) {
         self.provider_failure = true;
         self.history_initialized = false;
-        if !self.initialized {
-            return;
-        }
         unsafe { self.record_inner(command, false, FrameTiming::default(), None, slot) };
     }
 
@@ -787,12 +785,11 @@ impl GuidanceEstimator {
                 || !self.history_initialized
                 || !matches!(reset, GuidanceReset::None),
         };
-        // The final affine/inlier decision is GPU-resident and is only known
-        // while the recorded command executes.  Host metadata remains
-        // conservative instead of inferring support from `valid` or a prior
-        // in-flight frame; the depth image itself writes exact fallback 1.0
-        // when the GPU evidence thresholds are not met.
-        let depth_estimated = false;
+        // Support selection remains GPU-resident.  The host only reports that
+        // a valid depth dispatch was recorded; the shader may still produce a
+        // conservative exact flat-one image when its inlier thresholds are
+        // not met.
+        let depth_estimated = valid && !self.provider_failure;
         let resource =
             |image: vk::Image, view: vk::ImageView, format: vk::Format, state: SignalState| {
                 GuidanceResource {
@@ -874,7 +871,7 @@ impl GuidanceEstimator {
                     SignalState::Estimated
                 },
             ),
-            pre_exposure: 1.0,
+            pre_exposure: GuidanceScalar::constant_fallback(1.0),
             timing,
             jitter: JitterSample::default(),
             depth_semantics: if depth_estimated {

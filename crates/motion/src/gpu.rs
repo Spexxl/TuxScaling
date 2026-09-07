@@ -22,6 +22,19 @@ pub struct MotionProfile {
 }
 
 impl MotionQuality {
+    pub const fn mean_epe_limit(self) -> f32 {
+        match self {
+            Self::Ultra => 1.0,
+            Self::High => 1.25,
+            Self::Balanced => 1.75,
+            Self::Performance => 2.5,
+        }
+    }
+
+    pub const fn p95_epe_limit(self) -> f32 {
+        self.mean_epe_limit() * 2.0
+    }
+
     pub fn profile(self, available_levels: usize) -> MotionProfile {
         let profile = match self {
             Self::Ultra => MotionProfile {

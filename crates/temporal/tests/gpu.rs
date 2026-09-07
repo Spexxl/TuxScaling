@@ -1191,9 +1191,9 @@ fn provider_failure_writes_fallback_guidance_and_labels_the_view() {
             reset,
         )
     };
-    assert!(reactive.iter().all(|value| *value == 0));
-    assert!(disocclusion.iter().all(|value| *value == 0));
-    assert!(transparency.iter().all(|value| *value == 0));
+    assert!(reactive.iter().all(|value| *value == 255));
+    assert!(disocclusion.iter().all(|value| *value == 255));
+    assert!(transparency.iter().all(|value| *value == 255));
     assert!((exposure - 1.0).abs() <= f32::EPSILON);
     assert_eq!(states, [SignalState::ConstantFallback; 4]);
     assert!(reset);
@@ -1296,10 +1296,10 @@ fn relative_depth_orders_independent_parallax_planes() {
         guidance_masks_with_field_options(extent, &previous, &current, None, Some(&motion), false)
     };
     assert!(depth.iter().all(|value| value.is_finite()));
-    // The host view is intentionally conservative: support is decided by the
-    // GPU's slot-local reduction and is not inferred before execution.
-    assert_eq!(depth_state, SignalState::ConstantFallback);
-    assert_eq!(depth_semantics, DepthSemantics::FlatFallback);
+    // A recorded dispatch is an estimated resource even when the GPU chooses
+    // the exact flat-one conservative output for this scene.
+    assert_eq!(depth_state, SignalState::Estimated);
+    assert_eq!(depth_semantics, DepthSemantics::RelativeNearIsOne);
     let score = tuxscaling_temporal::quality::depth_order(&depth, &expected);
     let foreground = (0..extent.height)
         .flat_map(|y| (0..extent.width).map(move |x| (x, y)))
@@ -1331,6 +1331,22 @@ fn relative_depth_orders_independent_parallax_planes() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
+fn valid_depth_dispatch_advertises_estimated_relative_semantics() {
+    let extent = vk::Extent2D {
+        width: 64,
+        height: 48,
+    };
+    let (previous, current, motion, _) = layered_parallax_flow_fixture(extent);
+    let (_, _, _, depth, _, _, depth_state, depth_semantics, _) = unsafe {
+        guidance_masks_with_field_options(extent, &previous, &current, None, Some(&motion), false)
+    };
+    assert!(depth.iter().all(|value| value.is_finite()));
+    assert_eq!(depth_state, SignalState::Estimated);
+    assert_eq!(depth_semantics, DepthSemantics::RelativeNearIsOne);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
 fn relative_depth_uses_flat_fallback_below_global_motion_threshold() {
     let extent = vk::Extent2D {
         width: 64,
@@ -1349,8 +1365,8 @@ fn relative_depth_uses_flat_fallback_below_global_motion_threshold() {
     assert!(depth.iter().all(|value| *value == 1.0));
     assert!(depth.iter().all(|value| value.is_finite()));
     assert_eq!(states[0], SignalState::Estimated);
-    assert_eq!(depth_state, SignalState::ConstantFallback);
-    assert_eq!(depth_semantics, DepthSemantics::FlatFallback);
+    assert_eq!(depth_state, SignalState::Estimated);
+    assert_eq!(depth_semantics, DepthSemantics::RelativeNearIsOne);
 }
 
 #[test]
@@ -1377,6 +1393,6 @@ fn relative_depth_uses_flat_fallback_below_affine_inlier_threshold() {
     };
     assert!(depth.iter().all(|value| *value == 1.0));
     assert!(depth.iter().all(|value| value.is_finite()));
-    assert_eq!(depth_state, SignalState::ConstantFallback);
-    assert_eq!(depth_semantics, DepthSemantics::FlatFallback);
+    assert_eq!(depth_state, SignalState::Estimated);
+    assert_eq!(depth_semantics, DepthSemantics::RelativeNearIsOne);
 }

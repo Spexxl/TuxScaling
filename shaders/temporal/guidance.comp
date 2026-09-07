@@ -194,9 +194,9 @@ float exposure_from_percentile() {
 }
 
 void write_fallback(ivec2 pixel) {
-    imageStore(reactive_image, pixel, vec4(0.0));
-    imageStore(disocclusion_image, pixel, vec4(0.0));
-    imageStore(transparency_image, pixel, vec4(0.0));
+    imageStore(reactive_image, pixel, vec4(1.0));
+    imageStore(disocclusion_image, pixel, vec4(1.0));
+    imageStore(transparency_image, pixel, vec4(1.0));
     imageStore(transparency_residual_image, pixel, vec4(0.0));
     imageStore(depth_image, pixel, vec4(1.0));
 }

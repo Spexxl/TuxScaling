@@ -21,11 +21,15 @@ float robust(float error) {
     // remaining well behaved for flat or denormal input.
     return sqrt(error*error + 1e-4);
 }
-float source_gradient(ivec2 q) {
-    return 0.5 * (source(q+ivec2(1,0))-source(q-ivec2(1,0)));
+vec2 source_gradient(ivec2 q) {
+    return 0.5 * vec2(
+        source(q+ivec2(1,0))-source(q-ivec2(1,0)),
+        source(q+ivec2(0,1))-source(q-ivec2(0,1)));
 }
-float target_gradient(vec2 q) {
-    return 0.5 * (target(q+vec2(1,0))-target(q-vec2(1,0)));
+vec2 target_gradient(vec2 q) {
+    return 0.5 * vec2(
+        target(q+vec2(1,0))-target(q-vec2(1,0)),
+        target(q+vec2(0,1))-target(q-vec2(0,1)));
 }
 float cost(ivec2 center,vec2 delta) {
     vec2 t=vec2(center)+delta;
@@ -37,7 +41,7 @@ float cost(ivec2 center,vec2 delta) {
     for(int y=-radius;y<=radius;y+=step) for(int x=-radius;x<=radius;x+=step) {
         ivec2 sample_position=center+ivec2(x,y);
         float luminance=source(sample_position)-target(vec2(sample_position)+delta);
-        float gradient=source_gradient(sample_position)-target_gradient(vec2(sample_position)+delta);
+        float gradient=length(source_gradient(sample_position)-target_gradient(vec2(sample_position)+delta));
         sum+=0.72*robust(luminance)+0.28*robust(gradient);
         samples++;
     }

@@ -135,6 +135,60 @@ pub enum MotionUnits {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GuidanceSignal {
+    Motion = 0,
+    Confidence = 1,
+    Disocclusion = 2,
+    Reactive = 3,
+    Exposure = 4,
+    RelativeDepth = 5,
+    TransparencyComposition = 6,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuidanceCapabilities {
+    pub estimated: [bool; 7],
+    pub direction: MotionDirection,
+    pub units: MotionUnits,
+}
+
+impl GuidanceCapabilities {
+    pub const fn is_estimated(self, signal: GuidanceSignal) -> bool {
+        self.estimated[signal as usize]
+    }
+}
+
+impl GuidanceSignal {
+    pub const fn fallback_value(self) -> f32 {
+        match self {
+            Self::Motion | Self::Confidence => 0.0,
+            Self::Disocclusion | Self::Reactive | Self::Exposure | Self::RelativeDepth => 1.0,
+            Self::TransparencyComposition => 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GuidanceScalar {
+    pub value: f32,
+    pub state: SignalState,
+}
+
+impl GuidanceScalar {
+    pub const fn constant_fallback(value: f32) -> Self {
+        Self {
+            value,
+            state: SignalState::ConstantFallback,
+        }
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.value.is_finite() && self.value > 0.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuidanceReset {
     None,
     Initialize,
@@ -183,7 +237,8 @@ pub struct GuidanceResource {
 
 impl GuidanceResource {
     pub fn is_valid_for(self, frame_id: u64, extent: FrameExtent) -> bool {
-        self.image != vk::Image::null()
+        extent.is_valid()
+            && self.image != vk::Image::null()
             && self.view != vk::ImageView::null()
             && self.metadata.valid
             && self.metadata.frame_id == frame_id
@@ -201,7 +256,7 @@ pub struct GuidanceView {
     pub exposure: GuidanceResource,
     pub depth: GuidanceResource,
     pub transparency_composition: GuidanceResource,
-    pub pre_exposure: f32,
+    pub pre_exposure: GuidanceScalar,
     pub timing: FrameTiming,
     pub jitter: JitterSample,
     pub depth_semantics: DepthSemantics,
@@ -211,6 +266,35 @@ pub struct GuidanceView {
 }
 
 impl GuidanceView {
+    pub fn capabilities(self) -> GuidanceCapabilities {
+        GuidanceCapabilities {
+            estimated: [
+                self.motion.state,
+                self.confidence.state,
+                self.disocclusion.state,
+                self.reactive.state,
+                self.exposure.state,
+                self.depth.state,
+                self.transparency_composition.state,
+            ]
+            .map(|state| state == SignalState::Estimated),
+            direction: self.direction,
+            units: self.units,
+        }
+    }
+
+    pub fn resource(self, signal: GuidanceSignal) -> GuidanceResource {
+        match signal {
+            GuidanceSignal::Motion => self.motion,
+            GuidanceSignal::Confidence => self.confidence,
+            GuidanceSignal::Disocclusion => self.disocclusion,
+            GuidanceSignal::Reactive => self.reactive,
+            GuidanceSignal::Exposure => self.exposure,
+            GuidanceSignal::RelativeDepth => self.depth,
+            GuidanceSignal::TransparencyComposition => self.transparency_composition,
+        }
+    }
+
     pub fn has_expected_formats(self) -> bool {
         self.motion.format == vk::Format::R16G16_SFLOAT
             && self.confidence.format == vk::Format::R8_UNORM
@@ -233,8 +317,7 @@ impl GuidanceView {
             && matches!(self.direction, MotionDirection::CurrentToPrevious)
             && matches!(self.units, MotionUnits::SourcePixels)
             && self.timing.is_finite()
-            && self.pre_exposure.is_finite()
-            && self.pre_exposure > 0.0
+            && self.pre_exposure.is_valid()
             && self.jitter.is_finite()
     }
 }
@@ -282,7 +365,7 @@ mod tests {
             exposure: resource(metadata, vk::Format::R32_SFLOAT),
             depth: resource(metadata, vk::Format::R32_SFLOAT),
             transparency_composition: resource(metadata, vk::Format::R8_UNORM),
-            pre_exposure: 1.0,
+            pre_exposure: GuidanceScalar::constant_fallback(1.0),
             timing: FrameTiming::default(),
             jitter: JitterSample::default(),
             depth_semantics: DepthSemantics::FlatFallback,

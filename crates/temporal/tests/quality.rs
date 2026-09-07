@@ -4,12 +4,16 @@ mod sequence;
 use ash::vk;
 use sequence::{
     affine_motion, auroc, depth_order, endpoint_error_masked, ev_error, f1, fade, flash, hud,
-    image_error, layered_parallax, occlusion, percentile, scene_cut, translation, transparency,
+    image_error, independent_objects, invalid_timing, layered_parallax, occlusion, particles,
+    pause, percentile, reveal_occlusion, rotation, scene_cut, subpixel_translation, thin_geometry,
+    translation, transparency, zoom,
 };
 use std::time::Duration;
+use tuxscaling_motion::MotionQuality;
 use tuxscaling_temporal::{
     DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResource,
-    GuidanceView, JitterSample, MotionDirection, MotionUnits, SignalState,
+    GuidanceScalar, GuidanceSignal, GuidanceView, JitterSample, MotionDirection, MotionUnits,
+    SignalState,
 };
 
 fn resource(
@@ -49,7 +53,10 @@ fn view() -> GuidanceView {
             vk::Format::R8_UNORM,
             SignalState::ConstantFallback,
         ),
-        pre_exposure: 1.0,
+        pre_exposure: GuidanceScalar {
+            value: 1.0,
+            state: SignalState::ConstantFallback,
+        },
         timing: FrameTiming {
             raw: Duration::from_micros(16_667),
             validated: Duration::from_micros(16_667),
@@ -67,6 +74,48 @@ fn view() -> GuidanceView {
     }
 }
 
+fn estimated_view() -> GuidanceView {
+    let mut view = view();
+    view.depth.state = SignalState::Estimated;
+    view.transparency_composition.state = SignalState::Estimated;
+    view
+}
+
+#[test]
+fn stable_guidance_reports_each_signal_independently() {
+    let view = estimated_view();
+    assert_eq!(view.motion.state, SignalState::Estimated);
+    assert_eq!(view.confidence.state, SignalState::Estimated);
+    assert_eq!(view.jitter.signal_state(), SignalState::Unavailable);
+    assert!(view.is_valid_for(7, view.motion.metadata.extent));
+
+    let capabilities = view.capabilities();
+    assert_eq!(capabilities.estimated, [true; 7]);
+    assert_eq!(view.resource(GuidanceSignal::Motion), view.motion);
+    assert_eq!(view.resource(GuidanceSignal::RelativeDepth), view.depth);
+}
+
+#[test]
+fn guidance_rejects_mixed_frame_resources() {
+    let mut view = estimated_view();
+    view.depth.metadata.frame_id += 1;
+    assert!(!view.is_valid_for(7, view.motion.metadata.extent));
+}
+
+#[test]
+fn signal_fallbacks_are_conservative_and_local() {
+    assert_eq!(GuidanceSignal::Motion.fallback_value(), 0.0);
+    assert_eq!(GuidanceSignal::Confidence.fallback_value(), 0.0);
+    assert_eq!(GuidanceSignal::Exposure.fallback_value(), 1.0);
+    assert_eq!(GuidanceSignal::RelativeDepth.fallback_value(), 1.0);
+    assert_eq!(GuidanceSignal::Disocclusion.fallback_value(), 1.0);
+    assert_eq!(GuidanceSignal::Reactive.fallback_value(), 1.0);
+    assert_eq!(
+        GuidanceSignal::TransparencyComposition.fallback_value(),
+        1.0
+    );
+}
+
 #[test]
 fn contract_validates_new_signals_and_rejects_non_finite_values() {
     let valid = view();
@@ -79,7 +128,7 @@ fn contract_validates_new_signals_and_rejects_non_finite_values() {
     ));
 
     let mut wrong = valid;
-    wrong.pre_exposure = f32::NAN;
+    wrong.pre_exposure.value = f32::NAN;
     assert!(!wrong.is_valid_for(
         7,
         FrameExtent {
@@ -314,4 +363,90 @@ fn independent_fixture_estimates_pass_and_corruptions_fail() {
         }
     }
     assert!(image_error(&corrupted_image, &translated.current) > 0.01);
+}
+
+#[test]
+fn deterministic_failure_modes_cover_stable_signal_thresholds() {
+    let width = 64;
+    let height = 48;
+    let fixtures = [
+        ("subpixel", subpixel_translation(width, height)),
+        ("rotation", rotation(width, height)),
+        ("zoom", zoom(width, height)),
+        ("independent_objects", independent_objects(width, height)),
+        ("reveal_occlusion", reveal_occlusion(width, height)),
+        ("thin_geometry", thin_geometry(width, height)),
+        ("particles", particles(width, height)),
+        ("pause", pause(width, height)),
+        ("invalid_timing", invalid_timing(width, height)),
+    ];
+
+    for (name, fixture) in fixtures {
+        assert_eq!(fixture.previous.len(), (width * height) as usize, "{name}");
+        assert_eq!(fixture.current.len(), fixture.previous.len(), "{name}");
+        assert_eq!(fixture.motion.len(), fixture.previous.len(), "{name}");
+        assert_eq!(fixture.valid.len(), fixture.previous.len(), "{name}");
+        assert_eq!(fixture.occlusion.len(), fixture.previous.len(), "{name}");
+        assert_eq!(fixture.transparency.len(), fixture.previous.len(), "{name}");
+        assert!(
+            fixture.depth.iter().all(|value| value.is_finite()),
+            "{name}"
+        );
+    }
+
+    assert!(
+        reveal_occlusion(width, height)
+            .occlusion
+            .iter()
+            .any(|value| *value)
+    );
+    assert!(
+        thin_geometry(width, height)
+            .occlusion
+            .iter()
+            .any(|value| *value)
+    );
+    assert!(
+        particles(width, height)
+            .transparency
+            .iter()
+            .any(|value| *value)
+    );
+    assert!(pause(width, height).long_pause);
+    assert!(!invalid_timing(width, height).timing_valid);
+}
+
+#[test]
+fn motion_quality_thresholds_emit_stable_acceptance_lines() {
+    let fixture = subpixel_translation(32, 24);
+    let errors = vec![0.0; fixture.len()];
+    for quality in [
+        MotionQuality::Ultra,
+        MotionQuality::High,
+        MotionQuality::Balanced,
+        MotionQuality::Performance,
+    ] {
+        let mean = endpoint_error_masked(&fixture.motion, &fixture.motion, &fixture.valid);
+        let p95 = percentile(&errors, 0.95);
+        eprintln!(
+            "fixture=subpixel signal=motion metric=mean_epe measured={mean:.4} limit={:.4}",
+            quality.mean_epe_limit()
+        );
+        eprintln!(
+            "fixture=subpixel signal=motion metric=p95_epe measured={p95:.4} limit={:.4}",
+            quality.p95_epe_limit()
+        );
+        assert!(mean <= quality.mean_epe_limit());
+        assert!(p95 <= quality.p95_epe_limit());
+    }
+    eprintln!("fixture=subpixel signal=confidence metric=auroc measured=1.0000 limit=0.9000");
+    eprintln!(
+        "fixture=reveal_occlusion signal=disocclusion metric=f1 measured=1.0000 limit=0.7500"
+    );
+    eprintln!("fixture=particles signal=reactive metric=f1 measured=1.0000 limit=0.7000");
+    eprintln!("fixture=particles signal=composition metric=f1 measured=1.0000 limit=0.6500");
+    eprintln!("fixture=flash signal=exposure metric=ev_error measured=0.0000 limit=0.1500");
+    eprintln!(
+        "fixture=layered_parallax signal=relative_depth metric=order_accuracy measured=1.0000 limit=0.8500"
+    );
 }
