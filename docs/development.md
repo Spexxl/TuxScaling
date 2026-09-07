@@ -58,15 +58,15 @@ The default profile is equivalent to:
 ```toml
 motion_quality = "balanced"
 output_resolution = "native"
-processing_scale = 1.0
+guidance_scale = 1.0
 debug_view = "original"
 ```
 
-`processing_scale` is optional internal work reduction after capture. It does not change the game resolution or the output resolution; its default is `1.0`. The legacy `render_scale` key is accepted during the migration.
+`guidance_scale` is optional internal work reduction for estimator guidance after full-resolution source capture. It does not change the game resolution or the output resolution; its default is `1.0` and its manual range is `0.5..=1.0`. The legacy `processing_scale` and `render_scale` keys are accepted as deserialization aliases during the migration.
 
 The fixed quality targets are Ultra (12 ms), High (8 ms), Balanced (4 ms), and Performance (2.5 ms) for temporal work at 1080p. The overlay reports capture, luma, pyramid, forward/backward flow, confidence, scene, invalidate, reactive, exposure, depth, guidance total, reconstruction, overlay, and full injected timings. Logs report median and p95 for every phase plus guidance-only and full-injected totals. It warns when measured work exceeds the selected target; it never changes the preset automatically.
 
-Run the acceptance benchmark with `cargo xtask benchmark`. It uses one WSI swapchain, Vulkan validation, 180 warm-up frames, 600 measured frames, both `processing_scale = 1.0` and `0.5`, all four motion qualities, and both 1280x720-to-native-monitor upscale and native-monitor Native AA scenarios. On a 1920x1080 monitor this is the 1280x720-to-1920x1080 matrix; the harness follows the active RandR monitor elsewhere. Guidance-only and full-injected median/p95 totals are emitted separately; the normal configuration default remains `1.0`.
+Run the acceptance benchmark with `cargo xtask benchmark`. It uses one WSI swapchain, Vulkan validation, 180 warm-up frames, 600 measured frames, both `guidance_scale = 1.0` and `0.5`, all four motion qualities, and both 1280x720-to-native-monitor upscale and native-monitor Native AA scenarios. On a 1920x1080 monitor this is the 1280x720-to-1920x1080 matrix; the harness follows the active RandR monitor elsewhere. Guidance-only and full-injected median/p95 totals are emitted separately; the normal configuration default remains `1.0`.
 
 Run a controlled visible `vkcube` session with `cargo xtask vkcube --seconds 10`. The runner builds the layer in the selected debug or release profile, enables the TuxScaling and Vulkan validation layers, prints an explicit startup marker, and terminates and reaps `vkcube` after the requested interval. Use `--release` for the release profile and `--seconds N` for a positive duration.
 

@@ -98,7 +98,7 @@ pub struct TemporalPipeline {
     pub(crate) pending_timing: FrameTiming,
     pub(crate) reset_reason: GuidanceReset,
     pub(crate) pending_quality: Option<MotionQuality>,
-    pub(crate) pending_processing_scale: Option<f32>,
+    pub(crate) pending_guidance_scale: Option<f32>,
     pub(crate) queries: vk::QueryPool,
     pub(crate) query_ready: Vec<bool>,
     pub(crate) timestamp_period: f32,
@@ -122,9 +122,7 @@ impl TemporalPipeline {
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         let properties = unsafe { instance.get_physical_device_properties(physical) };
         let capture = if capture_enabled {
-            Some(unsafe {
-                Capture::new(device, &memory, resolution.processing_extent, info.format)
-            }?)
+            Some(unsafe { Capture::new(device, &memory, resolution.guidance_extent, info.format) }?)
         } else {
             None
         };
@@ -133,7 +131,7 @@ impl TemporalPipeline {
                 MotionEstimator::new(
                     device,
                     &memory,
-                    resolution.processing_extent,
+                    resolution.guidance_extent,
                     capture.color.view,
                     matches!(
                         info.format,
@@ -156,7 +154,7 @@ impl TemporalPipeline {
                 GuidanceEstimator::new_with_slots(
                     device,
                     &memory,
-                    resolution.processing_extent,
+                    resolution.guidance_extent,
                     capture.color.view,
                     capture.previous.view,
                     motion.confidence.view,
@@ -191,7 +189,7 @@ impl TemporalPipeline {
                 let view = guidance.view(
                     motion,
                     0,
-                    resolution.processing_extent,
+                    resolution.guidance_extent,
                     false,
                     FrameTiming::default(),
                     GuidanceReset::Initialize,
@@ -201,7 +199,7 @@ impl TemporalPipeline {
                         device,
                         &memory,
                         capture.color.view,
-                        resolution.processing_extent,
+                        resolution.guidance_extent,
                         resolution.output_extent,
                         info.format,
                         view,
@@ -238,7 +236,7 @@ impl TemporalPipeline {
             pending_timing: FrameTiming::default(),
             reset_reason: GuidanceReset::Initialize,
             pending_quality: None,
-            pending_processing_scale: None,
+            pending_guidance_scale: None,
             queries: vk::QueryPool::null(),
             query_ready: vec![false; image_count],
             timestamp_period,
@@ -277,7 +275,7 @@ impl TemporalPipeline {
             pending_timing: FrameTiming::default(),
             reset_reason: GuidanceReset::Initialize,
             pending_quality: None,
-            pending_processing_scale: None,
+            pending_guidance_scale: None,
             queries: vk::QueryPool::null(),
             query_ready: Vec::new(),
             timestamp_period: 0.0,

@@ -459,7 +459,7 @@ impl SwapchainRuntime {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
         let resolution =
-            ResolutionPlan::new(images.game_extent, info.extent, config.processing_scale);
+            ResolutionPlan::new(images.game_extent, info.extent, config.guidance_scale);
         let overlay = unsafe {
             OverlayRenderer::new(
                 instance,
@@ -532,7 +532,7 @@ impl SwapchainRuntime {
                 jitter_mode: config.jitter_mode,
                 debug_view: config.debug_view,
                 reset_reason: reset_name(GuidanceReset::Initialize).into(),
-                processing_scale: config.processing_scale,
+                guidance_scale: config.guidance_scale,
                 presentation_mode: if !capture_enabled {
                     "Fallback: unsupported capture"
                 } else if diagnostic_resolution.game_extent != diagnostic_resolution.output_extent {
@@ -556,9 +556,9 @@ impl SwapchainRuntime {
                     diagnostic_resolution.game_extent.width,
                     diagnostic_resolution.game_extent.height,
                 ],
-                processing_extent: [
-                    diagnostic_resolution.processing_extent.width,
-                    diagnostic_resolution.processing_extent.height,
+                guidance_extent: [
+                    diagnostic_resolution.guidance_extent.width,
+                    diagnostic_resolution.guidance_extent.height,
                 ],
                 output_extent: [
                     diagnostic_resolution.output_extent.width,
@@ -656,18 +656,18 @@ impl SwapchainRuntime {
         Ok(())
     }
 
-    unsafe fn apply_pending_processing_scale(&mut self) -> Result<(), vk::Result> {
-        let Some(scale) = self.temporal.pending_processing_scale.take() else {
+    unsafe fn apply_pending_guidance_scale(&mut self) -> Result<(), vk::Result> {
+        let Some(scale) = self.temporal.pending_guidance_scale.take() else {
             return Ok(());
         };
-        if (scale - self.diagnostics.processing_scale).abs() < f32::EPSILON {
+        if (scale - self.diagnostics.guidance_scale).abs() < f32::EPSILON {
             return Ok(());
         }
         for slot in &self.slots {
             unsafe { self.device.wait_for_fences(&[slot.fence], true, u64::MAX) }?;
         }
         let mut config = self.temporal.config.clone();
-        config.processing_scale = scale;
+        config.guidance_scale = scale;
         let resolution = ResolutionPlan::new(
             self.temporal.resolution.game_extent,
             self.temporal.resolution.output_extent,
@@ -689,7 +689,7 @@ impl SwapchainRuntime {
                 &self.device,
             )?;
         }
-        self.diagnostics.processing_scale = scale;
+        self.diagnostics.guidance_scale = scale;
         self.temporal.reset_reason = GuidanceReset::PresetChanged;
         self.temporal.jitter.reset();
         self.diagnostics.jitter_mode = self.temporal.jitter.mode();
@@ -703,11 +703,11 @@ impl SwapchainRuntime {
                 )
             }?;
         }
-        self.diagnostics.processing_extent = [
-            resolution.processing_extent.width,
-            resolution.processing_extent.height,
+        self.diagnostics.guidance_extent = [
+            resolution.guidance_extent.width,
+            resolution.guidance_extent.height,
         ];
-        self.diagnostics.state = "Processing scale changed; history reset".into();
+        self.diagnostics.state = "Guidance scale changed; history reset".into();
         Ok(())
     }
     pub unsafe fn prepare_frame(
@@ -729,7 +729,7 @@ impl SwapchainRuntime {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
         unsafe { self.initialize(queue, family) }?;
-        unsafe { self.apply_pending_processing_scale() }?;
+        unsafe { self.apply_pending_guidance_scale() }?;
         if let Some(guidance) = &mut self.temporal.guidance {
             guidance.clear_provider_failure();
         }
@@ -836,8 +836,8 @@ impl SwapchainRuntime {
         if let Some(quality) = frame.requested_quality {
             self.temporal.pending_quality = Some(motion_quality(quality));
         }
-        if let Some(scale) = frame.requested_processing_scale {
-            self.temporal.pending_processing_scale = Some(scale);
+        if let Some(scale) = frame.requested_guidance_scale {
+            self.temporal.pending_guidance_scale = Some(scale);
         }
         if let Some(mode) = frame.requested_jitter_mode
             && self.temporal.jitter.set_mode(mode)
@@ -891,7 +891,7 @@ impl SwapchainRuntime {
                 let mut view = guidance.view(
                     motion,
                     self.temporal.history.frame_id + 1,
-                    self.temporal.resolution.processing_extent,
+                    self.temporal.resolution.guidance_extent,
                     valid,
                     self.temporal.pending_timing,
                     if valid {
@@ -918,8 +918,8 @@ impl SwapchainRuntime {
         };
         let guidance_view = guidance_view.and_then(|view| {
             let frame_extent = FrameExtent {
-                width: self.temporal.resolution.processing_extent.width,
-                height: self.temporal.resolution.processing_extent.height,
+                width: self.temporal.resolution.guidance_extent.width,
+                height: self.temporal.resolution.guidance_extent.height,
             };
             if view.is_valid_for(self.temporal.history.frame_id + 1, frame_extent) {
                 Some(view)
@@ -1218,7 +1218,7 @@ impl SwapchainRuntime {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
         unsafe { self.initialize(queue, family) }?;
-        unsafe { self.apply_pending_processing_scale() }?;
+        unsafe { self.apply_pending_guidance_scale() }?;
         let index = index as usize;
         let output_layout = if self.output_presented[index] {
             vk::ImageLayout::PRESENT_SRC_KHR
@@ -1241,8 +1241,8 @@ impl SwapchainRuntime {
         if let Some(quality) = frame.requested_quality {
             self.temporal.pending_quality = Some(motion_quality(quality));
         }
-        if let Some(scale) = frame.requested_processing_scale {
-            self.temporal.pending_processing_scale = Some(scale);
+        if let Some(scale) = frame.requested_guidance_scale {
+            self.temporal.pending_guidance_scale = Some(scale);
         }
         unsafe {
             self.device

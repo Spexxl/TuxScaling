@@ -192,7 +192,7 @@ fn run_vkcube(root: &Path, options: VkcubeOptions) -> VkcubeExit {
 struct BenchmarkCase {
     scenario: &'static str,
     quality: &'static str,
-    processing_scale_percent: u32,
+    guidance_scale_percent: u32,
 }
 
 fn benchmark_cases() -> Vec<BenchmarkCase> {
@@ -201,13 +201,13 @@ fn benchmark_cases() -> Vec<BenchmarkCase> {
         .flat_map(|scenario| {
             [100, 50]
                 .into_iter()
-                .flat_map(move |processing_scale_percent| {
+                .flat_map(move |guidance_scale_percent| {
                     ["ultra", "high", "balanced", "performance"]
                         .into_iter()
                         .map(move |quality| BenchmarkCase {
                             scenario,
                             quality,
-                            processing_scale_percent,
+                            guidance_scale_percent,
                         })
                 })
         })
@@ -231,6 +231,16 @@ fn report(result: std::io::Result<Output>) -> bool {
         }
     }
 }
+
+fn generated_config(output_resolution: &str, guidance_scale: f32, quality: Option<&str>) -> String {
+    let quality = quality.map_or_else(String::new, |quality| {
+        format!("motion_quality = \"{quality}\"\n")
+    });
+    format!(
+        "output_resolution = \"{output_resolution}\"\nguidance_scale = {guidance_scale}\n{quality}"
+    )
+}
+
 fn run(program: &str, args: &[&str]) -> bool {
     report(Command::new(program).args(args).output())
 }
@@ -286,17 +296,9 @@ fn main() -> ExitCode {
                 .chain(std::env::split_paths(&inherited))
                 .collect::<Vec<_>>();
             let smoke_config = root.join("target/native-output-smoke.toml");
-            std::fs::write(
-                &smoke_config,
-                "output_resolution = \"native\"\nprocessing_scale = 1.0\n",
-            )
-            .unwrap();
+            std::fs::write(&smoke_config, generated_config("native", 1.0, None)).unwrap();
             let direct_config = root.join("target/native-aa-smoke.toml");
-            std::fs::write(
-                &direct_config,
-                "output_resolution = \"swapchain\"\nprocessing_scale = 1.0\n",
-            )
-            .unwrap();
+            std::fs::write(&direct_config, generated_config("swapchain", 1.0, None)).unwrap();
             let run_wsi = |scenario: &str, force_temporal_failure, resize_failure| {
                 let mut command = Command::new(root.join("target/debug/examples/wsi"));
                 validation(&mut command)
@@ -368,7 +370,7 @@ fn main() -> ExitCode {
                     "target/benchmark-{}-{}-{}.toml",
                     case.scenario,
                     case.quality,
-                    case.processing_scale_percent
+                    case.guidance_scale_percent
                 ));
                 let output_resolution = if case.scenario == "native_aa" {
                     "swapchain"
@@ -377,10 +379,10 @@ fn main() -> ExitCode {
                 };
                 if std::fs::write(
                     &config,
-                    format!(
-                        "output_resolution = \"{output_resolution}\"\nprocessing_scale = {}\nmotion_quality = \"{}\"\n",
-                        case.processing_scale_percent as f32 / 100.0,
-                        case.quality
+                    generated_config(
+                        output_resolution,
+                        case.guidance_scale_percent as f32 / 100.0,
+                        Some(case.quality),
                     ),
                 )
                 .is_err()
@@ -388,8 +390,8 @@ fn main() -> ExitCode {
                     return false;
                 }
                 eprintln!(
-                    "TuxScaling benchmark: scenario={} quality={} processing_scale={}% warmup=180 samples=600",
-                    case.scenario, case.quality, case.processing_scale_percent
+                    "TuxScaling benchmark: scenario={} quality={} guidance_scale={}% warmup=180 samples=600",
+                    case.scenario, case.quality, case.guidance_scale_percent
                 );
                 let mut command = Command::new(root.join("target/debug/examples/wsi"));
                 validation(&mut command)
@@ -458,7 +460,8 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        VkcubeExit, benchmark_cases, classify_vkcube_exit, parse_vkcube_args, vkcube_launch,
+        VkcubeExit, benchmark_cases, classify_vkcube_exit, generated_config, parse_vkcube_args,
+        vkcube_launch,
     };
     use std::path::Path;
 
@@ -480,12 +483,8 @@ mod tests {
                 .count(),
             8
         );
-        assert!(
-            cases
-                .iter()
-                .any(|case| case.processing_scale_percent == 100)
-        );
-        assert!(cases.iter().any(|case| case.processing_scale_percent == 50));
+        assert!(cases.iter().any(|case| case.guidance_scale_percent == 100));
+        assert!(cases.iter().any(|case| case.guidance_scale_percent == 50));
     }
 
     #[test]
@@ -559,5 +558,14 @@ mod tests {
             classify_vkcube_exit(None, true, false, false, false),
             VkcubeExit::MissingStartupEvidence
         );
+    }
+
+    #[test]
+    fn generated_configuration_emits_only_the_canonical_guidance_key() {
+        let source = generated_config("native", 1.0, Some("ultra"));
+
+        assert!(source.contains("guidance_scale = 1"));
+        assert!(!source.contains("processing_scale"));
+        assert!(!source.contains("render_scale"));
     }
 }

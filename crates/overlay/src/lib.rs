@@ -10,14 +10,14 @@ pub struct FrameDiagnostics {
     pub mode: String,
     pub quality: MotionQuality,
     pub requested_quality: Option<MotionQuality>,
-    pub requested_processing_scale: Option<f32>,
+    pub requested_guidance_scale: Option<f32>,
     pub requested_jitter_mode: Option<JitterMode>,
     pub requested_debug_view: Option<DebugView>,
     pub jitter_mode: JitterMode,
     pub debug_view: DebugView,
-    pub processing_scale: f32,
+    pub guidance_scale: f32,
     pub game_extent: [u32; 2],
-    pub processing_extent: [u32; 2],
+    pub guidance_extent: [u32; 2],
     pub output_extent: [u32; 2],
     pub presentation_mode: String,
     pub window_mode: String,
@@ -87,7 +87,7 @@ pub fn debug_view_label(view: DebugView) -> &'static str {
     }
 }
 
-pub fn processing_scale_request(value: f32) -> Option<f32> {
+pub fn guidance_scale_request(value: f32) -> Option<f32> {
     value
         .is_finite()
         .then_some(value)
@@ -102,7 +102,7 @@ pub fn render_diagnostics(
     visible: bool,
 ) -> OverlayFrame {
     diagnostics.requested_quality = None;
-    diagnostics.requested_processing_scale = None;
+    diagnostics.requested_guidance_scale = None;
     diagnostics.requested_jitter_mode = None;
     diagnostics.requested_debug_view = None;
     let output = context.run(
@@ -145,16 +145,16 @@ pub fn render_diagnostics(
                             }
                         });
                     ui.label(format!(
-                        "Processing scale: {:.0}%",
-                        diagnostics.processing_scale * 100.0
+                        "Guidance scale: {:.0}%",
+                        diagnostics.guidance_scale * 100.0
                     ));
                     if diagnostics.game_extent[0] > 0 && diagnostics.output_extent[0] > 0 {
                         ui.label(format!(
                             "Game: {} x {} | Processing: {} x {} | Output: {} x {}",
                             diagnostics.game_extent[0],
                             diagnostics.game_extent[1],
-                            diagnostics.processing_extent[0],
-                            diagnostics.processing_extent[1],
+                            diagnostics.guidance_extent[0],
+                            diagnostics.guidance_extent[1],
                             diagnostics.output_extent[0],
                             diagnostics.output_extent[1],
                         ));
@@ -167,16 +167,15 @@ pub fn render_diagnostics(
                     egui::CollapsingHeader::new("Advanced")
                         .default_open(false)
                         .show(ui, |ui| {
-                            let mut scale = diagnostics.processing_scale;
+                            let mut scale = diagnostics.guidance_scale;
                             if ui
                                 .add(
                                     egui::Slider::new(&mut scale, 0.5..=1.0)
-                                        .text("Processing scale"),
+                                        .text("Guidance scale"),
                                 )
                                 .changed()
                             {
-                                diagnostics.requested_processing_scale =
-                                    processing_scale_request(scale);
+                                diagnostics.requested_guidance_scale = guidance_scale_request(scale);
                             }
                             ui.small(
                                 "This does not reduce the game's rendering workload.",
@@ -311,7 +310,7 @@ pub fn render_diagnostics(
         primitives: context.tessellate(output.shapes, output.pixels_per_point),
         textures_delta: output.textures_delta,
         requested_quality: diagnostics.requested_quality,
-        requested_processing_scale: diagnostics.requested_processing_scale,
+        requested_guidance_scale: diagnostics.requested_guidance_scale,
         requested_jitter_mode: diagnostics.requested_jitter_mode,
         requested_debug_view: diagnostics.requested_debug_view,
     }
@@ -339,7 +338,7 @@ pub struct OverlayFrame {
     pub primitives: Vec<ClippedPrimitive>,
     pub textures_delta: TexturesDelta,
     pub requested_quality: Option<MotionQuality>,
-    pub requested_processing_scale: Option<f32>,
+    pub requested_guidance_scale: Option<f32>,
     pub requested_jitter_mode: Option<JitterMode>,
     pub requested_debug_view: Option<DebugView>,
 }
@@ -375,7 +374,7 @@ pub fn render_smoke_frame(
         primitives,
         textures_delta: output.textures_delta,
         requested_quality: None,
-        requested_processing_scale: None,
+        requested_guidance_scale: None,
         requested_jitter_mode: None,
         requested_debug_view: None,
     }
@@ -405,8 +404,7 @@ impl Default for OverlayState {
 #[cfg(test)]
 mod tests {
     use super::{
-        OverlayState, debug_view_label, processing_scale_request, render_smoke_frame,
-        resolution_mode,
+        OverlayState, debug_view_label, guidance_scale_request, render_smoke_frame, resolution_mode,
     };
     use tuxscaling_config::DebugView;
 
@@ -439,11 +437,11 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_processing_scales_in_the_supported_range() {
-        assert_eq!(processing_scale_request(0.75), Some(0.75));
-        assert_eq!(processing_scale_request(0.49), None);
-        assert_eq!(processing_scale_request(1.01), None);
-        assert_eq!(processing_scale_request(f32::NAN), None);
+    fn accepts_only_guidance_scales_in_the_supported_range() {
+        assert_eq!(guidance_scale_request(0.75), Some(0.75));
+        assert_eq!(guidance_scale_request(0.49), None);
+        assert_eq!(guidance_scale_request(1.01), None);
+        assert_eq!(guidance_scale_request(f32::NAN), None);
     }
 
     #[test]

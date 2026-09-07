@@ -97,7 +97,7 @@ fn auroc(positive: &[f32], negative: &[f32]) -> f32 {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn dense_outputs_match_processing_extent() {
+fn dense_outputs_match_guidance_extent() {
     let gpu = unsafe { Gpu::new() };
     let extent = vk::Extent2D {
         width: 129,
