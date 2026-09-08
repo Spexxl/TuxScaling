@@ -1,11 +1,12 @@
 use std::{
+    io::Read,
     path::{Path, PathBuf},
     process::{Child, Command, ExitCode, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
-const VKCUBE_STARTUP_MARKER: &str = "TuxScaling vkcube startup: layer enabled";
+const VKCUBE_LAYER_EVIDENCE_MARKER: &str = "TuxScaling swapchain:";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct VkcubeOptions {
@@ -107,6 +108,19 @@ fn classify_vkcube_exit(
     }
 }
 
+fn classify_vkcube_output(stdout: &[u8], stderr: &[u8]) -> (bool, bool) {
+    let output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
+    )
+    .to_ascii_lowercase();
+    (
+        output.contains(&VKCUBE_LAYER_EVIDENCE_MARKER.to_ascii_lowercase()),
+        output.contains("validation error"),
+    )
+}
+
 fn configure_vkcube_command(root: &Path, options: VkcubeOptions) -> Command {
     let launch = vkcube_launch(root, options);
     let inherited = std::env::var_os("LD_LIBRARY_PATH").unwrap_or_default();
@@ -123,44 +137,69 @@ fn configure_vkcube_command(root: &Path, options: VkcubeOptions) -> Command {
         )
         .env("TUXSCALING_VIEW", "reconstructed")
         .env("TUXSCALING_CONFIG", launch.config_path)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     command
 }
 
 fn wait_for_vkcube(mut child: Child, seconds: u64) -> VkcubeExit {
+    let Some(mut stdout) = child.stdout.take() else {
+        return VkcubeExit::UnexpectedExit;
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        return VkcubeExit::UnexpectedExit;
+    };
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.read_to_end(&mut bytes);
+        (result, bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stderr.read_to_end(&mut bytes);
+        (result, bytes)
+    });
     let deadline = Instant::now() + Duration::from_secs(seconds);
-    let mut startup_evidence = false;
-    loop {
+    let (status, timed_out) = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                return classify_vkcube_exit(status.code(), false, startup_evidence, false, false);
+            Ok(Some(status)) => break (status, false),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let status = child.wait();
+                let Some(status) = status.ok() else {
+                    return VkcubeExit::UnexpectedExit;
+                };
+                break (status, true);
             }
-            Ok(None) => {
-                if !startup_evidence {
-                    println!("{VKCUBE_STARTUP_MARKER}");
-                    startup_evidence = true;
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let status = child.wait().ok();
-                    return classify_vkcube_exit(
-                        status.and_then(|status| status.code()),
-                        true,
-                        startup_evidence,
-                        false,
-                        false,
-                    );
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return VkcubeExit::UnexpectedExit;
             }
         }
+    };
+    let (stdout_result, stdout) = stdout_reader.join().ok().unwrap_or((
+        Err(std::io::Error::other("vkcube stdout reader panicked")),
+        Vec::new(),
+    ));
+    let (stderr_result, stderr) = stderr_reader.join().ok().unwrap_or((
+        Err(std::io::Error::other("vkcube stderr reader panicked")),
+        Vec::new(),
+    ));
+    print!("{}", String::from_utf8_lossy(&stdout));
+    eprint!("{}", String::from_utf8_lossy(&stderr));
+    if stdout_result.is_err() || stderr_result.is_err() {
+        return VkcubeExit::UnexpectedExit;
     }
+    let (startup_evidence, validation_error) = classify_vkcube_output(&stdout, &stderr);
+    classify_vkcube_exit(
+        status.code(),
+        timed_out,
+        startup_evidence,
+        validation_error,
+        false,
+    )
 }
 
 fn run_vkcube(root: &Path, options: VkcubeOptions) -> VkcubeExit {
@@ -525,8 +564,8 @@ fn main() -> ExitCode {
 mod tests {
     use super::{
         BENCHMARK_SAMPLE_COUNT, VkcubeExit, benchmark_cases,
-        benchmark_output_is_operationally_valid, classify_vkcube_exit, generated_config,
-        parse_vkcube_args, quality_fixture_passes, vkcube_launch,
+        benchmark_output_is_operationally_valid, classify_vkcube_exit, classify_vkcube_output,
+        generated_config, parse_vkcube_args, quality_fixture_passes, vkcube_launch,
     };
     use std::path::Path;
 
@@ -625,10 +664,10 @@ mod tests {
     }
 
     #[test]
-    fn vkcube_classifies_controlled_timeout_after_startup_as_success() {
+    fn vkcube_does_not_treat_a_live_child_as_startup_evidence() {
         assert_eq!(
-            classify_vkcube_exit(None, true, true, false, false),
-            VkcubeExit::Success
+            classify_vkcube_exit(None, true, false, false, false),
+            VkcubeExit::MissingStartupEvidence
         );
     }
 
@@ -654,6 +693,24 @@ mod tests {
             classify_vkcube_exit(None, true, true, true, false),
             VkcubeExit::ValidationError
         );
+    }
+
+    #[test]
+    fn vkcube_reads_layer_evidence_and_validation_errors_from_both_streams() {
+        let (startup, validation) = classify_vkcube_output(
+            b"TuxScaling swapchain: format=B8G8R8A8_UNORM",
+            b"Validation Error: injected",
+        );
+        assert!(startup);
+        assert!(validation);
+    }
+
+    #[test]
+    fn vkcube_does_not_accept_unrelated_output_as_layer_evidence() {
+        let (startup, validation) =
+            classify_vkcube_output(b"TuxScaling vkcube startup: layer enabled", b"");
+        assert!(!startup);
+        assert!(!validation);
     }
 
     #[test]
