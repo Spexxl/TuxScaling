@@ -1,9 +1,11 @@
 pub const CRATE_NAME: &str = "tuxscaling-temporal";
 mod gpu;
 mod history;
+mod resolve;
 mod types;
 pub use gpu::*;
 pub use history::*;
+pub use resolve::*;
 pub use types::*;
 
 /// Deterministic, CPU-only sequences and metrics used by the temporal quality

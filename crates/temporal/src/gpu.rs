@@ -6,9 +6,9 @@ use tuxscaling_vulkan::{
 };
 
 use crate::{
-    DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResource,
-    GuidanceScalar, GuidanceView, JitterSample, MotionDirection, MotionUnits, SignalState,
-    ValidRegion,
+    DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResolution,
+    GuidanceResource, GuidanceScalar, GuidanceView, JitterSample, MotionDirection, MotionUnits,
+    SignalState, ValidRegion,
 };
 
 const DEPTH_RECORD_WORDS: u64 = 80;
@@ -881,6 +881,7 @@ impl GuidanceEstimator {
             },
             direction: MotionDirection::CurrentToPrevious,
             units: MotionUnits::SourcePixels,
+            resolution: GuidanceResolution::new(extent, extent),
             requires_history_reset: metadata.requires_history_reset,
         }
     }

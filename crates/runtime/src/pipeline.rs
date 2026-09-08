@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 use tuxscaling_capture::JitterState;
 use tuxscaling_config::Config;
 use tuxscaling_motion::{MotionEstimator, MotionQuality};
-use tuxscaling_temporal::{FrameTiming, GuidanceEstimator, GuidanceReset, History};
+use tuxscaling_temporal::{
+    FrameTiming, GuidanceEstimator, GuidanceReset, GuidanceResolver, History,
+};
 use tuxscaling_upscaler::{ReferenceUpscaler, ResolutionPlan};
 
 pub struct TemporalPipelineDescriptor<'a> {
@@ -90,6 +92,7 @@ pub struct TemporalPipeline {
     pub(crate) capture: Option<Capture>,
     pub(crate) motion: Option<MotionEstimator>,
     pub(crate) guidance: Option<GuidanceEstimator>,
+    pub(crate) resolver: Option<GuidanceResolver>,
     pub(crate) upscaler: Option<ReferenceUpscaler>,
     pub(crate) history: History,
     pub(crate) start: Instant,
@@ -181,8 +184,10 @@ impl TemporalPipeline {
         } else {
             None
         };
+        let mut resolver = None;
         let mut upscaler = None;
         if let (Some(guidance), Some(motion), Some(capture)) = (&guidance, &motion, &capture) {
+            let requires_guidance_resolve = resolution.game_extent != resolution.guidance_extent;
             let features =
                 unsafe { instance.get_physical_device_format_properties(physical, info.format) }
                     .optimal_tiling_features;
@@ -194,7 +199,7 @@ impl TemporalPipeline {
             if features.contains(required)
                 && device_features.shader_storage_image_write_without_format != 0
             {
-                let view = guidance.view(
+                let raw_view = guidance.view(
                     motion,
                     0,
                     resolution.guidance_extent,
@@ -202,21 +207,47 @@ impl TemporalPipeline {
                     FrameTiming::default(),
                     GuidanceReset::Initialize,
                 );
-                match unsafe {
-                    ReferenceUpscaler::new(
-                        device,
-                        &memory,
-                        capture.source.color.view,
-                        resolution.game_extent,
-                        resolution.output_extent,
-                        info.format,
-                        view,
-                        image_count,
-                    )
-                } {
-                    Ok(value) => upscaler = Some(value),
-                    Err(error) => {
-                        eprintln!("TuxScaling: reference reconstruction disabled: {error:?}")
+                if requires_guidance_resolve {
+                    match unsafe {
+                        GuidanceResolver::new(
+                            device,
+                            &memory,
+                            resolution.game_extent,
+                            resolution.guidance_extent,
+                            capture.source.color.view,
+                            raw_view,
+                        )
+                    } {
+                        Ok(value) => resolver = Some(value),
+                        Err(error) => {
+                            eprintln!("TuxScaling: guidance resolve disabled: {error:?}")
+                        }
+                    }
+                }
+                let backend_view = resolver
+                    .as_ref()
+                    .map_or(raw_view, |value| value.view(raw_view));
+                if requires_guidance_resolve && resolver.is_none() {
+                    eprintln!(
+                        "TuxScaling: reference reconstruction disabled because guidance resolve is unavailable"
+                    );
+                } else {
+                    match unsafe {
+                        ReferenceUpscaler::new(
+                            device,
+                            &memory,
+                            capture.source.color.view,
+                            resolution.game_extent,
+                            resolution.output_extent,
+                            info.format,
+                            backend_view,
+                            image_count,
+                        )
+                    } {
+                        Ok(value) => upscaler = Some(value),
+                        Err(error) => {
+                            eprintln!("TuxScaling: reference reconstruction disabled: {error:?}")
+                        }
                     }
                 }
             } else {
@@ -236,6 +267,7 @@ impl TemporalPipeline {
             capture,
             motion,
             guidance,
+            resolver,
             upscaler,
             history: History::default(),
             start: Instant::now(),
@@ -275,6 +307,7 @@ impl TemporalPipeline {
             capture: None,
             motion: None,
             guidance: None,
+            resolver: None,
             upscaler: None,
             history: History::default(),
             start: Instant::now(),

@@ -2,9 +2,9 @@
 
 use ash::vk;
 use tuxscaling_temporal::{
-    DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResource,
-    GuidanceScalar, GuidanceView, JitterSample, MotionDirection, MotionUnits, SignalState,
-    ValidRegion,
+    DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResolution,
+    GuidanceResource, GuidanceScalar, GuidanceView, JitterSample, MotionDirection, MotionUnits,
+    SignalState, ValidRegion,
 };
 use tuxscaling_upscaler::ReferenceUpscaler;
 use tuxscaling_vulkan::{Buffer, Image, image_barrier, memory_barrier};
@@ -173,6 +173,16 @@ fn guidance(
         depth_semantics: DepthSemantics::RelativeNearIsOne,
         direction: MotionDirection::CurrentToPrevious,
         units: MotionUnits::SourcePixels,
+        resolution: GuidanceResolution::new(
+            FrameExtent {
+                width: 64,
+                height: 48,
+            },
+            FrameExtent {
+                width: 64,
+                height: 48,
+            },
+        ),
         requires_history_reset,
     }
 }

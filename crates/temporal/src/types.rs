@@ -84,10 +84,36 @@ impl JitterSample {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FrameExtent {
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GuidanceResolution {
+    pub signal_extent: FrameExtent,
+    pub estimator_extent: FrameExtent,
+}
+
+impl GuidanceResolution {
+    pub const fn new(signal_extent: FrameExtent, estimator_extent: FrameExtent) -> Self {
+        Self {
+            signal_extent,
+            estimator_extent,
+        }
+    }
+
+    pub const fn requires_resolve(self) -> bool {
+        self.signal_extent.width != self.estimator_extent.width
+            || self.signal_extent.height != self.estimator_extent.height
+    }
+
+    pub fn is_valid_for(self, signal_extent: FrameExtent) -> bool {
+        self.signal_extent == signal_extent
+            && self.signal_extent.is_valid()
+            && self.estimator_extent.is_valid()
+    }
 }
 
 impl FrameExtent {
@@ -262,6 +288,7 @@ pub struct GuidanceView {
     pub depth_semantics: DepthSemantics,
     pub direction: MotionDirection,
     pub units: MotionUnits,
+    pub resolution: GuidanceResolution,
     pub requires_history_reset: bool,
 }
 
@@ -319,6 +346,7 @@ impl GuidanceView {
             && self.timing.is_finite()
             && self.pre_exposure.is_valid()
             && self.jitter.is_finite()
+            && self.resolution.is_valid_for(extent)
     }
 }
 
@@ -371,6 +399,7 @@ mod tests {
             depth_semantics: DepthSemantics::FlatFallback,
             direction: MotionDirection::CurrentToPrevious,
             units: MotionUnits::SourcePixels,
+            resolution: GuidanceResolution::new(extent, extent),
             requires_history_reset: false,
         };
         assert!(view.is_valid_for(7, extent));
@@ -380,5 +409,24 @@ mod tests {
         let mut wrong = view;
         wrong.motion.format = vk::Format::R32G32_SFLOAT;
         assert!(!wrong.is_valid_for(7, extent));
+    }
+
+    #[test]
+    fn guidance_resolution_bypasses_resolve_at_matching_extents() {
+        let extent = FrameExtent {
+            width: 1280,
+            height: 720,
+        };
+        assert!(!GuidanceResolution::new(extent, extent).requires_resolve());
+        assert!(
+            GuidanceResolution::new(
+                extent,
+                FrameExtent {
+                    width: 960,
+                    height: 540,
+                },
+            )
+            .requires_resolve()
+        );
     }
 }

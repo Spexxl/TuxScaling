@@ -886,7 +886,7 @@ impl SwapchainRuntime {
             *state = "Unavailable".into();
         }
         self.diagnostics.depth_semantics = "FlatFallback".into();
-        let guidance_view = match (&self.temporal.guidance, &self.temporal.motion) {
+        let raw_guidance_view = match (&self.temporal.guidance, &self.temporal.motion) {
             (Some(guidance), Some(motion)) => {
                 let mut view = guidance.view(
                     motion,
@@ -916,13 +916,18 @@ impl SwapchainRuntime {
             }
             _ => None,
         };
-        let guidance_view = guidance_view.and_then(|view| {
+        let guidance_view = raw_guidance_view.and_then(|view| {
+            let resolved = self
+                .temporal
+                .resolver
+                .as_ref()
+                .map_or(view, |resolver| resolver.view(view));
             let frame_extent = FrameExtent {
-                width: self.temporal.resolution.guidance_extent.width,
-                height: self.temporal.resolution.guidance_extent.height,
+                width: self.temporal.resolution.game_extent.width,
+                height: self.temporal.resolution.game_extent.height,
             };
-            if view.is_valid_for(self.temporal.history.frame_id + 1, frame_extent) {
-                Some(view)
+            if resolved.is_valid_for(self.temporal.history.frame_id + 1, frame_extent) {
+                Some(resolved)
             } else {
                 eprintln!("TuxScaling: invalid guidance metadata; reconstruction bypassed");
                 None
@@ -1050,6 +1055,12 @@ impl SwapchainRuntime {
                         index as u32 * GPU_TIMESTAMPS as u32 + offset,
                     );
                 }
+            }
+            if let Some(resolver) = &mut self.temporal.resolver {
+                let depth_semantics =
+                    guidance_view.map_or(DepthSemantics::FlatFallback, |view| view.depth_semantics);
+                resolver.record(slot.command, valid, depth_semantics);
+                compute_memory_barrier(&self.device, slot.command);
             }
             if self.game_images[index] != self.output_images[index] {
                 image_barrier(

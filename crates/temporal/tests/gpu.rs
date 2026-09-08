@@ -2,7 +2,11 @@
 
 use ash::vk;
 use tuxscaling_motion::MotionEstimator;
-use tuxscaling_temporal::{DepthSemantics, GuidanceReset, SignalState};
+use tuxscaling_temporal::{
+    DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResolution,
+    GuidanceResolver, GuidanceResource, GuidanceScalar, GuidanceView, JitterSample,
+    MotionDirection, MotionUnits, SignalState, ValidRegion,
+};
 use tuxscaling_vulkan::{Buffer, Image, image_barrier, memory_barrier};
 
 #[path = "../../../tests/support/gpu.rs"]
@@ -54,6 +58,305 @@ fn guidance_shader_contains_reprojected_mask_and_exposure_producers() {
 fn guidance_reuses_the_motion_statistics_exposure() {
     let shader = include_str!("../../../shaders/temporal/guidance.comp");
     assert!(shader.contains("return metadata.exposure"));
+}
+
+#[test]
+fn resolve_shader_guides_weights_with_each_input_sample_luma() {
+    let shader = include_str!("../../../shaders/temporal/resolve.comp");
+    assert!(shader.contains("vec2(pixel) + 0.5"));
+    assert!(shader.contains("signal_luma(sample_pixel)"));
+    assert!(shader.contains("flat_depth"));
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn guidance_resolver_outputs_full_resolution_signals() {
+    unsafe {
+        let gpu = Gpu::new();
+        let device = &gpu.device;
+        let game_extent = vk::Extent2D {
+            width: 4,
+            height: 4,
+        };
+        let estimator_extent = vk::Extent2D {
+            width: 2,
+            height: 2,
+        };
+        let usage = vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::STORAGE;
+        let source = Image::new(
+            device,
+            &gpu.memory,
+            game_extent,
+            vk::Format::R8G8B8A8_UNORM,
+            usage,
+        )
+        .unwrap();
+        let motion = Image::new(
+            device,
+            &gpu.memory,
+            estimator_extent,
+            vk::Format::R16G16_SFLOAT,
+            usage,
+        )
+        .unwrap();
+        let confidence = Image::new(
+            device,
+            &gpu.memory,
+            estimator_extent,
+            vk::Format::R8_UNORM,
+            usage,
+        )
+        .unwrap();
+        let disocclusion = Image::new(
+            device,
+            &gpu.memory,
+            estimator_extent,
+            vk::Format::R8_UNORM,
+            usage,
+        )
+        .unwrap();
+        let reactive = Image::new(
+            device,
+            &gpu.memory,
+            estimator_extent,
+            vk::Format::R8_UNORM,
+            usage,
+        )
+        .unwrap();
+        let depth = Image::new(
+            device,
+            &gpu.memory,
+            estimator_extent,
+            vk::Format::R32_SFLOAT,
+            usage,
+        )
+        .unwrap();
+        let composition = Image::new(
+            device,
+            &gpu.memory,
+            estimator_extent,
+            vk::Format::R8_UNORM,
+            usage,
+        )
+        .unwrap();
+        let exposure = Image::new(
+            device,
+            &gpu.memory,
+            vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+            vk::Format::R32_SFLOAT,
+            usage,
+        )
+        .unwrap();
+
+        let source_bytes = vec![
+            0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255, 0, 0,
+            0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255,
+            255, 255,
+        ];
+        let motion_bytes = [
+            f32_to_f16(1.0).to_ne_bytes(),
+            f32_to_f16(-2.0).to_ne_bytes(),
+            f32_to_f16(1.0).to_ne_bytes(),
+            f32_to_f16(-2.0).to_ne_bytes(),
+            f32_to_f16(1.0).to_ne_bytes(),
+            f32_to_f16(-2.0).to_ne_bytes(),
+            f32_to_f16(1.0).to_ne_bytes(),
+            f32_to_f16(-2.0).to_ne_bytes(),
+        ]
+        .concat();
+        let confidence_bytes = vec![128u8; 4];
+        let disocclusion_bytes = vec![64u8; 4];
+        let reactive_bytes = vec![96u8; 4];
+        let composition_bytes = vec![192u8; 4];
+        let depth_bytes = [0.25f32, 0.75, 0.25, 0.75]
+            .into_iter()
+            .flat_map(f32::to_ne_bytes)
+            .collect::<Vec<_>>();
+        let exposure_bytes = 1.0f32.to_ne_bytes();
+        let mut uploads = Vec::new();
+        let mut upload = |image: &Image, bytes: &[u8], layout, extent| {
+            uploads.push(upload_image_layout(&gpu, image, bytes, layout, extent));
+        };
+        upload(
+            &source,
+            &source_bytes,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            game_extent,
+        );
+        upload(
+            &motion,
+            &motion_bytes,
+            vk::ImageLayout::GENERAL,
+            estimator_extent,
+        );
+        upload(
+            &confidence,
+            &confidence_bytes,
+            vk::ImageLayout::GENERAL,
+            estimator_extent,
+        );
+        upload(
+            &disocclusion,
+            &disocclusion_bytes,
+            vk::ImageLayout::GENERAL,
+            estimator_extent,
+        );
+        upload(
+            &reactive,
+            &reactive_bytes,
+            vk::ImageLayout::GENERAL,
+            estimator_extent,
+        );
+        upload(
+            &composition,
+            &composition_bytes,
+            vk::ImageLayout::GENERAL,
+            estimator_extent,
+        );
+        upload(
+            &depth,
+            &depth_bytes,
+            vk::ImageLayout::GENERAL,
+            estimator_extent,
+        );
+        upload(
+            &exposure,
+            &exposure_bytes,
+            vk::ImageLayout::GENERAL,
+            vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+        );
+
+        let input_extent = FrameExtent {
+            width: estimator_extent.width,
+            height: estimator_extent.height,
+        };
+        let metadata = GuidanceMetadata {
+            frame_id: 1,
+            extent: input_extent,
+            valid_region: ValidRegion::full(input_extent),
+            reset: GuidanceReset::None,
+            valid: true,
+            is_zero: false,
+            requires_history_reset: false,
+        };
+        let resource = |image: &Image, format: vk::Format| GuidanceResource {
+            image: image.handle,
+            view: image.view,
+            format,
+            metadata,
+            state: SignalState::Estimated,
+        };
+        let raw = GuidanceView {
+            motion: resource(&motion, vk::Format::R16G16_SFLOAT),
+            confidence: resource(&confidence, vk::Format::R8_UNORM),
+            disocclusion: resource(&disocclusion, vk::Format::R8_UNORM),
+            reactive: resource(&reactive, vk::Format::R8_UNORM),
+            exposure: resource(&exposure, vk::Format::R32_SFLOAT),
+            depth: resource(&depth, vk::Format::R32_SFLOAT),
+            transparency_composition: resource(&composition, vk::Format::R8_UNORM),
+            pre_exposure: GuidanceScalar::constant_fallback(1.0),
+            timing: FrameTiming::default(),
+            jitter: JitterSample::default(),
+            depth_semantics: DepthSemantics::RelativeNearIsOne,
+            direction: MotionDirection::CurrentToPrevious,
+            units: MotionUnits::SourcePixels,
+            resolution: GuidanceResolution::new(input_extent, input_extent),
+            requires_history_reset: false,
+        };
+        let mut resolver = GuidanceResolver::new(
+            device,
+            &gpu.memory,
+            game_extent,
+            estimator_extent,
+            source.view,
+            raw,
+        )
+        .unwrap();
+        gpu.submit(|command| resolver.record(command, true, raw.depth_semantics));
+        let resolved = resolver.view(raw);
+        let game_frame_extent = FrameExtent {
+            width: game_extent.width,
+            height: game_extent.height,
+        };
+        assert!(resolved.is_valid_for(1, game_frame_extent));
+        assert_eq!(resolved.resolution.signal_extent, game_frame_extent);
+        assert_eq!(resolved.resolution.estimator_extent, input_extent);
+
+        let motion_output = read_resolved(
+            &gpu,
+            resolved.motion.image,
+            game_extent,
+            std::mem::size_of::<u16>() * 2,
+        );
+        let confidence_output = read_resolved(&gpu, resolved.confidence.image, game_extent, 1);
+        let disocclusion_output = read_resolved(&gpu, resolved.disocclusion.image, game_extent, 1);
+        let reactive_output = read_resolved(&gpu, resolved.reactive.image, game_extent, 1);
+        let composition_output = read_resolved(
+            &gpu,
+            resolved.transparency_composition.image,
+            game_extent,
+            1,
+        );
+        let depth_output = read_resolved(
+            &gpu,
+            resolved.depth.image,
+            game_extent,
+            std::mem::size_of::<f32>(),
+        );
+        for &[x0, x1, y0, y1] in motion_output.as_slice().as_chunks::<4>().0 {
+            assert!((f16_to_f32(u16::from_ne_bytes([x0, x1])) - 2.0).abs() < 0.01);
+            assert!((f16_to_f32(u16::from_ne_bytes([y0, y1])) + 4.0).abs() < 0.01);
+        }
+        assert!(
+            confidence_output
+                .iter()
+                .all(|value| (*value as i32 - 128).abs() <= 1)
+        );
+        assert!(
+            disocclusion_output
+                .iter()
+                .all(|value| (*value as i32 - 64).abs() <= 1)
+        );
+        assert!(
+            reactive_output
+                .iter()
+                .all(|value| (*value as i32 - 96).abs() <= 1)
+        );
+        assert!(
+            composition_output
+                .iter()
+                .all(|value| (*value as i32 - 192).abs() <= 1)
+        );
+        let depth_values = depth_output
+            .as_slice()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|value| f32::from_ne_bytes(*value))
+            .collect::<Vec<_>>();
+        assert!(
+            depth_values
+                .as_slice()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|row| row
+                    .as_slice()
+                    .windows(2)
+                    .all(|pair| pair[0] <= pair[1] + 0.001))
+        );
+        assert!(depth_values[0] < depth_values[3]);
+    }
 }
 
 #[test]
@@ -142,6 +445,144 @@ unsafe fn copy_upload(gpu: &Gpu, image: &Image, upload: &Buffer, extent: vk::Ext
             );
         });
     }
+}
+
+unsafe fn upload_image_layout(
+    gpu: &Gpu,
+    image: &Image,
+    bytes: &[u8],
+    layout: vk::ImageLayout,
+    extent: vk::Extent2D,
+) -> Buffer {
+    let device = &gpu.device;
+    let staging = unsafe {
+        Buffer::new(
+            device,
+            &gpu.memory,
+            bytes.len() as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+    }
+    .unwrap();
+    unsafe { staging.write(bytes) }.unwrap();
+    unsafe {
+        gpu.submit(|command| {
+            image_barrier(
+                device,
+                command,
+                image.handle,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            );
+            device.cmd_copy_buffer_to_image(
+                command,
+                staging.handle,
+                image.handle,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::BufferImageCopy::default()
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: extent.width,
+                        height: extent.height,
+                        depth: 1,
+                    })],
+            );
+            image_barrier(
+                device,
+                command,
+                image.handle,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                layout,
+            );
+        });
+    }
+    staging
+}
+
+unsafe fn read_resolved(
+    gpu: &Gpu,
+    image: vk::Image,
+    extent: vk::Extent2D,
+    bytes_per_pixel: usize,
+) -> Vec<u8> {
+    let device = &gpu.device;
+    let readback = unsafe {
+        Buffer::new(
+            device,
+            &gpu.memory,
+            (extent.width * extent.height) as u64 * bytes_per_pixel as u64,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+    }
+    .unwrap();
+    unsafe {
+        gpu.submit(|command| {
+            image_barrier(
+                device,
+                command,
+                image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+            device.cmd_copy_image_to_buffer(
+                command,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                readback.handle,
+                &[vk::BufferImageCopy::default()
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: extent.width,
+                        height: extent.height,
+                        depth: 1,
+                    })],
+            );
+            image_barrier(
+                device,
+                command,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::ImageLayout::GENERAL,
+            );
+        });
+    }
+    let mut bytes = vec![0u8; readback.size as usize];
+    unsafe { readback.read(&mut bytes) }.unwrap();
+    bytes
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits & 0x8000) as u32) << 16;
+    let exponent = (bits >> 10) & 0x1f;
+    let mantissa = (bits & 0x03ff) as u32;
+    let value = match exponent {
+        0 => {
+            if mantissa == 0 {
+                sign
+            } else {
+                let mut mantissa = mantissa;
+                let mut exponent = -14i32;
+                while mantissa & 0x400 == 0 {
+                    mantissa <<= 1;
+                    exponent -= 1;
+                }
+                sign | (((exponent + 127) as u32) << 23) | ((mantissa & 0x3ff) << 13)
+            }
+        }
+        0x1f => sign | 0x7f80_0000 | (mantissa << 13),
+        exponent => sign | (((exponent as i32 - 15 + 127) as u32) << 23) | (mantissa << 13),
+    };
+    f32::from_bits(value)
 }
 
 unsafe fn copy_upload_reuse(gpu: &Gpu, image: &Image, upload: &Buffer, extent: vk::Extent2D) {

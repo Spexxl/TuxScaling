@@ -1,0 +1,108 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D source_image;
+layout(binding = 1) uniform sampler2D signal_image;
+
+#ifdef RESOLVE_MOTION
+layout(rg16f, binding = 2) uniform writeonly image2D output_image;
+#elif defined(RESOLVE_DEPTH)
+layout(r32f, binding = 2) uniform writeonly image2D output_image;
+#else
+layout(r8, binding = 2) uniform writeonly image2D output_image;
+#endif
+
+layout(push_constant) uniform Params {
+    uint output_width;
+    uint output_height;
+    uint input_width;
+    uint input_height;
+    uint valid;
+    uint flat_depth;
+} p;
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+float source_luma(ivec2 pixel) {
+    vec3 value = texelFetch(source_image, clamp(pixel, ivec2(0), ivec2(p.output_width, p.output_height) - 1), 0).rgb;
+    return dot(max(value, vec3(0.0)), LUMA);
+}
+
+float signal_luma(ivec2 pixel) {
+    vec2 position = (vec2(pixel) + 0.5) * vec2(p.output_width, p.output_height)
+        / vec2(p.input_width, p.input_height) - 0.5;
+    return source_luma(ivec2(round(position)));
+}
+
+ivec2 input_pixel(ivec2 output_pixel) {
+    vec2 position = (vec2(output_pixel) + 0.5) * vec2(p.input_width, p.input_height)
+        / vec2(p.output_width, p.output_height) - 0.5;
+    return clamp(ivec2(round(position)), ivec2(0), ivec2(p.input_width, p.input_height) - 1);
+}
+
+vec4 safe_signal(ivec2 pixel) {
+    vec4 value = texelFetch(signal_image, clamp(pixel, ivec2(0), ivec2(p.input_width, p.input_height) - 1), 0);
+    if (any(isnan(value)) || any(isinf(value))) return vec4(0.0);
+    return value;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(p.output_width) || pixel.y >= int(p.output_height)) return;
+    if (p.valid == 0u) {
+#ifdef RESOLVE_MOTION
+        imageStore(output_image, pixel, vec4(0.0));
+#elif defined(RESOLVE_CONFIDENCE)
+        imageStore(output_image, pixel, vec4(0.0));
+#elif defined(RESOLVE_DEPTH)
+        imageStore(output_image, pixel, vec4(1.0));
+#else
+        imageStore(output_image, pixel, vec4(1.0));
+#endif
+        return;
+    }
+
+    ivec2 center = input_pixel(pixel);
+    float reference = source_luma(pixel);
+    vec4 values[4];
+    float weights[4];
+    int index = 0;
+    float total = 0.0;
+    for (int y = -1; y <= 0; ++y) {
+        for (int x = -1; x <= 0; ++x) {
+            ivec2 sample_pixel = clamp(center + ivec2(x, y), ivec2(0), ivec2(p.input_width, p.input_height) - 1);
+            values[index] = safe_signal(sample_pixel);
+            float sample_luma = signal_luma(sample_pixel);
+            float weight = 1.0 / (1.0 + abs(sample_luma - reference) * 32.0);
+            weights[index] = weight;
+            total += weight;
+            index++;
+        }
+    }
+
+#ifdef RESOLVE_MOTION
+    vec2 motion = vec2(0.0);
+    for (int i = 0; i < 4; ++i) motion += values[i].xy * weights[i] / max(total, 0.0001);
+    motion *= vec2(p.output_width, p.output_height) / vec2(p.input_width, p.input_height);
+    imageStore(output_image, pixel, vec4(motion, 0.0, 0.0));
+#elif defined(RESOLVE_CONFIDENCE)
+    float confidence = 1.0;
+    for (int i = 0; i < 4; ++i) confidence = min(confidence, values[i].r);
+    imageStore(output_image, pixel, vec4(clamp(confidence, 0.0, 1.0)));
+#elif defined(RESOLVE_DEPTH)
+    if (p.flat_depth != 0u) {
+        imageStore(output_image, pixel, vec4(1.0));
+        return;
+    }
+    float depth = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        depth += values[i].r * weights[i] / max(total, 0.0001);
+    }
+    imageStore(output_image, pixel, vec4(clamp(depth, 0.0, 1.0)));
+#else
+    float mask = 0.0;
+    for (int i = 0; i < 4; ++i) mask = max(mask, values[i].r);
+    imageStore(output_image, pixel, vec4(clamp(mask, 0.0, 1.0)));
+#endif
+}

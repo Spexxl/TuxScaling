@@ -27,4 +27,23 @@ fn main() {
         .status()
         .expect("glslc is required; install the shader compiler before building");
     assert!(status.success(), "shader compilation failed: depth_reduce");
+
+    for (name, define) in [
+        ("resolve_motion", "RESOLVE_MOTION"),
+        ("resolve_confidence", "RESOLVE_CONFIDENCE"),
+        ("resolve_mask", "RESOLVE_MASK"),
+        ("resolve_depth", "RESOLVE_DEPTH"),
+    ] {
+        let source = root.join("resolve.comp");
+        println!("cargo:rerun-if-changed={}", source.display());
+        let status = Command::new("glslc")
+            .args(["--target-env=vulkan1.0", "-O"])
+            .arg(format!("-D{define}"))
+            .arg(&source)
+            .arg("-o")
+            .arg(out.join(format!("{name}.spv")))
+            .status()
+            .expect("glslc is required; install the shader compiler before building");
+        assert!(status.success(), "shader compilation failed: {name}");
+    }
 }

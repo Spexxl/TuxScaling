@@ -11,9 +11,9 @@ use sequence::{
 use std::time::Duration;
 use tuxscaling_motion::MotionQuality;
 use tuxscaling_temporal::{
-    DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResource,
-    GuidanceScalar, GuidanceSignal, GuidanceView, JitterSample, MotionDirection, MotionUnits,
-    SignalState,
+    DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResolution,
+    GuidanceResource, GuidanceScalar, GuidanceSignal, GuidanceView, JitterSample, MotionDirection,
+    MotionUnits, SignalState,
 };
 
 fn resource(
@@ -70,6 +70,7 @@ fn view() -> GuidanceView {
         depth_semantics: DepthSemantics::FlatFallback,
         direction: MotionDirection::CurrentToPrevious,
         units: MotionUnits::SourcePixels,
+        resolution: GuidanceResolution::new(extent, extent),
         requires_history_reset: false,
     }
 }
