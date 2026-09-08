@@ -7,7 +7,9 @@ use tuxscaling_motion::{MotionEstimator, MotionQuality};
 use tuxscaling_temporal::{
     FrameTiming, GuidanceEstimator, GuidanceReset, GuidanceResolver, History,
 };
-use tuxscaling_upscaler::{ReferenceUpscaler, ResolutionPlan};
+use tuxscaling_upscaler::{
+    BackendConfig, ReferenceUpscaler, ResolutionPlan, UpscalerBackend, content_viewport,
+};
 
 pub struct TemporalPipelineDescriptor<'a> {
     pub instance: &'a ash::Instance,
@@ -93,7 +95,7 @@ pub struct TemporalPipeline {
     pub(crate) motion: Option<MotionEstimator>,
     pub(crate) guidance: Option<GuidanceEstimator>,
     pub(crate) resolver: Option<GuidanceResolver>,
-    pub(crate) upscaler: Option<ReferenceUpscaler>,
+    pub(crate) upscaler: Option<Box<dyn UpscalerBackend>>,
     pub(crate) history: History,
     pub(crate) start: Instant,
     pub(crate) pending_time: Duration,
@@ -185,7 +187,7 @@ impl TemporalPipeline {
             None
         };
         let mut resolver = None;
-        let mut upscaler = None;
+        let mut upscaler: Option<Box<dyn UpscalerBackend>> = None;
         if let (Some(guidance), Some(motion), Some(capture)) = (&guidance, &motion, &capture) {
             let requires_guidance_resolve = resolution.game_extent != resolution.guidance_extent;
             let features =
@@ -245,7 +247,27 @@ impl TemporalPipeline {
                             image_count,
                         )
                     } {
-                        Ok(value) => upscaler = Some(value),
+                        Ok(mut value) => {
+                            let backend_config = BackendConfig {
+                                game_extent: resolution.game_extent,
+                                output_extent: resolution.output_extent,
+                                source_format: info.format,
+                                output_format: info.format,
+                                viewport: content_viewport(
+                                    resolution.game_extent,
+                                    resolution.output_extent,
+                                ),
+                                guidance: backend_view.capabilities(),
+                            };
+                            match value.configure(backend_config) {
+                                Ok(()) => upscaler = Some(Box::new(value)),
+                                Err(error) => {
+                                    eprintln!(
+                                        "TuxScaling: reference backend configuration failed: {error}"
+                                    )
+                                }
+                            }
+                        }
                         Err(error) => {
                             eprintln!("TuxScaling: reference reconstruction disabled: {error:?}")
                         }
@@ -338,8 +360,10 @@ impl TemporalPipeline {
         if let Some(guidance) = &mut self.guidance {
             guidance.reset_history();
         }
-        if let Some(upscaler) = &mut self.upscaler {
-            upscaler.reset();
+        if let Some(upscaler) = &mut self.upscaler
+            && let Err(error) = upscaler.reset()
+        {
+            eprintln!("TuxScaling: backend reset failed: {error}");
         }
     }
 }
@@ -355,9 +379,47 @@ fn motion_quality(quality: tuxscaling_config::MotionQuality) -> MotionQuality {
 
 #[cfg(test)]
 mod tests {
-    use super::FrameTimingState;
+    use super::{FrameTimingState, TemporalPipeline};
+    use ash::vk;
     use std::time::Duration;
     use tuxscaling_temporal::{FrameTiming, GuidanceReset};
+    use tuxscaling_upscaler::{
+        BackendCapabilities, BackendConfig, BackendError, BackendFrame, BackendId, UpscalerBackend,
+    };
+
+    struct ResetSpy {
+        resets: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl UpscalerBackend for ResetSpy {
+        fn id(&self) -> BackendId {
+            BackendId::Reference
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                temporal: true,
+                frame_generation: false,
+                required_guidance: [false; 7],
+                supported_source_formats: &[vk::Format::R8G8B8A8_UNORM],
+                supported_output_formats: &[vk::Format::R8G8B8A8_UNORM],
+            }
+        }
+
+        fn configure(&mut self, _: BackendConfig) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        unsafe fn record(&mut self, _: BackendFrame) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn reset(&mut self) -> Result<(), BackendError> {
+            self.resets
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
 
     #[test]
     fn timing_uses_nominal_first_sample() {
@@ -424,5 +486,29 @@ mod tests {
         assert_eq!(maximum.raw, Duration::from_millis(250));
         assert_eq!(maximum.validated, Duration::from_millis(250));
         assert_eq!(maximum_reset, None);
+    }
+
+    #[test]
+    fn history_reset_is_forwarded_to_the_generic_backend() {
+        let mut pipeline = TemporalPipeline::for_test(tuxscaling_upscaler::ResolutionPlan::new(
+            vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            },
+            1.0,
+        ));
+        let resets = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        pipeline.upscaler = Some(Box::new(ResetSpy {
+            resets: resets.clone(),
+        }));
+
+        pipeline.reset_history(GuidanceReset::ProviderFailure);
+
+        assert_eq!(resets.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(pipeline.reset_reason, GuidanceReset::ProviderFailure);
     }
 }

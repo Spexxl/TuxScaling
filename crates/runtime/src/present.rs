@@ -7,7 +7,7 @@ use tuxscaling_motion::MotionQuality;
 use tuxscaling_overlay::FrameDiagnostics;
 use tuxscaling_overlay_vulkan::{OverlayRenderer, SwapchainInfo};
 use tuxscaling_temporal::{DepthSemantics, FrameExtent, GuidanceReset, SignalState};
-use tuxscaling_upscaler::{ResolutionPlan, content_viewport};
+use tuxscaling_upscaler::{BackendFrame, BackendImage, ResolutionPlan, content_viewport};
 use tuxscaling_vulkan::{compute_memory_barrier, image_barrier, transfer_memory_barrier};
 
 #[path = "pipeline.rs"]
@@ -193,6 +193,18 @@ fn debug_view_id(view: DebugView) -> u32 {
         DebugView::Depth => 8,
         DebugView::Composition => 9,
         DebugView::Exposure => 10,
+    }
+}
+
+fn backend_debug_view(mode: u32) -> u32 {
+    match mode {
+        5 => 6,
+        6 => 1,
+        7 => 2,
+        8 => 3,
+        9 => 4,
+        10 => 5,
+        _ => 0,
     }
 }
 
@@ -405,6 +417,36 @@ unsafe fn record_spatial_blit(
     }
 }
 
+unsafe fn create_output_views(
+    device: &ash::Device,
+    images: &[vk::Image],
+    format: vk::Format,
+) -> Result<Vec<vk::ImageView>, vk::Result> {
+    let mut views = Vec::with_capacity(images.len());
+    for image in images {
+        let view = match unsafe {
+            device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(*image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(tuxscaling_vulkan::color_range()),
+                None,
+            )
+        } {
+            Ok(view) => view,
+            Err(error) => {
+                for view in views {
+                    unsafe { device.destroy_image_view(view, None) };
+                }
+                return Err(error);
+            }
+        };
+        views.push(view);
+    }
+    Ok(views)
+}
+
 pub struct SwapchainRuntime {
     instance: ash::Instance,
     physical: vk::PhysicalDevice,
@@ -412,6 +454,7 @@ pub struct SwapchainRuntime {
     info: SwapchainInfo,
     game_images: Vec<vk::Image>,
     output_images: Vec<vk::Image>,
+    output_views: Vec<vk::ImageView>,
     overlay: Option<OverlayRenderer>,
     pool: vk::CommandPool,
     slots: Vec<Slot>,
@@ -482,7 +525,6 @@ impl SwapchainRuntime {
                 image_count: images.output_images.len(),
             })
         }?;
-        let image_count = images.output_images.len();
         let mode = match std::env::var("TUXSCALING_VIEW").as_deref() {
             Ok(value) => debug_mode_id(value).ok_or_else(|| {
                 eprintln!("TuxScaling: unsupported TUXSCALING_VIEW={value}");
@@ -490,6 +532,9 @@ impl SwapchainRuntime {
             })?,
             Err(_) => debug_view_id(config.debug_view),
         };
+        let output_views =
+            unsafe { create_output_views(device, &images.output_images, info.format) }?;
+        let image_count = images.output_images.len();
         let diagnostic_resolution = temporal.resolution;
         let promoted_borderless =
             diagnostic_resolution.game_extent != diagnostic_resolution.output_extent && fullscreen;
@@ -510,6 +555,7 @@ impl SwapchainRuntime {
             info,
             game_images: images.game_images,
             output_images: images.output_images,
+            output_views,
             overlay: Some(overlay),
             pool: vk::CommandPool::null(),
             slots: Vec::new(),
@@ -574,8 +620,10 @@ impl SwapchainRuntime {
         if let Some(guidance) = &mut self.temporal.guidance {
             guidance.reset_history();
         }
-        if let Some(upscaler) = &mut self.temporal.upscaler {
-            upscaler.reset();
+        if let Some(upscaler) = &mut self.temporal.upscaler
+            && let Err(error) = upscaler.reset()
+        {
+            eprintln!("TuxScaling: backend reset failed: {error}");
         }
         self.temporal.reset_reason = GuidanceReset::CaptureInterrupted;
         self.temporal.jitter.reset();
@@ -1071,26 +1119,45 @@ impl SwapchainRuntime {
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 );
             }
-            if let (Some(upscaler), Some(guidance)) = (&mut self.temporal.upscaler, guidance_view) {
-                let cpu_start = Instant::now();
-                upscaler.record(
-                    slot.command,
-                    self.output_images[index],
-                    guidance,
-                    valid,
-                    self.temporal.history.write_index(),
-                    index,
-                    match self.mode {
-                        6 => 1,
-                        7 => 2,
-                        8 => 3,
-                        9 => 4,
-                        10 => 5,
-                        _ => 0,
+            let backend_source = self.temporal.capture.as_ref().map(|capture| BackendImage {
+                image: capture.source.color.handle,
+                view: capture.source.color.view,
+                format: capture.source.color.format,
+                extent: capture.source.color.extent,
+                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            });
+            let mut backend_failed = false;
+            if let (Some(upscaler), Some(guidance), Some(source)) =
+                (&mut self.temporal.upscaler, guidance_view, backend_source)
+            {
+                let frame = BackendFrame {
+                    command_buffer: slot.command,
+                    slot: index,
+                    source,
+                    output: BackendImage {
+                        image: self.output_images[index],
+                        view: self.output_views[index],
+                        format: self.info.format,
+                        extent: self.temporal.resolution.output_extent,
+                        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                     },
-                );
+                    guidance,
+                    viewport: content_viewport(
+                        self.temporal.resolution.game_extent,
+                        self.temporal.resolution.output_extent,
+                    ),
+                    frame_id: guidance.motion.metadata.frame_id,
+                    reset_history: !valid,
+                    debug_view: backend_debug_view(self.mode),
+                };
+                let cpu_start = Instant::now();
+                let result = upscaler.record(frame);
                 self.diagnostics.reconstruction_cpu_ms =
                     cpu_start.elapsed().as_secs_f32() * 1_000.0;
+                if let Err(error) = result {
+                    eprintln!("TuxScaling: backend record failed: {error}");
+                    backend_failed = true;
+                }
             } else if self.game_images[index] != self.output_images[index]
                 && let Some(capture) = &self.temporal.capture
             {
@@ -1103,14 +1170,21 @@ impl SwapchainRuntime {
                     self.temporal.resolution.output_extent,
                 );
             }
-            if self.mode == 5
-                && let Some(upscaler) = &self.temporal.upscaler
-            {
-                upscaler.record_debug(
-                    slot.command,
-                    self.output_images[index],
-                    self.temporal.history.write_index(),
-                );
+            if backend_failed {
+                self.temporal.reset_history(GuidanceReset::ProviderFailure);
+                self.diagnostics.state = "Backend failure; spatial fallback".into();
+                if self.game_images[index] != self.output_images[index]
+                    && let Some(capture) = &self.temporal.capture
+                {
+                    record_spatial_fallback(
+                        &self.device,
+                        slot.command,
+                        capture,
+                        self.output_images[index],
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        self.temporal.resolution.output_extent,
+                    );
+                }
             }
             if self.mode != 0
                 && self.mode <= 3
@@ -1414,6 +1488,9 @@ impl Drop for SwapchainRuntime {
         drop(self.temporal.capture.take());
         drop(self.overlay.take());
         unsafe {
+            for view in &self.output_views {
+                self.device.destroy_image_view(*view, None);
+            }
             for slot in &self.slots {
                 self.device.destroy_semaphore(slot.semaphore, None);
                 self.device.destroy_fence(slot.fence, None);
@@ -1426,7 +1503,7 @@ impl Drop for SwapchainRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{GPU_PHASES, GpuTimingWindow, debug_mode_id};
+    use super::{GPU_PHASES, GpuTimingWindow, backend_debug_view, debug_mode_id};
     use tuxscaling_config::MotionQuality;
 
     #[test]
@@ -1436,6 +1513,14 @@ mod tests {
         assert_eq!(debug_mode_id("composition"), Some(9));
         assert_eq!(debug_mode_id("exposure"), Some(10));
         assert_eq!(debug_mode_id("unsupported"), None);
+    }
+
+    #[test]
+    fn backend_debug_view_keeps_history_and_signal_modes() {
+        assert_eq!(backend_debug_view(5), 6);
+        assert_eq!(backend_debug_view(6), 1);
+        assert_eq!(backend_debug_view(10), 5);
+        assert_eq!(backend_debug_view(4), 0);
     }
 
     #[test]

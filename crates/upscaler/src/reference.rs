@@ -532,9 +532,14 @@ impl UpscalerBackend for ReferenceUpscaler {
     unsafe fn record(&mut self, frame: BackendFrame) -> Result<(), BackendError> {
         let config = self.backend_config.ok_or(BackendError::Unavailable)?;
         frame.validate(config, self.capabilities())?;
-        let history_write = (frame.frame_id % 2) as usize;
-        let slot = frame.frame_id as usize % self.descriptor_sets.len().max(1);
+        let history_write = frame.frame_id.saturating_sub(1) as usize % 2;
+        let slot = frame.slot % self.descriptor_sets.len().max(1);
         let valid = !frame.reset_history && !frame.guidance.requires_history_reset;
+        let reconstruction_debug_view = if frame.debug_view == 6 {
+            0
+        } else {
+            frame.debug_view
+        };
         unsafe {
             ReferenceUpscaler::record(
                 self,
@@ -544,8 +549,11 @@ impl UpscalerBackend for ReferenceUpscaler {
                 valid,
                 history_write,
                 slot,
-                frame.debug_view,
+                reconstruction_debug_view,
             );
+            if frame.debug_view == 6 {
+                self.record_debug(frame.command_buffer, frame.output.image, history_write);
+            }
         }
         Ok(())
     }

@@ -127,6 +127,7 @@ impl BackendConfig {
 #[derive(Debug, Clone, Copy)]
 pub struct BackendFrame {
     pub command_buffer: vk::CommandBuffer,
+    pub slot: usize,
     pub source: BackendImage,
     pub output: BackendImage,
     pub guidance: GuidanceView,
@@ -299,7 +300,7 @@ impl ResolutionPlan {
     }
 }
 
-pub trait UpscalerBackend {
+pub trait UpscalerBackend: Send {
     fn id(&self) -> BackendId;
     fn capabilities(&self) -> BackendCapabilities;
     fn configure(&mut self, config: BackendConfig) -> Result<(), BackendError>;
@@ -438,6 +439,7 @@ mod tests {
     fn frame() -> BackendFrame {
         BackendFrame {
             command_buffer: vk::CommandBuffer::from_raw(3),
+            slot: 0,
             source: BackendImage {
                 image: vk::Image::from_raw(4),
                 view: vk::ImageView::from_raw(5),
