@@ -45,6 +45,13 @@ pub struct Fsr314Upscaler {
 }
 
 impl Fsr314Upscaler {
+    /// Creates an FSR 3.1.4 backend for the supplied Vulkan device.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `environment` refers to live Vulkan
+    /// instance/device handles and that no other thread uses those handles
+    /// while construction records or submits backend resources.
     pub unsafe fn new(
         environment: &BackendEnvironment,
         config: BackendConfig,

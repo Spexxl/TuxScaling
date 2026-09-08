@@ -8,10 +8,60 @@ use std::{
 
 const VKCUBE_LAYER_EVIDENCE_MARKER: &str = "TuxScaling swapchain:";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BackendSelection {
+    #[default]
+    Reference,
+    Fsr314,
+}
+
+impl BackendSelection {
+    const fn config_value(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Fsr314 => "fsr_3_1_4",
+        }
+    }
+}
+
+fn parse_backend(value: &str) -> Result<BackendSelection, String> {
+    match value {
+        "reference" => Ok(BackendSelection::Reference),
+        "fsr_3_1_4" => Ok(BackendSelection::Fsr314),
+        value => Err(format!("unknown backend: {value}")),
+    }
+}
+
+fn parse_backend_args(args: &[&str]) -> Result<BackendSelection, String> {
+    let mut backend = BackendSelection::Reference;
+    let mut seen = false;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] != "--backend" {
+            return Err(format!("unknown argument: {}", args[index]));
+        }
+        if seen {
+            return Err("--backend may only be specified once".into());
+        }
+        seen = true;
+        index += 1;
+        let value = args
+            .get(index)
+            .ok_or_else(|| "--backend requires reference or fsr_3_1_4".to_owned())?;
+        backend = parse_backend(value)?;
+        index += 1;
+        if index < args.len() && args[index] == "--backend" {
+            return Err("--backend may only be specified once".into());
+        }
+    }
+    Ok(backend)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct VkcubeOptions {
     seconds: u64,
     release: bool,
+    backend: BackendSelection,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,7 +91,9 @@ fn parse_vkcube_args(args: &[&str]) -> Result<VkcubeOptions, String> {
     let mut options = VkcubeOptions {
         seconds: 10,
         release: false,
+        backend: BackendSelection::Reference,
     };
+    let mut backend_seen = false;
     let mut index = 0;
     while index < args.len() {
         match args[index] {
@@ -57,6 +109,17 @@ fn parse_vkcube_args(args: &[&str]) -> Result<VkcubeOptions, String> {
                     .ok()
                     .filter(|seconds| *seconds > 0)
                     .ok_or_else(|| "--seconds requires a positive integer".to_owned())?;
+            }
+            "--backend" => {
+                if backend_seen {
+                    return Err("--backend may only be specified once".into());
+                }
+                backend_seen = true;
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--backend requires reference or fsr_3_1_4".to_owned())?;
+                options.backend = parse_backend(value)?;
             }
             value => return Err(format!("unknown vkcube argument: {value}")),
         }
@@ -214,7 +277,7 @@ fn run_vkcube(root: &Path, options: VkcubeOptions) -> VkcubeExit {
     let launch = vkcube_launch(root, options);
     if std::fs::write(
         &launch.config_path,
-        "output_resolution = \"swapchain\"\nguidance_scale = 1.0\n",
+        generated_config_with_backend("swapchain", 1.0, None, options.backend),
     )
     .is_err()
     {
@@ -335,11 +398,26 @@ fn report(result: std::io::Result<Output>) -> bool {
 }
 
 fn generated_config(output_resolution: &str, guidance_scale: f32, quality: Option<&str>) -> String {
+    generated_config_with_backend(
+        output_resolution,
+        guidance_scale,
+        quality,
+        BackendSelection::Reference,
+    )
+}
+
+fn generated_config_with_backend(
+    output_resolution: &str,
+    guidance_scale: f32,
+    quality: Option<&str>,
+    backend: BackendSelection,
+) -> String {
     let quality = quality.map_or_else(String::new, |quality| {
         format!("motion_quality = \"{quality}\"\n")
     });
     format!(
-        "output_resolution = \"{output_resolution}\"\nguidance_scale = {guidance_scale}\n{quality}"
+        "output_resolution = \"{output_resolution}\"\nguidance_scale = {guidance_scale}\n{quality}upscaler = \"{}\"\n",
+        backend.config_value()
     )
 }
 
@@ -353,30 +431,151 @@ fn validation(command: &mut Command) -> &mut Command {
         .env("DISABLE_MANGOHUD", "1")
         .env("DISABLE_LSFG", "1")
 }
-fn main() -> ExitCode {
-    let command = std::env::args().nth(1).unwrap_or_default();
-    let success = match command.as_str() {
-        "gpu-check" => report(
+
+fn run_gpu_check(backend: BackendSelection) -> bool {
+    let base = report(
+        validation(Command::new("cargo").args([
+            "test",
+            "-p",
+            "tuxscaling-capture",
+            "-p",
+            "tuxscaling-motion",
+            "-p",
+            "tuxscaling-temporal",
+            "-p",
+            "tuxscaling-upscaler",
+            "--test",
+            "gpu",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]))
+        .output(),
+    );
+    if !base || backend != BackendSelection::Fsr314 {
+        return base;
+    }
+    let input = report(
+        validation(Command::new("cargo").args([
+            "test",
+            "-p",
+            "tuxscaling-upscaler",
+            "--test",
+            "fidelityfx_input_gpu",
+            "--features",
+            "fidelityfx",
+            "--",
+            "--nocapture",
+            "--test-threads=1",
+        ]))
+        .output(),
+    );
+    input
+        && report(
             validation(Command::new("cargo").args([
                 "test",
                 "-p",
-                "tuxscaling-capture",
-                "-p",
-                "tuxscaling-motion",
-                "-p",
-                "tuxscaling-temporal",
-                "-p",
                 "tuxscaling-upscaler",
                 "--test",
-                "gpu",
+                "fsr314_gpu",
+                "--features",
+                "fidelityfx",
                 "--",
                 "--ignored",
                 "--nocapture",
                 "--test-threads=1",
             ]))
             .output(),
-        ),
+        )
+}
+
+fn fidelityfx_check(root: &Path) -> bool {
+    let scripts = root.join("scripts/fidelityfx");
+    if !report(
+        Command::new(scripts.join("verify-source.sh"))
+            .current_dir(root)
+            .output(),
+    ) || !report(
+        Command::new(scripts.join("verify-vulkan-shaders.sh"))
+            .current_dir(root)
+            .output(),
+    ) {
+        return false;
+    }
+    let output_dir = root.join("target/fidelityfx-check");
+    if !report(
+        Command::new(scripts.join("build-linux.sh"))
+            .current_dir(root)
+            .arg(&output_dir)
+            .output(),
+    ) {
+        return false;
+    }
+    let library = output_dir.join("libtuxscaling_fidelityfx_vk.so");
+    let Ok(symbols) = Command::new("nm").args(["-D"]).arg(&library).output() else {
+        return false;
+    };
+    let symbol_text = String::from_utf8_lossy(&symbols.stdout);
+    let symbols_ok = symbols.status.success()
+        && [
+            "tux_ffx_version",
+            "tux_ffx_create",
+            "tux_ffx_dispatch",
+            "tux_ffx_reset",
+            "tux_ffx_destroy",
+        ]
+        .iter()
+        .all(|symbol| symbol_text.lines().any(|line| line.ends_with(symbol)));
+    if !symbols_ok {
+        eprintln!("cargo xtask fidelityfx-check: companion symbols are incomplete");
+        return false;
+    }
+    report(
+        validation(Command::new("cargo").args([
+            "test",
+            "-p",
+            "tuxscaling-upscaler",
+            "--test",
+            "fidelityfx_library",
+            "--features",
+            "fidelityfx",
+            "--",
+            "--nocapture",
+        ]))
+        .output(),
+    )
+}
+
+fn main() -> ExitCode {
+    let command = std::env::args().nth(1).unwrap_or_default();
+    let success = match command.as_str() {
+        "fidelityfx-check" => {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+            fidelityfx_check(root)
+        }
+        "gpu-check" => {
+            let arguments = std::env::args().skip(2).collect::<Vec<_>>();
+            let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+            let backend = match parse_backend_args(&arguments) {
+                Ok(backend) => backend,
+                Err(error) => {
+                    eprintln!("cargo xtask gpu-check: {error}");
+                    return ExitCode::from(2);
+                }
+            };
+            run_gpu_check(backend)
+        }
         "smoke" => {
+            let arguments = std::env::args().skip(2).collect::<Vec<_>>();
+            let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+            let backend = match parse_backend_args(&arguments) {
+                Ok(backend) => backend,
+                Err(error) => {
+                    eprintln!("cargo xtask smoke: {error}");
+                    return ExitCode::from(2);
+                }
+            };
             if !run(
                 "cargo",
                 &[
@@ -398,11 +597,23 @@ fn main() -> ExitCode {
                 .chain(std::env::split_paths(&inherited))
                 .collect::<Vec<_>>();
             let smoke_config = root.join("target/native-output-smoke.toml");
-            std::fs::write(&smoke_config, generated_config("native", 1.0, None)).unwrap();
+            std::fs::write(
+                &smoke_config,
+                generated_config_with_backend("native", 1.0, None, backend),
+            )
+            .unwrap();
             let direct_config = root.join("target/native-aa-smoke.toml");
-            std::fs::write(&direct_config, generated_config("swapchain", 1.0, None)).unwrap();
+            std::fs::write(
+                &direct_config,
+                generated_config_with_backend("swapchain", 1.0, None, backend),
+            )
+            .unwrap();
             let guidance_config = root.join("target/guidance-resolve-smoke.toml");
-            std::fs::write(&guidance_config, generated_config("native", 0.5, None)).unwrap();
+            std::fs::write(
+                &guidance_config,
+                generated_config_with_backend("native", 0.5, None, backend),
+            )
+            .unwrap();
             let run_wsi = |scenario: &str, force_temporal_failure, resize_failure| {
                 let mut command = Command::new(root.join("target/debug/examples/wsi"));
                 validation(&mut command)
@@ -554,7 +765,9 @@ fn main() -> ExitCode {
                 )
         }
         _ => {
-            eprintln!("Usage: cargo xtask <benchmark|check|gpu-check|smoke|vkcube>");
+            eprintln!(
+                "Usage: cargo xtask <benchmark|check|fidelityfx-check|gpu-check|smoke|vkcube>"
+            );
             return ExitCode::from(2);
         }
     };
@@ -568,9 +781,10 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        BENCHMARK_SAMPLE_COUNT, VkcubeExit, benchmark_cases,
+        BENCHMARK_SAMPLE_COUNT, BackendSelection, VkcubeExit, benchmark_cases,
         benchmark_output_is_operationally_valid, classify_vkcube_exit, classify_vkcube_output,
-        generated_config, parse_vkcube_args, quality_fixture_passes, vkcube_launch,
+        generated_config, parse_backend_args, parse_vkcube_args, quality_fixture_passes,
+        vkcube_launch,
     };
     use std::path::Path;
 
@@ -653,6 +867,20 @@ mod tests {
         assert_eq!(options.seconds, 27);
         assert!(options.release);
         assert_eq!(launch.profile_dir, Path::new("/workspace/target/release"));
+    }
+
+    #[test]
+    fn vkcube_accepts_the_fidelityfx_backend() {
+        let options = parse_vkcube_args(&["--backend", "fsr_3_1_4"]).unwrap();
+
+        assert_eq!(options.backend, BackendSelection::Fsr314);
+    }
+
+    #[test]
+    fn backend_parser_rejects_unknown_names_before_launch() {
+        assert!(parse_backend_args(&["--backend", "unknown"]).is_err());
+        assert!(parse_backend_args(&["--backend"]).is_err());
+        assert!(parse_backend_args(&["--backend", "reference", "--backend", "fsr_3_1_4"]).is_err());
     }
 
     #[test]

@@ -49,6 +49,7 @@ fn fsr314_lifecycle_dispatches_reset_and_native_aa() {
     let memory = gpu.memory;
     let color_usage = vk::ImageUsageFlags::SAMPLED
         | vk::ImageUsageFlags::STORAGE
+        | vk::ImageUsageFlags::COLOR_ATTACHMENT
         | vk::ImageUsageFlags::TRANSFER_SRC
         | vk::ImageUsageFlags::TRANSFER_DST;
     let source = unsafe {

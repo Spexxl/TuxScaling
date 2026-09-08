@@ -6,7 +6,9 @@
 - Rust stable with Rust 1.88 or newer, including `rustfmt` and `clippy`.
 - Cargo.
 - CMake 3.20 or newer and a C compiler.
+- A C++17 compiler and Ninja or Make for the optional FidelityFX companion library.
 - Vulkan loader and Vulkan headers.
+- `glslc` for project shader compilation. Wine is needed only when regenerating the committed FidelityFX shader headers.
 - Mesa RADV for the primary validation target.
 - X11/XWayland runtime libraries for interactive overlay input; native Wayland input is not enabled yet.
 
@@ -23,9 +25,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo xtask check
 cargo xtask gpu-check
 cargo xtask smoke
+cargo xtask fidelityfx-check
 ```
 
 `cargo xtask check` is the preferred host-only command. `gpu-check` runs ignored GPU tests. `smoke` exercises multiple swapchains, grouped presents, resize, capture, optical flow, virtual-output fallback, and validation synchronization.
+
+Pass `--backend fsr_3_1_4` to `gpu-check`, `smoke`, or `vkcube` to exercise the experimental FidelityFX path. `Reference` remains the default.
 
 The debug WSI harness sets `TUXSCALING_TEST_FORCE_VIRTUAL=1` so it can validate small logical game images against the discovered monitor output without depending on a window manager fullscreen transition. Release builds ignore this test-only override.
 
@@ -37,13 +42,17 @@ Set `TUXSCALING_TEST_RESIZE_INTERVAL=0` only for a warmed-up timing run; the def
 
 ## Native boundary
 
-The native boundary is intentionally SDK-free in the initial milestone:
+The core layer remains SDK-free. The optional FidelityFX boundary is built
+from the pinned SDK by the upscaler crate and loaded at runtime:
 
 ```bash
 cmake -S native -B target/native-configure
 ```
 
-Vendor runtimes must not be copied into the repository. Future adapters will load optional libraries at runtime and communicate through the versioned header in `native/include/backend.h`.
+Vendor runtime binaries must not be copied into the repository. The legacy
+project-owned boundary remains available under `native/include/backend.h`;
+the FidelityFX companion-library boundary is documented in
+[fidelityfx.md](fidelityfx.md).
 
 ## Local Vulkan layer inspection
 
@@ -60,6 +69,7 @@ motion_quality = "ultra"
 output_resolution = "native"
 guidance_scale = 1.0
 debug_view = "original"
+upscaler = "reference"
 ```
 
 `guidance_scale` is optional internal work reduction for estimator guidance after full-resolution source capture. It does not change the game resolution or the output resolution; its default is `1.0` and its manual range is `0.5..=1.0`. The legacy `processing_scale` and `render_scale` keys are accepted as deserialization aliases during the migration.

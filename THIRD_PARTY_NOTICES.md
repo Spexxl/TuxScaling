@@ -17,4 +17,14 @@ TuxScaling includes the official AMD FidelityFX SDK as a Git submodule at
 The complete upstream license text remains in the submodule. Verify the
 checkout with `scripts/fidelityfx/verify-source.sh` before building.
 
+The Linux companion library is a TuxScaling-owned C ABI shim linked against
+the selected SDK components. It is not the Windows DLL shipped in upstream
+release packages; Linux deployments must install the resulting
+`libtuxscaling_fidelityfx_vk.so` beside the Vulkan layer or set
+`TUXSCALING_FIDELITYFX_LIBRARY`.
+
+The project intentionally pins SDK 1.1.4 / FSR 3.1.4 for this milestone. A
+newer SDK such as 1.1.5 requires a separate source, shader, ABI, and license
+audit before it can replace the pinned build.
+
 The OptiScaler source was not used, copied, or translated.

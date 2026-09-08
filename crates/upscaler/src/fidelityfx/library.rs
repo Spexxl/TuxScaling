@@ -150,10 +150,10 @@ fn map_status(status: i32) -> BackendError {
 
 fn layer_adjacent_candidates() -> Vec<PathBuf> {
     let mut directories = Vec::new();
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(parent) = executable.parent() {
-            directories.push(parent.to_path_buf());
-        }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(parent) = executable.parent()
+    {
+        directories.push(parent.to_path_buf());
     }
 
     #[cfg(target_os = "linux")]
@@ -163,10 +163,9 @@ fn layer_adjacent_candidates() -> Vec<PathBuf> {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.contains("tuxscaling") && name.ends_with(".so"))
+                && let Some(parent) = path.parent()
             {
-                if let Some(parent) = path.parent() {
-                    directories.push(parent.to_path_buf());
-                }
+                directories.push(parent.to_path_buf());
             }
         }
     }
