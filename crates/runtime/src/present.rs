@@ -1123,7 +1123,7 @@ impl SwapchainRuntime {
                     debug_view: backend_debug_view(self.mode),
                 };
                 let cpu_start = Instant::now();
-                let result = upscaler.record(frame);
+                let result = pipeline::record_backend(upscaler.as_mut(), frame);
                 self.diagnostics.reconstruction_cpu_ms =
                     cpu_start.elapsed().as_secs_f32() * 1_000.0;
                 if let Err(error) = result {

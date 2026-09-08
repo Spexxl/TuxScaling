@@ -8,8 +8,16 @@ use tuxscaling_temporal::{
     FrameTiming, GuidanceEstimator, GuidanceReset, GuidanceResolver, History,
 };
 use tuxscaling_upscaler::{
-    BackendConfig, ReferenceUpscaler, ResolutionPlan, UpscalerBackend, content_viewport,
+    BackendConfig, BackendError, BackendFrame, ReferenceUpscaler, ResolutionPlan, UpscalerBackend,
+    content_viewport,
 };
+
+pub(crate) unsafe fn record_backend(
+    backend: &mut dyn UpscalerBackend,
+    frame: BackendFrame,
+) -> Result<(), BackendError> {
+    unsafe { backend.record(frame) }
+}
 
 pub struct TemporalPipelineDescriptor<'a> {
     pub instance: &'a ash::Instance,
@@ -471,16 +479,120 @@ fn motion_quality(quality: tuxscaling_config::MotionQuality) -> MotionQuality {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameTimingState, TemporalPipeline};
-    use ash::vk;
+    use super::{FrameTimingState, TemporalPipeline, record_backend};
+    use ash::{vk, vk::Handle};
     use std::time::Duration;
-    use tuxscaling_temporal::{FrameTiming, GuidanceReset};
+    use tuxscaling_temporal::GuidanceReset;
+    use tuxscaling_temporal::{
+        DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceResolution,
+        GuidanceResource, GuidanceScalar, GuidanceView, JitterSample, MotionDirection, MotionUnits,
+        SignalState,
+    };
     use tuxscaling_upscaler::{
-        BackendCapabilities, BackendConfig, BackendError, BackendFrame, BackendId, UpscalerBackend,
+        BackendCapabilities, BackendConfig, BackendError, BackendFrame, BackendId, BackendImage,
+        UpscalerBackend, content_viewport,
     };
 
     struct ResetSpy {
         resets: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    struct RecordSpy {
+        records: u32,
+        failure: bool,
+    }
+
+    impl UpscalerBackend for RecordSpy {
+        fn id(&self) -> BackendId {
+            BackendId::Reference
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                temporal: true,
+                frame_generation: false,
+                required_guidance: [false; 7],
+                supported_source_formats: &[vk::Format::R8G8B8A8_UNORM],
+                supported_output_formats: &[vk::Format::R8G8B8A8_UNORM],
+            }
+        }
+
+        fn configure(&mut self, _: BackendConfig) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        unsafe fn record(&mut self, _: BackendFrame) -> Result<(), BackendError> {
+            self.records += 1;
+            if self.failure {
+                Err(BackendError::Internal("injected backend failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn reset(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    fn test_frame() -> BackendFrame {
+        let extent = vk::Extent2D {
+            width: 8,
+            height: 8,
+        };
+        let metadata = GuidanceMetadata::zero(
+            1,
+            FrameExtent {
+                width: extent.width,
+                height: extent.height,
+            },
+            GuidanceReset::None,
+        );
+        let resource = |format| GuidanceResource {
+            image: vk::Image::from_raw(1),
+            view: vk::ImageView::from_raw(2),
+            format,
+            metadata,
+            state: SignalState::Estimated,
+        };
+        let guidance = GuidanceView {
+            motion: resource(vk::Format::R16G16_SFLOAT),
+            confidence: resource(vk::Format::R8_UNORM),
+            disocclusion: resource(vk::Format::R8_UNORM),
+            reactive: resource(vk::Format::R8_UNORM),
+            exposure: resource(vk::Format::R32_SFLOAT),
+            depth: resource(vk::Format::R32_SFLOAT),
+            transparency_composition: resource(vk::Format::R8_UNORM),
+            pre_exposure: GuidanceScalar::constant_fallback(1.0),
+            timing: FrameTiming::default(),
+            jitter: JitterSample::default(),
+            depth_semantics: DepthSemantics::FlatFallback,
+            direction: MotionDirection::CurrentToPrevious,
+            units: MotionUnits::SourcePixels,
+            resolution: GuidanceResolution::new(metadata.extent, metadata.extent),
+            requires_history_reset: false,
+        };
+        let image = |handle, view| BackendImage {
+            image: vk::Image::from_raw(handle),
+            view: vk::ImageView::from_raw(view),
+            format: vk::Format::R8G8B8A8_UNORM,
+            extent,
+            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        };
+        BackendFrame {
+            command_buffer: vk::CommandBuffer::from_raw(5),
+            slot: 0,
+            source: image(3, 4),
+            output: BackendImage {
+                layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                ..image(6, 7)
+            },
+            guidance,
+            viewport: content_viewport(extent, extent),
+            frame_id: 1,
+            reset_history: false,
+            debug_view: 0,
+        }
     }
 
     impl UpscalerBackend for ResetSpy {
@@ -602,5 +714,18 @@ mod tests {
 
         assert_eq!(resets.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(pipeline.reset_reason, GuidanceReset::ProviderFailure);
+    }
+
+    #[test]
+    fn backend_dispatch_forwards_record_failures_to_the_runtime() {
+        let mut backend = RecordSpy {
+            records: 0,
+            failure: true,
+        };
+
+        let error = unsafe { record_backend(&mut backend, test_frame()) }.unwrap_err();
+
+        assert!(matches!(error, BackendError::Internal(_)));
+        assert_eq!(backend.records, 1);
     }
 }
