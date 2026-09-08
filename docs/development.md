@@ -56,7 +56,7 @@ The layer currently supports SDR swapchains with transfer and sampling usage. On
 The default profile is equivalent to:
 
 ```toml
-motion_quality = "balanced"
+motion_quality = "ultra"
 output_resolution = "native"
 guidance_scale = 1.0
 debug_view = "original"
@@ -64,13 +64,15 @@ debug_view = "original"
 
 `guidance_scale` is optional internal work reduction for estimator guidance after full-resolution source capture. It does not change the game resolution or the output resolution; its default is `1.0` and its manual range is `0.5..=1.0`. The legacy `processing_scale` and `render_scale` keys are accepted as deserialization aliases during the migration.
 
-The fixed quality targets are Ultra (12 ms), High (8 ms), Balanced (4 ms), and Performance (2.5 ms) for temporal work at 1080p. The overlay reports capture, luma, pyramid, forward/backward flow, confidence, scene, invalidate, reactive, exposure, depth, guidance total, reconstruction, overlay, and full injected timings. Logs report median and p95 for every phase plus guidance-only and full-injected totals. It warns when measured work exceeds the selected target; it never changes the preset automatically.
+Timing is telemetry, not a correctness gate. The overlay reports capture, luma, pyramid, forward/backward flow, confidence, scene, invalidate, reactive, exposure, depth, resolve, guidance total, reconstruction, overlay, and full injected timings. Logs report median and p95 for every phase plus total guidance preparation and total GPU work. The quality gates are deterministic fixture metrics shared by all presets and guidance scales; timing values do not change the selected preset.
 
-Run the acceptance benchmark with `cargo xtask benchmark`. It uses one WSI swapchain, Vulkan validation, 180 warm-up frames, 600 measured frames, both `guidance_scale = 1.0` and `0.5`, all four motion qualities, and both 1280x720-to-native-monitor upscale and native-monitor Native AA scenarios. On a 1920x1080 monitor this is the 1280x720-to-1920x1080 matrix; the harness follows the active RandR monitor elsewhere. Guidance-only and full-injected median/p95 totals are emitted separately; the normal configuration default remains `1.0`.
+Run the acceptance benchmark with `cargo xtask benchmark`. It builds the release WSI harness and uses one swapchain, Vulkan validation, 180 warm-up frames, 600 measured frames, `guidance_scale = 1.0`, `0.75`, and `0.5`, all four motion qualities, and both upscale and Native AA scenarios. On a 1920x1080 monitor this is the 1280x720-to-1920x1080 matrix; the harness follows the active RandR monitor elsewhere. Total guidance preparation, every phase, reconstruction, and total GPU-work median/p95 telemetry are emitted separately. The benchmark fails only for operational errors or missing/non-finite samples; slow but finite timing remains informational.
+
+The deterministic acceptance gates are shared across presets and tested scales: mean motion EPE `<= 1.0 px`, p95 EPE `<= 2.0 px`, confidence AUROC `>= 0.90`, disocclusion F1 `>= 0.75`, reactive F1 `>= 0.70`, composition F1 `>= 0.65`, exposure error `<= 0.15 EV`, and depth ordering `>= 0.85`. Regression deltas are recorded in `tests/fixtures/quality-baselines.txt`.
 
 Run a controlled visible `vkcube` session with `cargo xtask vkcube --seconds 10`. The runner builds the layer in the selected debug or release profile, enables the TuxScaling and Vulkan validation layers, prints an explicit startup marker, and terminates and reaps `vkcube` after the requested interval. Use `--release` for the release profile and `--seconds N` for a positive duration.
 
-The RX 9060 XT/RADV reference run at 1920x1080 completed without validation errors:
+The following is a historical RX 9060 XT/RADV telemetry snapshot at 1920x1080. It is informational and is not a latency-quality gate; rerun the release benchmark for current values:
 
 | Presentation | Quality | Median | p95 |
 | --- | --- | ---: | ---: |

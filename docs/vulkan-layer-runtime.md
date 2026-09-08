@@ -4,9 +4,9 @@
 
 The Vulkan layer injects work immediately before presentation while preserving the application's Vulkan device, queues, and swapchains. The layer must fail open: if TuxScaling cannot process a present, the original call is forwarded unchanged.
 
-The runtime captures supported swapchains, computes estimated optical flow and frame guidance, runs the reference reconstruction when the format supports storage images, and renders the Egui diagnostic panel over `vkcube` on RADV. In fullscreen X11/XWayland virtual-output mode, game-owned layer images remain at the requested game extent while the real swapchain images use the configured output extent. Unsupported formats and allocation failures bypass reconstruction while preserving presentation. If temporal recording fails after virtualization has started, the runtime attempts a spatial bilinear blit into the real output before presenting.
+The runtime captures supported swapchains, computes estimated optical flow and frame guidance, optionally resolves reduced guidance back to the game extent, dispatches the reference reconstruction through the common backend contract when the format supports storage images, and renders the Egui diagnostic panel over `vkcube` on RADV. In fullscreen X11/XWayland virtual-output mode, game-owned layer images remain at the requested game extent while the real swapchain images use the configured output extent. Unsupported formats and allocation failures bypass reconstruction while preserving presentation. If temporal recording fails after virtualization has started, the runtime attempts a spatial bilinear blit into the real output before presenting.
 
-The overlay displays `Virtual upscale`, `Native AA`, `Windowed 1:1`, or a direct fallback reason alongside game, processing, and output extents. It also reports the window mode and selected monitor, for example `Promoted borderless` and `1920x1080 at 0,0`. The logical surface capabilities saved before a resize are restored to the application, while internal layer queries continue to use downstream physical capabilities. Present IDs and Google present timing structures survive incremental-present rectangle remapping.
+The overlay displays `Virtual upscale`, `Native AA`, `Windowed 1:1`, or a direct fallback reason alongside game, guidance, and output extents. It also reports the window mode and selected monitor, for example `Promoted borderless` and `1920x1080 at 0,0`. The logical surface capabilities saved before a resize are restored to the application, while internal layer queries continue to use downstream physical capabilities. Present IDs and Google present timing structures survive incremental-present rectangle remapping.
 
 ## Ownership
 
@@ -62,7 +62,7 @@ The runtime milestone is complete only when all checks pass:
 - `vkcube` renders an Egui panel with the layer enabled;
 - validation layers report no synchronization or lifetime errors during create, resize, present, and destruction;
 - the WSI harness exercises two swapchains, grouped presents, resize, and resource destruction without global queue-idle stalls;
-- GPU tests cover known motion, scene cuts, occlusion confidence, capture isolation, per-signal mask fallbacks, relative-depth support state, and the deterministic quality fixtures. The acceptance benchmark separates guidance from reconstruction and requires p95 no greater than 135 percent of median for each reported total.
+- GPU tests cover known motion, scene cuts, occlusion confidence, capture isolation, per-signal mask fallbacks, relative-depth support state, full-resolution guidance resolve, and the deterministic quality fixtures. The acceptance benchmark separates guidance from reconstruction and reports timing without treating it as a quality pass condition.
 
 ## Scope boundary
 

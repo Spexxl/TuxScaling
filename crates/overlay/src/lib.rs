@@ -149,7 +149,7 @@ pub fn render_diagnostics(
                     ));
                     if diagnostics.game_extent[0] > 0 && diagnostics.output_extent[0] > 0 {
                         ui.label(format!(
-                            "Game: {} x {} | Processing: {} x {} | Output: {} x {}",
+                            "Game: {} x {} | Guidance: {} x {} | Output: {} x {}",
                             diagnostics.game_extent[0],
                             diagnostics.game_extent[1],
                             diagnostics.guidance_extent[0],

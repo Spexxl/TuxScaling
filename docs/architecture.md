@@ -9,7 +9,7 @@ Vulkan present
   -> color capture
   -> optical-flow estimation
   -> guidance validation and estimated masks/exposure/depth
-  -> low-resolution simulation
+  -> optional reduced-resolution guidance estimation
   -> reference temporal reconstruction
   -> egui overlay
   -> downstream presentation
@@ -46,4 +46,4 @@ Unsupported formats, unavailable backends, allocation failures, swapchain change
 
 ## Current milestone
 
-The current workspace captures supported swapchains, computes estimated optical flow and guidance on RADV, tracks temporal history, optionally reduces processing resolution, runs a reference reconstruction, and injects an egui diagnostic panel with X11/XWayland input. Native or fixed output resolution promotes an eligible X11/XWayland window through a reversible borderless lease while preserving the game's logical swapchain images; `swapchain` and native Wayland remain direct. `vkcube` and the WSI harness are the validation targets for grouped presents, resize, promotion, restoration, and synchronization. Vendor SDK adapters and production FSR/DLSS/XeSS integrations remain separate milestones. See [Vulkan Layer Runtime](vulkan-layer-runtime.md) for its maintenance contract.
+The current workspace captures supported swapchains, computes estimated optical flow and guidance on RADV, tracks temporal history, optionally reduces only the internal guidance work, resolves all backend-visible guidance to the game extent, runs the reference reconstruction through the vendor-neutral backend contract, and injects an egui diagnostic panel with X11/XWayland input. Native or fixed output resolution promotes an eligible X11/XWayland window through a reversible borderless lease while preserving the game's logical swapchain images; `swapchain` and native Wayland remain direct. `vkcube` and the WSI harness are the validation targets for grouped presents, resize, promotion, restoration, and synchronization. Vendor SDK adapters and production FSR/DLSS/XeSS integrations remain separate milestones. See [Vulkan Layer Runtime](vulkan-layer-runtime.md) for its maintenance contract.
