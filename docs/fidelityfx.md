@@ -1,9 +1,10 @@
 # FidelityFX FSR 3.1.4
 
-TuxScaling's optional vendor backend uses AMD's official FidelityFX SDK
-1.1.4, tag `v1.1.4`, at commit
+TuxScaling's optional vendor backend consumes the packaged Linux companion
+library built from AMD's official FidelityFX SDK 1.1.4, tag `v1.1.4`, at commit
 `c6efa6bf7f2027b3ec94f28578bb5965eabb9e55`. The selected component is FSR
-3.1.4 Super Resolution; frame generation is not included.
+3.1.4 Super Resolution; frame generation is not included. The SDK source is
+not stored in this repository; normal builds need only the packaged `.so`.
 
 ## Why 3.1.4
 
@@ -15,36 +16,37 @@ license inventory.
 
 ## Prerequisites
 
-Normal Linux builds require CMake, Ninja or Make, a C++17 compiler, Vulkan
-headers and loader libraries, and `glslc`. Wine is required only for the
-maintainer-only shader-header regeneration flow.
+Normal Linux builds require the packaged companion library, Vulkan headers and
+loader libraries, and `glslc`. CMake, Ninja or Make, a C++17 compiler, Wine,
+and an external SDK checkout are required only for maintainer rebuilds or
+shader regeneration.
 
-Initialize and verify the dependency:
+The packaged companion is `lib/libtuxscaling_fidelityfx_vk.so`. To select a
+different local build:
 
 ```bash
-git submodule update --init --recursive
-scripts/fidelityfx/verify-source.sh
-scripts/fidelityfx/verify-vulkan-shaders.sh
+cp /path/to/libtuxscaling_fidelityfx_vk.so lib/
+# or:
+export TUXSCALING_FIDELITYFX_LIBRARY=/path/to/libtuxscaling_fidelityfx_vk.so
 ```
 
-Build and validate the native companion library:
+Validate the packaged companion library:
 
 ```bash
 cargo xtask fidelityfx-check
 ```
 
-The command verifies the source revision and shader manifest, builds
-`libtuxscaling_fidelityfx_vk.so` natively without Wine, checks its five ABI
-symbols, and runs the Rust version-loader test. A regular Cargo build with
-the default `fidelityfx` feature performs the same native build into Cargo's
-`OUT_DIR`; `--no-default-features` omits it.
+The command checks that the selected prebuilt file is an ELF shared library,
+contains its five ABI symbols, and passes the Rust version-loader test. A
+regular Cargo build with the default `fidelityfx` feature uses the same local
+file; `--no-default-features` omits the optional backend.
 
-The generated headers are committed under
-`crates/upscaler/native/fidelityfx/generated/vk/`. To regenerate them, use
-`scripts/fidelityfx/generate-vulkan-shaders.sh` on a maintainer machine with
-Wine and the SDK-provided shader compiler, then run the verifier. The
-regeneration script applies the `rgba16f` luma-history correction before
-compilation and rewrites the SHA-256 manifest.
+The generated headers are retained for the optional external rebuild flow.
+To regenerate them, set `TUXSCALING_FIDELITYFX_SDK` to an external exact SDK
+checkout and use `scripts/fidelityfx/generate-vulkan-shaders.sh` on a
+maintainer machine with Wine, then run the verifier. The regeneration script
+applies the `rgba16f` luma-history correction before compilation and rewrites
+the SHA-256 manifest.
 
 ## Runtime selection and packaging
 

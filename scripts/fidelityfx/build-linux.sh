@@ -10,7 +10,7 @@ if [[ "$#" -ne 1 ]]; then
     exit 2
 fi
 
-sdk_root="${TUXSCALING_FIDELITYFX_SDK:-$repo_root/third_party/fidelityfx-sdk}"
+sdk_root="${TUXSCALING_FIDELITYFX_SDK:?set TUXSCALING_FIDELITYFX_SDK to an external FidelityFX SDK checkout}"
 generated_vk="$repo_root/crates/upscaler/native/fidelityfx/generated/vk"
 patch_file="$script_dir/patches/linux-build.patch"
 

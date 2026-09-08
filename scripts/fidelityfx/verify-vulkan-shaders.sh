@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd "$script_dir/../.." && pwd -P)"
-sdk_root="${TUXSCALING_FIDELITYFX_SDK:-$repo_root/third_party/fidelityfx-sdk}"
+sdk_root="${TUXSCALING_FIDELITYFX_SDK:?set TUXSCALING_FIDELITYFX_SDK to an external FidelityFX SDK checkout}"
 generated_root="$repo_root/crates/upscaler/native/fidelityfx/generated"
 generated_vk="$generated_root/vk"
 patch_file="$script_dir/patches/luma-history-rgba16f.patch"

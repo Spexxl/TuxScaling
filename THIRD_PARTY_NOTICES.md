@@ -2,20 +2,22 @@
 
 ## AMD FidelityFX SDK 1.1.4
 
-TuxScaling includes the official AMD FidelityFX SDK as a Git submodule at
-`third_party/fidelityfx-sdk`.
+The optional Linux companion library is based on AMD's official FidelityFX SDK
+1.1.4. The SDK source is not vendored in this repository; normal users only
+need the packaged `lib/libtuxscaling_fidelityfx_vk.so`.
 
 - Repository: https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git
 - Tag: `v1.1.4`
 - Pinned commit: `c6efa6bf7f2027b3ec94f28578bb5965eabb9e55`
 - License: MIT, as provided by the upstream `LICENSE.txt` and the component
   license text in `sdk/LICENSE.txt`.
-- Included components: the FSR 3.1.4 Super Resolution component, its Vulkan
-  backend and API support, and the generated Vulkan shader permutations used
-  by the native companion library.
+- Included components in the companion: the FSR 3.1.4 Super Resolution
+  component, its Vulkan backend and API support, and the generated Vulkan
+  shader permutations used by the native companion library.
 
-The complete upstream license text remains in the submodule. Verify the
-checkout with `scripts/fidelityfx/verify-source.sh` before building.
+Maintainers rebuilding the companion must obtain the exact upstream source at
+the pinned commit and review its complete MIT license inventory before
+packaging. See `docs/fidelityfx.md` for the external-source rebuild flow.
 
 The Linux companion library is a TuxScaling-owned C ABI shim linked against
 the selected SDK components. It is not the Windows DLL shipped in upstream

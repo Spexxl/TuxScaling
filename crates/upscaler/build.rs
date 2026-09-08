@@ -18,53 +18,32 @@ fn main() {
         }
     }
 
-    println!("cargo:rerun-if-env-changed=TUXSCALING_FIDELITYFX_SDK");
+    println!("cargo:rerun-if-env-changed=TUXSCALING_FIDELITYFX_LIBRARY");
     if env::var_os("CARGO_FEATURE_FIDELITYFX").is_some() {
         if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
             panic!("the fidelityfx feature is supported only on Linux");
         }
 
-        let driver = repo_root.join("scripts/fidelityfx/build-linux.sh");
-        println!("cargo:rerun-if-changed={}", driver.display());
-        println!(
-            "cargo:rerun-if-changed={}",
-            repo_root
-                .join("scripts/fidelityfx/patches/linux-build.patch")
-                .display()
+        let configured = env::var_os("TUXSCALING_FIDELITYFX_LIBRARY").map(PathBuf::from);
+        let library = configured.map_or_else(
+            || repo_root.join("lib/libtuxscaling_fidelityfx_vk.so"),
+            |path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    repo_root.join(path)
+                }
+            },
         );
-        println!(
-            "cargo:rerun-if-changed={}",
-            repo_root
-                .join("crates/upscaler/native/fidelityfx/CMakeLists.txt")
-                .display()
-        );
-        for native_path in [
-            "crates/upscaler/native/fidelityfx/include/tux_fidelityfx.h",
-            "crates/upscaler/native/fidelityfx/src/tux_fidelityfx.cpp",
-            "crates/upscaler/native/fidelityfx/src/tux_fidelityfx_provider.cpp",
-            "crates/upscaler/native/fidelityfx/src/tux_fidelityfx_linux_compat.h",
-        ] {
-            println!(
-                "cargo:rerun-if-changed={}",
-                repo_root.join(native_path).display()
-            );
-        }
-        println!(
-            "cargo:rerun-if-changed={}",
-            repo_root.join("third_party/fidelityfx-sdk").display()
-        );
-
-        let status = Command::new(&driver)
-            .arg(&out)
-            .status()
-            .expect("failed to run the FidelityFX Linux build driver");
+        println!("cargo:rerun-if-changed={}", library.display());
         assert!(
-            status.success(),
-            "failed to build the FidelityFX companion library"
+            library.is_file(),
+            "FidelityFX companion library is missing: {} (copy the prebuilt .so there or set TUXSCALING_FIDELITYFX_LIBRARY)",
+            library.display()
         );
         println!(
             "cargo:rustc-env=TUXSCALING_BUILT_FIDELITYFX={}",
-            out.join("libtuxscaling_fidelityfx_vk.so").display()
+            library.display()
         );
     }
 }

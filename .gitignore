@@ -7,6 +7,10 @@ target/
 *.so
 *.dylib
 
+# The optional FidelityFX companion is a packaged project dependency.
+!/lib/
+!/lib/*.so
+
 # Rust profiling and coverage artifacts.
 *.profraw
 *.profdata

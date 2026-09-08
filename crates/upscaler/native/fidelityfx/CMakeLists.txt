@@ -2,8 +2,12 @@ cmake_minimum_required(VERSION 3.23)
 
 project(tuxscaling_fidelityfx_vk LANGUAGES CXX)
 
-set(FFX_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_party/fidelityfx-sdk" CACHE PATH "Pinned FidelityFX SDK checkout")
+set(FFX_SDK_ROOT "" CACHE PATH "External FidelityFX SDK checkout used only for rebuilding the companion library")
 set(FFX_GENERATED_SHADER_PATH "${CMAKE_CURRENT_SOURCE_DIR}/generated/vk" CACHE PATH "Generated FidelityFX Vulkan shader headers")
+
+if (NOT FFX_SDK_ROOT OR NOT EXISTS "${FFX_SDK_ROOT}/ffx-api/CMakeLists.txt")
+    message(FATAL_ERROR "FFX_SDK_ROOT must point to an external FidelityFX SDK checkout")
+endif()
 
 set(FFX_API_BACKEND VK_X64 CACHE STRING "FidelityFX API backend")
 set(FFX_FSR2 OFF CACHE BOOL "" FORCE)

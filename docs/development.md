@@ -5,10 +5,12 @@
 - Linux x86_64.
 - Rust stable with Rust 1.88 or newer, including `rustfmt` and `clippy`.
 - Cargo.
-- CMake 3.20 or newer and a C compiler.
-- A C++17 compiler and Ninja or Make for the optional FidelityFX companion library.
+- A prebuilt `lib/libtuxscaling_fidelityfx_vk.so` for the optional FidelityFX backend.
+- CMake 3.20 or newer, a C++17 compiler, and Ninja or Make only when rebuilding
+  the companion library from an external SDK checkout.
 - Vulkan loader and Vulkan headers.
-- `glslc` for project shader compilation. Wine is needed only when regenerating the committed FidelityFX shader headers.
+- `glslc` for project shader compilation. Wine and the external SDK are needed
+  only when regenerating the committed FidelityFX shader headers.
 - Mesa RADV for the primary validation target.
 - X11/XWayland runtime libraries for interactive overlay input; native Wayland input is not enabled yet.
 
@@ -42,17 +44,18 @@ Set `TUXSCALING_TEST_RESIZE_INTERVAL=0` only for a warmed-up timing run; the def
 
 ## Native boundary
 
-The core layer remains SDK-free. The optional FidelityFX boundary is built
-from the pinned SDK by the upscaler crate and loaded at runtime:
+The core layer remains SDK-free. The optional FidelityFX boundary loads the
+packaged companion at runtime:
 
 ```bash
-cmake -S native -B target/native-configure
+cp /path/to/libtuxscaling_fidelityfx_vk.so lib/
+# or:
+export TUXSCALING_FIDELITYFX_LIBRARY=/path/to/libtuxscaling_fidelityfx_vk.so
 ```
 
-Vendor runtime binaries must not be copied into the repository. The legacy
-project-owned boundary remains available under `native/include/backend.h`;
-the FidelityFX companion-library boundary is documented in
-[fidelityfx.md](fidelityfx.md).
+The legacy project-owned boundary remains available under
+`native/include/backend.h`; optional maintainer rebuilds and packaging are
+documented in [fidelityfx.md](fidelityfx.md).
 
 ## Local Vulkan layer inspection
 

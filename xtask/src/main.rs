@@ -488,31 +488,55 @@ fn run_gpu_check(backend: BackendSelection) -> bool {
             ]))
             .output(),
         )
+        && report(
+            validation(Command::new("cargo").args([
+                "test",
+                "-p",
+                "tuxscaling-upscaler",
+                "--test",
+                "fidelityfx_quality_gpu",
+                "--features",
+                "fidelityfx",
+                "--",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ]))
+            .output(),
+        )
 }
 
 fn fidelityfx_check(root: &Path) -> bool {
-    let scripts = root.join("scripts/fidelityfx");
-    if !report(
-        Command::new(scripts.join("verify-source.sh"))
-            .current_dir(root)
-            .output(),
-    ) || !report(
-        Command::new(scripts.join("verify-vulkan-shaders.sh"))
-            .current_dir(root)
-            .output(),
-    ) {
+    let library = std::env::var_os("TUXSCALING_FIDELITYFX_LIBRARY")
+        .map(PathBuf::from)
+        .map_or_else(
+            || root.join("lib/libtuxscaling_fidelityfx_vk.so"),
+            |path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    root.join(path)
+                }
+            },
+        );
+    if !library.is_file() {
+        eprintln!(
+            "cargo xtask fidelityfx-check: missing companion library {}",
+            library.display()
+        );
         return false;
     }
-    let output_dir = root.join("target/fidelityfx-check");
-    if !report(
-        Command::new(scripts.join("build-linux.sh"))
-            .current_dir(root)
-            .arg(&output_dir)
-            .output(),
-    ) {
+    let Ok(file) = Command::new("file").arg(&library).output() else {
+        return false;
+    };
+    let file_text = String::from_utf8_lossy(&file.stdout);
+    if !file.status.success() || !file_text.contains("ELF") {
+        eprintln!(
+            "cargo xtask fidelityfx-check: companion is not an ELF shared library: {}",
+            library.display()
+        );
         return false;
     }
-    let library = output_dir.join("libtuxscaling_fidelityfx_vk.so");
     let Ok(symbols) = Command::new("nm").args(["-D"]).arg(&library).output() else {
         return false;
     };

@@ -36,14 +36,15 @@ xtask/        Workspace validation commands
 
 ## Development
 
-See [docs/development.md](docs/development.md) for toolchain setup and validation commands. Run `cargo xtask gpu-check` for GPU motion/capture tests and `cargo xtask gpu-check --backend fsr_3_1_4` for the FidelityFX adapter lifecycle. Run `cargo xtask smoke --backend fsr_3_1_4` for the multi-swapchain WSI test and `cargo xtask fidelityfx-check` for source, shader, native-library, symbol, and loader checks. The runtime logs per-phase GPU medians and p95 values after warm-up when timestamp queries are available.
+See [docs/development.md](docs/development.md) for toolchain setup and validation commands. Run `cargo xtask gpu-check` for GPU motion/capture tests and `cargo xtask gpu-check --backend fsr_3_1_4` for the FidelityFX adapter, lifecycle, and output-quality checks. Run `cargo xtask smoke --backend fsr_3_1_4` for the multi-swapchain WSI test and `cargo xtask fidelityfx-check` for the prebuilt companion's ELF, ABI-symbol, and loader checks. The runtime logs per-phase GPU medians and p95 values after warm-up when timestamp queries are available.
 
-Clone the repository with its pinned FidelityFX dependency:
+The packaged Linux companion library lives under `lib/`. To replace it with
+another local build:
 
 ```bash
-git clone --recurse-submodules <repository-url>
-git submodule update --init --recursive
+cp /path/to/libtuxscaling_fidelityfx_vk.so lib/
 ```
 
-Run `scripts/fidelityfx/verify-source.sh` to verify the upstream revision
-before building the optional FidelityFX backend. See [docs/fidelityfx.md](docs/fidelityfx.md) for native companion-library packaging and shader regeneration.
+Alternatively set `TUXSCALING_FIDELITYFX_LIBRARY` to the companion path. See
+[docs/fidelityfx.md](docs/fidelityfx.md) for packaging and optional maintainer
+rebuild instructions.
