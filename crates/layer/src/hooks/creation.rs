@@ -670,6 +670,7 @@ unsafe fn create_swapchain_inner(
         );
         let mut info = SwapchainInfo {
             format: modified.image_format,
+            color_space: modified.image_color_space,
             extent: modified.image_extent,
         };
         let loader = ash::khr::swapchain::Device::new(&device_state.instance, &device_state.device);
@@ -692,6 +693,7 @@ unsafe fn create_swapchain_inner(
                         capture_enabled = false;
                         info = SwapchainInfo {
                             format: original.image_format,
+                            color_space: original.image_color_space,
                             extent: original.image_extent,
                         };
                         images
@@ -763,6 +765,7 @@ unsafe fn create_swapchain_inner(
                     handle = unsafe { *swapchain };
                     info = SwapchainInfo {
                         format: original.image_format,
+                        color_space: original.image_color_space,
                         extent: original.image_extent,
                     };
                     capture_enabled = false;

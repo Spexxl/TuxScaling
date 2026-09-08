@@ -9,6 +9,7 @@ pub const CRATE_NAME: &str = "tuxscaling-overlay-vulkan";
 #[derive(Clone, Copy)]
 pub struct SwapchainInfo {
     pub format: vk::Format,
+    pub color_space: vk::ColorSpaceKHR,
     pub extent: vk::Extent2D,
 }
 

@@ -5,8 +5,8 @@ use tuxscaling_temporal::{DepthSemantics, GuidanceView};
 use tuxscaling_vulkan::{Image, compute_memory_barrier, image_barrier};
 
 use crate::{
-    BackendCapabilities, BackendConfig, BackendError, BackendFrame, BackendId, BackendImage,
-    UpscalerBackend, content_viewport,
+    BackendCapabilities, BackendColorEncoding, BackendConfig, BackendError, BackendFrame,
+    BackendId, BackendImage, UpscalerBackend, content_viewport,
 };
 
 const REFERENCE_COLOR_FORMATS: &[vk::Format] = &[
@@ -80,6 +80,7 @@ impl ReferenceUpscaler {
                 output_extent,
                 source_format,
                 output_format,
+                color_encoding: BackendColorEncoding::SrgbNonlinear,
                 viewport: content_viewport(input_extent, output_extent),
                 guidance: guidance.capabilities(),
             }),

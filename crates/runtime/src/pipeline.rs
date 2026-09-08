@@ -8,8 +8,8 @@ use tuxscaling_temporal::{
     FrameTiming, GuidanceEstimator, GuidanceReset, GuidanceResolver, History,
 };
 use tuxscaling_upscaler::{
-    BackendConfig, BackendError, BackendFrame, ReferenceUpscaler, ResolutionPlan, UpscalerBackend,
-    content_viewport,
+    BackendColorEncoding, BackendConfig, BackendError, BackendFrame, ReferenceUpscaler,
+    ResolutionPlan, UpscalerBackend, content_viewport,
 };
 
 pub(crate) unsafe fn record_backend(
@@ -261,6 +261,7 @@ impl TemporalPipeline {
                                 output_extent: resolution.output_extent,
                                 source_format: info.format,
                                 output_format: info.format,
+                                color_encoding: BackendColorEncoding::from(info.color_space),
                                 viewport: content_viewport(
                                     resolution.game_extent,
                                     resolution.output_extent,

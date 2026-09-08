@@ -13,6 +13,67 @@ pub const CRATE_NAME: &str = "tuxscaling-upscaler";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendId {
     Reference,
+    Fsr314,
+}
+
+impl BackendId {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Fsr314 => "fsr_3_1_4",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendColorEncoding {
+    SrgbNonlinear,
+    Unsupported(vk::ColorSpaceKHR),
+}
+
+impl From<vk::ColorSpaceKHR> for BackendColorEncoding {
+    fn from(value: vk::ColorSpaceKHR) -> Self {
+        if value == vk::ColorSpaceKHR::SRGB_NONLINEAR {
+            Self::SrgbNonlinear
+        } else {
+            Self::Unsupported(value)
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct BackendEnvironment {
+    pub instance: ash::Instance,
+    pub physical_device: vk::PhysicalDevice,
+    pub device: ash::Device,
+    pub memory: vk::PhysicalDeviceMemoryProperties,
+    pub get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
+}
+
+impl BackendEnvironment {
+    pub fn new(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        device: &ash::Device,
+    ) -> Self {
+        Self {
+            instance: instance.clone(),
+            physical_device,
+            device: device.clone(),
+            memory: unsafe { instance.get_physical_device_memory_properties(physical_device) },
+            get_device_proc_addr: instance.fp_v1_0().get_device_proc_addr,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), BackendError> {
+        if self.instance.handle() == vk::Instance::null()
+            || self.physical_device == vk::PhysicalDevice::null()
+            || self.device.handle() == vk::Device::null()
+        {
+            return Err(BackendError::InvalidMetadata("Vulkan backend environment"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +143,7 @@ pub struct BackendConfig {
     pub output_extent: vk::Extent2D,
     pub source_format: vk::Format,
     pub output_format: vk::Format,
+    pub color_encoding: BackendColorEncoding,
     pub viewport: ContentViewport,
     pub guidance: GuidanceCapabilities,
 }
@@ -119,6 +181,9 @@ impl BackendConfig {
                 role: "output",
                 format: self.output_format,
             });
+        }
+        if !matches!(self.color_encoding, BackendColorEncoding::SrgbNonlinear) {
+            return Err(BackendError::InvalidMetadata("color encoding"));
         }
         if !self.viewport.is_valid() {
             return Err(BackendError::InvalidMetadata("viewport"));
@@ -323,8 +388,9 @@ pub trait UpscalerBackend: Send {
 mod tests {
     use super::content_viewport;
     use super::{
-        BackendCapabilities, BackendConfig, BackendError, BackendFrame, BackendId, BackendImage,
-        ContentViewport, PresentationMode, ResolutionPlan, UpscalerBackend,
+        BackendCapabilities, BackendColorEncoding, BackendConfig, BackendError, BackendFrame,
+        BackendId, BackendImage, ContentViewport, PresentationMode, ResolutionPlan,
+        UpscalerBackend,
     };
     use ash::vk;
     use ash::vk::Handle;
@@ -364,6 +430,11 @@ mod tests {
     fn dummy_backend_satisfies_contract() {
         let mut backend = Dummy;
         assert_eq!(backend.id(), BackendId::Reference);
+        assert_eq!(BackendId::Fsr314.as_str(), "fsr_3_1_4");
+        assert_eq!(
+            BackendColorEncoding::from(vk::ColorSpaceKHR::SRGB_NONLINEAR),
+            BackendColorEncoding::SrgbNonlinear
+        );
         assert!(backend.capabilities().temporal);
         backend
             .configure(BackendConfig {
@@ -377,6 +448,7 @@ mod tests {
                 },
                 source_format: vk::Format::R8G8B8A8_UNORM,
                 output_format: vk::Format::R8G8B8A8_UNORM,
+                color_encoding: BackendColorEncoding::SrgbNonlinear,
                 viewport: ContentViewport {
                     offset: [0.0, 0.0],
                     size: [1.0, 1.0],
@@ -434,6 +506,7 @@ mod tests {
             output_extent: OUTPUT,
             source_format: vk::Format::R8G8B8A8_UNORM,
             output_format: vk::Format::R8G8B8A8_UNORM,
+            color_encoding: BackendColorEncoding::SrgbNonlinear,
             viewport: content_viewport(GAME, OUTPUT),
             guidance: guidance().capabilities(),
         }
