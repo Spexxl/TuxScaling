@@ -60,7 +60,6 @@ pub struct FrameDiagnostics {
     pub overlay_ms: f32,
     pub full_injected_ms: f32,
     pub p95_ms: f32,
-    pub budget_warning: bool,
 }
 
 pub fn resolution_mode(game_extent: [u32; 2], output_extent: [u32; 2]) -> &'static str {
@@ -251,15 +250,6 @@ pub fn render_diagnostics(
                         diagnostics.composition_state,
                         diagnostics.jitter_state
                     ));
-                    if diagnostics.budget_warning {
-                        ui.colored_label(
-                            egui::Color32::YELLOW,
-                            format!(
-                                "Warning: temporal work exceeds the {} preset target",
-                                format_quality(diagnostics.quality)
-                            ),
-                        );
-                    }
                     ui.label("Motion: current -> previous, pixels");
                     ui.label("Hue: direction | Brightness: magnitude");
                     ui.label(format!(

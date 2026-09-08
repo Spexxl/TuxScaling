@@ -9,6 +9,8 @@ use tuxscaling_temporal::{
 };
 use tuxscaling_vulkan::{Buffer, Image, image_barrier, memory_barrier};
 
+#[path = "../../../tests/support/quality.rs"]
+mod quality_gates;
 #[path = "../../../tests/support/gpu.rs"]
 mod support;
 use support::Gpu;
@@ -1452,7 +1454,7 @@ fn normal_guidance_record_updates_the_exposure_image() {
         let exposure = f32::from_ne_bytes(bytes[0..4].try_into().unwrap());
         let expected: f32 = 1.0 / (128.0 / 255.0);
         assert!(exposure.is_finite() && exposure > 0.0);
-        assert!((exposure.log2() - expected.log2()).abs() <= 0.15);
+        assert!((exposure.log2() - expected.log2()).abs() <= quality_gates::MAX_EXPOSURE_ERROR_EV);
         let interior = ((extent.width / 4) as usize, (extent.height / 4) as usize);
         let interior_index = interior.1 * extent.width as usize + interior.0;
         eprintln!(
@@ -1507,7 +1509,10 @@ fn guidance_masks_separate_transparency_from_a_static_background() {
         .collect::<Vec<_>>();
     let score = tuxscaling_temporal::quality::f1(&predicted, &labels);
     eprintln!("transparency F1={score:.3}");
-    assert!(score >= 0.65);
+    assert!(quality_gates::passes_lower_gate(
+        score,
+        quality_gates::MIN_COMPOSITION_F1
+    ));
     let mut inside = 0.0;
     let mut outside = 0.0;
     let mut inside_count = 0;
@@ -1563,14 +1568,20 @@ fn guidance_disocclusion_uses_flow_holes_and_boundaries() {
         .count();
     eprintln!("disocclusion counts tp={tp} fp={fp} fn={fn_}");
     eprintln!("disocclusion F1={score:.3}");
-    assert!(score >= 0.75);
+    assert!(quality_gates::passes_lower_gate(
+        score,
+        quality_gates::MIN_DISOCCLUSION_F1
+    ));
     let reactive_predicted = reactive
         .iter()
         .map(|value| *value as f32 / 255.0 > 0.25)
         .collect::<Vec<_>>();
     let reactive_score = tuxscaling_temporal::quality::f1(&reactive_predicted, &labels);
     eprintln!("reactive F1={reactive_score:.3}");
-    assert!(reactive_score >= 0.70);
+    assert!(quality_gates::passes_lower_gate(
+        reactive_score,
+        quality_gates::MIN_REACTIVE_F1
+    ));
     let average = |x: std::ops::Range<u32>, y: std::ops::Range<u32>| {
         let mut total = 0.0;
         let mut count = 0;
@@ -1766,7 +1777,10 @@ fn relative_depth_orders_independent_parallax_planes() {
     eprintln!(
         "relative depth parallax: order={score:.3} foreground={foreground_mean:.3} background={background_mean:.3}"
     );
-    assert!(score >= 0.85);
+    assert!(quality_gates::passes_lower_gate(
+        score,
+        quality_gates::MIN_DEPTH_ORDERING
+    ));
     assert!(foreground_mean > background_mean + 0.10);
 }
 

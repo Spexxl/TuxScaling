@@ -1,0 +1,10 @@
+# Deterministic fixture baselines.
+# Format: metric=baseline; maximum regression delta; direction
+motion.mean_epe=0.0000; 0.0100; upper
+motion.p95_epe=0.0000; 0.0100; upper
+confidence.auroc=1.0000; 0.0020; lower
+disocclusion.f1=1.0000; 0.0050; lower
+reactive.f1=1.0000; 0.0050; lower
+composition.f1=1.0000; 0.0050; lower
+exposure.error_ev=0.0000; 0.0050; upper
+depth.ordering=1.0000; 0.0050; lower

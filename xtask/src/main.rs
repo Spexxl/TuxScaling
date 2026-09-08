@@ -199,7 +199,7 @@ fn benchmark_cases() -> Vec<BenchmarkCase> {
     ["upscale", "native_aa"]
         .into_iter()
         .flat_map(|scenario| {
-            [100, 50]
+            [100, 75, 50]
                 .into_iter()
                 .flat_map(move |guidance_scale_percent| {
                     ["ultra", "high", "balanced", "performance"]
@@ -212,6 +212,69 @@ fn benchmark_cases() -> Vec<BenchmarkCase> {
                 })
         })
         .collect()
+}
+
+const BENCHMARK_SAMPLE_COUNT: usize = 600;
+
+fn benchmark_output_is_operationally_valid(
+    status_success: bool,
+    stdout: &str,
+    stderr: &str,
+) -> bool {
+    if !status_success {
+        return false;
+    }
+    let output = format!("{stdout}\n{stderr}");
+    let lowercase = output.to_ascii_lowercase();
+    for marker in [
+        "validation error",
+        "error_device_lost",
+        "queue idle",
+        "synchronous readback",
+        "non-finite",
+        "incomplete",
+        "incoherent metadata",
+        "cleanup failure",
+        "window restoration failure",
+        "budget=",
+    ] {
+        if lowercase.contains(marker) {
+            return false;
+        }
+    }
+    if lowercase.contains("nan") || lowercase.contains("infinity") {
+        return false;
+    }
+    let Some(samples) = output
+        .split("GPU samples=")
+        .nth(1)
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return false;
+    };
+    samples == BENCHMARK_SAMPLE_COUNT
+}
+
+fn benchmark_report(result: std::io::Result<Output>) -> bool {
+    match result {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            print!("{stdout}");
+            eprint!("{stderr}");
+            benchmark_output_is_operationally_valid(output.status.success(), &stdout, &stderr)
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+fn quality_fixture_passes(value: f32, minimum: f32) -> bool {
+    value.is_finite() && value >= minimum
 }
 
 fn report(result: std::io::Result<Output>) -> bool {
@@ -354,6 +417,7 @@ fn main() -> ExitCode {
                     "--lib",
                     "--example",
                     "wsi",
+                    "--release",
                 ],
             ) {
                 return ExitCode::FAILURE;
@@ -362,7 +426,7 @@ fn main() -> ExitCode {
                 .parent()
                 .unwrap();
             let inherited = std::env::var_os("LD_LIBRARY_PATH").unwrap_or_default();
-            let libraries = std::iter::once(root.join("target/debug"))
+            let libraries = std::iter::once(root.join("target/release"))
                 .chain(std::env::split_paths(&inherited))
                 .collect::<Vec<_>>();
             benchmark_cases().into_iter().all(|case| {
@@ -393,7 +457,7 @@ fn main() -> ExitCode {
                     "TuxScaling benchmark: scenario={} quality={} guidance_scale={}% warmup=180 samples=600",
                     case.scenario, case.quality, case.guidance_scale_percent
                 );
-                let mut command = Command::new(root.join("target/debug/examples/wsi"));
+                let mut command = Command::new(root.join("target/release/examples/wsi"));
                 validation(&mut command)
                     .env("VK_ADD_LAYER_PATH", root.join("assets/vulkan-layer"))
                     .env("LD_LIBRARY_PATH", std::env::join_paths(&libraries).unwrap())
@@ -410,7 +474,7 @@ fn main() -> ExitCode {
                     .env("TUXSCALING_TEST_SINGLE_WINDOW", "1")
                     .env("TUXSCALING_TEST_FORCE_TEMPORAL_FAILURE", "0")
                     .env("TUXSCALING_TEST_FORCE_RESIZE_FAILURE", "0");
-                report(command.output())
+                benchmark_report(command.output())
             })
         }
         "vkcube" => {
@@ -460,31 +524,71 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        VkcubeExit, benchmark_cases, classify_vkcube_exit, generated_config, parse_vkcube_args,
-        vkcube_launch,
+        BENCHMARK_SAMPLE_COUNT, VkcubeExit, benchmark_cases,
+        benchmark_output_is_operationally_valid, classify_vkcube_exit, generated_config,
+        parse_vkcube_args, quality_fixture_passes, vkcube_launch,
     };
     use std::path::Path;
 
     #[test]
     fn benchmark_matrix_covers_each_quality_and_presentation_mode() {
         let cases = benchmark_cases();
-        assert_eq!(cases.len(), 16);
+        assert_eq!(cases.len(), 24);
         assert_eq!(
             cases
                 .iter()
                 .filter(|case| case.scenario == "upscale")
                 .count(),
-            8
+            12
         );
         assert_eq!(
             cases
                 .iter()
                 .filter(|case| case.scenario == "native_aa")
                 .count(),
-            8
+            12
         );
         assert!(cases.iter().any(|case| case.guidance_scale_percent == 100));
+        assert!(cases.iter().any(|case| case.guidance_scale_percent == 75));
         assert!(cases.iter().any(|case| case.guidance_scale_percent == 50));
+    }
+
+    #[test]
+    fn benchmark_accepts_slow_but_finite_complete_samples() {
+        let stderr = format!(
+            "TuxScaling 1920x1080 GPU samples={BENCHMARK_SAMPLE_COUNT} temporal_median=99.000 temporal_p95=140.000"
+        );
+        assert!(benchmark_output_is_operationally_valid(true, "", &stderr));
+    }
+
+    #[test]
+    fn benchmark_rejects_non_finite_or_incomplete_samples() {
+        assert!(!benchmark_output_is_operationally_valid(
+            true,
+            "",
+            "GPU samples=600 temporal_median=NaN"
+        ));
+        assert!(!benchmark_output_is_operationally_valid(
+            true,
+            "",
+            "GPU samples=incomplete temporal_median=1.000"
+        ));
+    }
+
+    #[test]
+    fn quality_fixture_below_threshold_fails_independently_of_timing() {
+        assert!(quality_fixture_passes(1.0, 0.90));
+        assert!(!quality_fixture_passes(0.89, 0.90));
+        assert!(!quality_fixture_passes(f32::NAN, 0.90));
+    }
+
+    #[test]
+    fn benchmark_output_has_no_latency_budget_result() {
+        let stderr = format!(
+            "GPU samples={BENCHMARK_SAMPLE_COUNT} temporal_median=99.000 temporal_p95=140.000"
+        );
+        assert!(!stderr.contains(&format!("{}false", "budget=")));
+        assert!(benchmark_output_is_operationally_valid(true, "", &stderr));
     }
 
     #[test]

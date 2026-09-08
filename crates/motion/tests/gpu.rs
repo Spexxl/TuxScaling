@@ -5,6 +5,8 @@ use tuxscaling_vulkan::{Buffer, Image, image_barrier, memory_barrier};
 #[path = "../../../tests/support/gpu.rs"]
 mod support;
 use support::Gpu;
+#[path = "../../../tests/support/quality.rs"]
+mod quality_gates;
 
 #[test]
 fn confidence_reads_a_separate_dense_motion_source() {
@@ -419,17 +421,15 @@ fn all_quality_presets_keep_dense_odd_extent_translation() {
         assert!(confidence.iter().all(|value| value.is_finite()));
         let p95 = percentile95(errors);
         eprintln!("{quality:?} dense translation EPE={epe:.4} p95={p95:.4}");
-        let limit = match quality {
-            MotionQuality::Ultra => 1.0,
-            MotionQuality::High => 1.25,
-            MotionQuality::Balanced => 1.75,
-            MotionQuality::Performance => 2.5,
-        };
-        assert!(epe <= limit, "{quality:?} EPE={epe} > {limit}");
         assert!(
-            p95 <= limit * 2.0,
+            quality_gates::passes_upper_gate(epe, quality_gates::MAX_MEAN_EPE),
+            "{quality:?} EPE={epe} > {}",
+            quality_gates::MAX_MEAN_EPE
+        );
+        assert!(
+            quality_gates::passes_upper_gate(p95, quality_gates::MAX_P95_EPE),
             "{quality:?} p95={p95} > {}",
-            limit * 2.0
+            quality_gates::MAX_P95_EPE
         );
     }
 }
@@ -479,17 +479,15 @@ fn rotation_zoom_and_affine_fixture_remain_finite_and_calibrated() {
         assert!(confidence.iter().all(|value| value.is_finite()));
         let p95 = percentile95(errors);
         eprintln!("{quality:?} affine EPE={epe:.4} p95={p95:.4}");
-        let limit = match quality {
-            MotionQuality::Ultra => 1.0,
-            MotionQuality::High => 1.25,
-            MotionQuality::Balanced => 1.75,
-            MotionQuality::Performance => 2.5,
-        };
-        assert!(epe <= limit, "{quality:?} EPE={epe} > {limit}");
         assert!(
-            p95 <= limit * 2.0,
+            quality_gates::passes_upper_gate(epe, quality_gates::MAX_MEAN_EPE),
+            "{quality:?} EPE={epe} > {}",
+            quality_gates::MAX_MEAN_EPE
+        );
+        assert!(
+            quality_gates::passes_upper_gate(p95, quality_gates::MAX_P95_EPE),
             "{quality:?} p95={p95} > {}",
-            limit * 2.0
+            quality_gates::MAX_P95_EPE
         );
     }
 }
@@ -548,7 +546,11 @@ fn independent_object_and_uniform_frames_keep_guidance_calibrated() {
         );
         let score = auroc(&object_scores, &background_scores);
         eprintln!("{quality:?} occlusion AUROC={score:.4}");
-        assert!(score >= 0.90, "{quality:?} AUROC={score} < 0.90");
+        assert!(
+            quality_gates::passes_lower_gate(score, quality_gates::MIN_CONFIDENCE_AUROC),
+            "{quality:?} AUROC={score} < {}",
+            quality_gates::MIN_CONFIDENCE_AUROC
+        );
     }
 
     let uniform = vec![128; (width * height * 4) as usize];
@@ -628,7 +630,7 @@ fn parallel_exposure_is_finite_and_accurate_for_uniform_and_gradient_frames() {
     let expected = expected_exposure(&uniform, width, height);
     assert_eq!(cut, 0);
     assert!(exposure.is_finite() && exposure > 0.0);
-    assert!((exposure.log2() - expected.log2()).abs() <= 0.15);
+    assert!((exposure.log2() - expected.log2()).abs() <= quality_gates::MAX_EXPOSURE_ERROR_EV);
 
     let gradient = (0..height)
         .flat_map(|y| {
@@ -642,7 +644,7 @@ fn parallel_exposure_is_finite_and_accurate_for_uniform_and_gradient_frames() {
     let expected = expected_exposure(&gradient, width, height);
     assert_eq!(cut, 0);
     assert!(exposure.is_finite() && exposure > 0.0);
-    assert!((exposure.log2() - expected.log2()).abs() <= 0.15);
+    assert!((exposure.log2() - expected.log2()).abs() <= quality_gates::MAX_EXPOSURE_ERROR_EV);
 }
 
 #[test]
