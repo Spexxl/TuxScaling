@@ -431,6 +431,7 @@ fn disoccluded_reconstruction_does_not_exceed_bilinear_baseline() {
             input_extent,
             output_extent,
             vk::Format::R8G8B8A8_UNORM,
+            vk::Format::R8G8B8A8_UNORM,
             guidance(
                 &motion,
                 &confidence,

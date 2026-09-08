@@ -4,6 +4,19 @@ use ash::vk;
 use tuxscaling_temporal::{DepthSemantics, GuidanceView};
 use tuxscaling_vulkan::{Image, compute_memory_barrier, image_barrier};
 
+use crate::{
+    BackendCapabilities, BackendConfig, BackendError, BackendFrame, BackendId, UpscalerBackend,
+    content_viewport,
+};
+
+const REFERENCE_COLOR_FORMATS: &[vk::Format] = &[
+    vk::Format::R8G8B8A8_UNORM,
+    vk::Format::B8G8R8A8_UNORM,
+    vk::Format::R8G8B8A8_SRGB,
+    vk::Format::B8G8R8A8_SRGB,
+    vk::Format::R16G16B16A16_SFLOAT,
+];
+
 pub fn scaled_extent(output: vk::Extent2D, scale: f32) -> vk::Extent2D {
     let scale = scale.clamp(0.5, 1.0);
     vk::Extent2D {
@@ -22,8 +35,10 @@ pub struct ReferenceUpscaler {
     descriptor_sets: Vec<vk::DescriptorSet>,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    source_format: vk::Format,
     pub input_extent: vk::Extent2D,
     pub output_extent: vk::Extent2D,
+    backend_config: Option<BackendConfig>,
     initialized: bool,
 }
 
@@ -35,6 +50,7 @@ impl ReferenceUpscaler {
         input_view: vk::ImageView,
         input_extent: vk::Extent2D,
         output_extent: vk::Extent2D,
+        source_format: vk::Format,
         output_format: vk::Format,
         guidance: GuidanceView,
         image_count: usize,
@@ -56,8 +72,17 @@ impl ReferenceUpscaler {
             descriptor_sets: Vec::new(),
             pipeline_layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
+            source_format,
             input_extent,
             output_extent,
+            backend_config: Some(BackendConfig {
+                game_extent: input_extent,
+                output_extent,
+                source_format,
+                output_format,
+                viewport: content_viewport(input_extent, output_extent),
+                guidance: guidance.capabilities(),
+            }),
             initialized: false,
         };
         result.sampler = unsafe {
@@ -454,6 +479,80 @@ impl ReferenceUpscaler {
 
     pub fn reset(&mut self) {
         self.initialized = false;
+    }
+}
+
+impl UpscalerBackend for ReferenceUpscaler {
+    fn id(&self) -> BackendId {
+        BackendId::Reference
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            temporal: true,
+            frame_generation: false,
+            required_guidance: [true; 7],
+            supported_source_formats: REFERENCE_COLOR_FORMATS,
+            supported_output_formats: REFERENCE_COLOR_FORMATS,
+        }
+    }
+
+    fn configure(&mut self, config: BackendConfig) -> Result<(), BackendError> {
+        config.validate(self.capabilities())?;
+        if config.game_extent != self.input_extent {
+            return Err(BackendError::IncompatibleExtent {
+                role: "game",
+                expected: self.input_extent,
+                actual: config.game_extent,
+            });
+        }
+        if config.output_extent != self.output_extent {
+            return Err(BackendError::IncompatibleExtent {
+                role: "output",
+                expected: self.output_extent,
+                actual: config.output_extent,
+            });
+        }
+        if config.source_format != self.source_format {
+            return Err(BackendError::UnsupportedFormat {
+                role: "source",
+                format: config.source_format,
+            });
+        }
+        if config.output_format != self.output.format {
+            return Err(BackendError::UnsupportedFormat {
+                role: "output",
+                format: config.output_format,
+            });
+        }
+        self.backend_config = Some(config);
+        Ok(())
+    }
+
+    unsafe fn record(&mut self, frame: BackendFrame) -> Result<(), BackendError> {
+        let config = self.backend_config.ok_or(BackendError::Unavailable)?;
+        frame.validate(config, self.capabilities())?;
+        let history_write = (frame.frame_id % 2) as usize;
+        let slot = frame.frame_id as usize % self.descriptor_sets.len().max(1);
+        let valid = !frame.reset_history && !frame.guidance.requires_history_reset;
+        unsafe {
+            ReferenceUpscaler::record(
+                self,
+                frame.command_buffer,
+                frame.output.image,
+                frame.guidance,
+                valid,
+                history_write,
+                slot,
+                frame.debug_view,
+            );
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<(), BackendError> {
+        ReferenceUpscaler::reset(self);
+        Ok(())
     }
 }
 

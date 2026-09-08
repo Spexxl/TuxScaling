@@ -240,6 +240,7 @@ impl TemporalPipeline {
                             resolution.game_extent,
                             resolution.output_extent,
                             info.format,
+                            info.format,
                             backend_view,
                             image_count,
                         )
