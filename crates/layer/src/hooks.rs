@@ -10,10 +10,12 @@ use tuxscaling_runtime::{
 };
 
 use super::{
-    loader::{LAYER_LINK_INFO, LayerCreateInfo, next_gipa},
+    loader::{
+        DeviceLayerLink, InstanceLayerLink, LAYER_LINK_INFO, LayerCreateInfo, next_gipa, next_gpdpa,
+    },
     state::{
-        DeviceState, QueueState, SwapchainState, X11Surface, devices, instances, queues, surfaces,
-        swapchains,
+        DeviceState, QueueState, SwapchainState, X11Surface, devices, instance_api_versions,
+        instances, queues, surfaces, swapchains,
     },
 };
 
@@ -56,6 +58,59 @@ unsafe fn device_downstream(device: vk::Device, name: &CStr) -> vk::PFN_vkVoidFu
     unsafe { get_device_proc_addr(device, name.as_ptr()) }
 }
 
+unsafe fn instance_for_physical_device(
+    physical_device: vk::PhysicalDevice,
+) -> Option<ash::Instance> {
+    instances()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .values()
+        .find(|instance| {
+            unsafe { instance.enumerate_physical_devices() }
+                .is_ok_and(|devices| devices.contains(&physical_device))
+        })
+        .cloned()
+}
+
+unsafe fn enumerate_device_extension_properties_inner(
+    physical_device: vk::PhysicalDevice,
+    layer_name: *const i8,
+    property_count: *mut u32,
+    properties: *mut vk::ExtensionProperties,
+) -> vk::Result {
+    if property_count.is_null() {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    let Some(instance) = (unsafe { instance_for_physical_device(physical_device) }) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let Some(proc) =
+        (unsafe { downstream(instance.handle(), c"vkEnumerateDeviceExtensionProperties") })
+    else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let enumerate: vk::PFN_vkEnumerateDeviceExtensionProperties =
+        unsafe { std::mem::transmute(proc) };
+    unsafe { enumerate(physical_device, layer_name, property_count, properties) }
+}
+
+unsafe extern "system" fn enumerate_device_extension_properties(
+    physical_device: vk::PhysicalDevice,
+    layer_name: *const i8,
+    property_count: *mut u32,
+    properties: *mut vk::ExtensionProperties,
+) -> vk::Result {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        enumerate_device_extension_properties_inner(
+            physical_device,
+            layer_name,
+            property_count,
+            properties,
+        )
+    }))
+    .unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED)
+}
+
 pub(crate) unsafe fn get_instance_proc_addr_inner(
     instance: vk::Instance,
     name: *const i8,
@@ -94,6 +149,12 @@ pub(crate) unsafe fn get_instance_proc_addr_inner(
             std::mem::transmute::<vk::PFN_vkDestroySurfaceKHR, vk::PFN_vkVoidFunction>(
                 destroy_surface_khr as vk::PFN_vkDestroySurfaceKHR,
             )
+        },
+        b"vkEnumerateDeviceExtensionProperties" => unsafe {
+            std::mem::transmute::<
+                vk::PFN_vkEnumerateDeviceExtensionProperties,
+                vk::PFN_vkVoidFunction,
+            >(enumerate_device_extension_properties)
         },
         b"vkGetPhysicalDeviceSurfaceCapabilitiesKHR" => unsafe {
             std::mem::transmute::<
@@ -136,6 +197,27 @@ pub(crate) unsafe fn get_instance_proc_addr_inner(
         }),
         _ => unsafe { downstream(instance, name) },
     }
+}
+
+pub(crate) unsafe fn get_physical_device_proc_addr_inner(
+    instance: vk::Instance,
+    name: *const i8,
+) -> vk::PFN_vkVoidFunction {
+    if name.is_null() {
+        return None;
+    }
+    let name = unsafe { CStr::from_ptr(name) };
+    if name.to_bytes() == b"vkEnumerateDeviceExtensionProperties" {
+        return unsafe {
+            std::mem::transmute::<
+                vk::PFN_vkEnumerateDeviceExtensionProperties,
+                vk::PFN_vkVoidFunction,
+            >(enumerate_device_extension_properties)
+        };
+    }
+    let get_physical_device_proc_addr = *next_gpdpa().lock().unwrap_or_else(|e| e.into_inner());
+    let get_physical_device_proc_addr = get_physical_device_proc_addr?;
+    unsafe { get_physical_device_proc_addr(instance, name.as_ptr()) }
 }
 
 pub(crate) unsafe fn get_device_proc_addr_inner(

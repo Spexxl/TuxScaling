@@ -367,7 +367,7 @@ unsafe fn run() {
             })
             .collect::<Vec<_>>();
         let entry = ash::Entry::load().unwrap();
-        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
         let extensions = [
             ash::khr::surface::NAME.as_ptr(),
             ash::khr::xlib_surface::NAME.as_ptr(),
@@ -395,6 +395,19 @@ unsafe fn run() {
             })
             .collect::<Vec<_>>();
         let physical = instance.enumerate_physical_devices().unwrap()[0];
+        let physical_features = instance.get_physical_device_features(physical);
+        let features = vk::PhysicalDeviceFeatures {
+            shader_int16: physical_features.shader_int16,
+            shader_storage_image_write_without_format: physical_features
+                .shader_storage_image_write_without_format,
+            ..Default::default()
+        };
+        let mut supported_vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut supported_features2 =
+            vk::PhysicalDeviceFeatures2::default().push_next(&mut supported_vulkan12);
+        instance.get_physical_device_features2(physical, &mut supported_features2);
+        let mut enabled_vulkan12 = vk::PhysicalDeviceVulkan12Features::default()
+            .shader_float16(supported_vulkan12.shader_float16 == vk::TRUE);
         let families = instance.get_physical_device_queue_family_properties(physical);
         let family = families
             .iter()
@@ -422,7 +435,9 @@ unsafe fn run() {
                 physical,
                 &vk::DeviceCreateInfo::default()
                     .queue_create_infos(&queues)
-                    .enabled_extension_names(&[ash::khr::swapchain::NAME.as_ptr()]),
+                    .enabled_extension_names(&[ash::khr::swapchain::NAME.as_ptr()])
+                    .enabled_features(&features)
+                    .push_next(&mut enabled_vulkan12),
                 None,
             )
             .unwrap();

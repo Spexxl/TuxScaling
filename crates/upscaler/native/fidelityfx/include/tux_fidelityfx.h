@@ -34,11 +34,18 @@ typedef struct TuxFfxCreateInfo {
     uint64_t physical_device;
     uint64_t device;
     uint64_t get_device_proc_addr;
+    uint64_t enumerate_device_extension_properties;
+    uint64_t get_physical_device_features;
+    uint64_t get_physical_device_features2;
+    uint64_t get_physical_device_memory_properties;
+    uint64_t get_physical_device_properties;
+    uint64_t get_physical_device_properties2;
     uint32_t max_render_width;
     uint32_t max_render_height;
     uint32_t max_output_width;
     uint32_t max_output_height;
     uint32_t flags;
+    uint32_t vulkan_api_version;
 } TuxFfxCreateInfo;
 
 typedef struct TuxFfxDispatchInfo {

@@ -59,6 +59,17 @@ impl Fsr314Upscaler {
         image_count: usize,
     ) -> Result<Self, BackendError> {
         environment.validate()?;
+        if environment.vulkan_api_version < vk::API_VERSION_1_2 {
+            return Err(BackendError::Unavailable);
+        }
+        let physical_properties = unsafe {
+            environment
+                .instance
+                .get_physical_device_properties(environment.physical_device)
+        };
+        if physical_properties.api_version < vk::API_VERSION_1_2 {
+            return Err(BackendError::Unavailable);
+        }
         if image_count == 0 {
             return Err(BackendError::InvalidMetadata("FidelityFX frame slots"));
         }
@@ -158,6 +169,36 @@ impl Fsr314Upscaler {
             physical_device: environment.physical_device.as_raw(),
             device: environment.device.handle().as_raw(),
             get_device_proc_addr: environment.get_device_proc_addr as usize as u64,
+            enumerate_device_extension_properties: environment
+                .instance
+                .fp_v1_0()
+                .enumerate_device_extension_properties
+                as usize as u64,
+            get_physical_device_features: environment
+                .instance
+                .fp_v1_0()
+                .get_physical_device_features as usize
+                as u64,
+            get_physical_device_features2: environment
+                .instance
+                .fp_v1_1()
+                .get_physical_device_features2 as usize
+                as u64,
+            get_physical_device_memory_properties: environment
+                .instance
+                .fp_v1_0()
+                .get_physical_device_memory_properties
+                as usize as u64,
+            get_physical_device_properties: environment
+                .instance
+                .fp_v1_0()
+                .get_physical_device_properties as usize
+                as u64,
+            get_physical_device_properties2: environment
+                .instance
+                .fp_v1_1()
+                .get_physical_device_properties2
+                as usize as u64,
             max_render_width: config.game_extent.width,
             max_render_height: config.game_extent.height,
             max_output_width: content_extent.width,
@@ -165,6 +206,7 @@ impl Fsr314Upscaler {
             flags: TUX_FFX_CREATE_DEPTH_INVERTED
                 | TUX_FFX_CREATE_NON_LINEAR_COLORSPACE
                 | TUX_FFX_CREATE_DEBUG_CHECKING,
+            vulkan_api_version: environment.vulkan_api_version,
         };
         let native = NativeContext::create(library, create_info)?;
 

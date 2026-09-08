@@ -34,6 +34,18 @@ pub unsafe extern "system" fn layer_vkGetDeviceProcAddr(
     .unwrap_or(None)
 }
 
+#[unsafe(no_mangle)]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "system" fn layer_vkGetPhysicalDeviceProcAddr(
+    instance: vk::Instance,
+    name: *const i8,
+) -> vk::PFN_vkVoidFunction {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        hooks::get_physical_device_proc_addr_inner(instance, name)
+    }))
+    .unwrap_or(None)
+}
+
 unsafe fn negotiate_inner(version: *mut NegotiateLayerInterface) -> vk::Result {
     if version.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
@@ -45,7 +57,7 @@ unsafe fn negotiate_inner(version: *mut NegotiateLayerInterface) -> vk::Result {
     version.interface_version = LOADER_INTERFACE_VERSION;
     version.get_instance_proc_addr = layer_vkGetInstanceProcAddr;
     version.get_device_proc_addr = layer_vkGetDeviceProcAddr;
-    version.get_physical_device_proc_addr = None;
+    version.get_physical_device_proc_addr = Some(layer_vkGetPhysicalDeviceProcAddr);
     vk::Result::SUCCESS
 }
 

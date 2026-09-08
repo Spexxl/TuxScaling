@@ -43,6 +43,7 @@ target_include_directories(tuxscaling_fidelityfx_vk PRIVATE
     "${FFX_SDK_ROOT}/sdk/include"
 )
 target_link_libraries(tuxscaling_fidelityfx_vk PRIVATE amd_fidelityfx_vk)
+target_link_options(tuxscaling_fidelityfx_vk PRIVATE "LINKER:-Bsymbolic-functions")
 set_target_properties(tuxscaling_fidelityfx_vk PROPERTIES
     OUTPUT_NAME tuxscaling_fidelityfx_vk
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/output"

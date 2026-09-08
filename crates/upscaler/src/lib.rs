@@ -48,6 +48,7 @@ pub struct BackendEnvironment {
     pub device: ash::Device,
     pub memory: vk::PhysicalDeviceMemoryProperties,
     pub get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
+    pub vulkan_api_version: u32,
 }
 
 impl BackendEnvironment {
@@ -56,12 +57,22 @@ impl BackendEnvironment {
         physical_device: vk::PhysicalDevice,
         device: &ash::Device,
     ) -> Self {
+        Self::new_with_api_version(instance, physical_device, device, vk::API_VERSION_1_2)
+    }
+
+    pub fn new_with_api_version(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        device: &ash::Device,
+        vulkan_api_version: u32,
+    ) -> Self {
         Self {
             instance: instance.clone(),
             physical_device,
             device: device.clone(),
             memory: unsafe { instance.get_physical_device_memory_properties(physical_device) },
             get_device_proc_addr: instance.fp_v1_0().get_device_proc_addr,
+            vulkan_api_version,
         }
     }
 

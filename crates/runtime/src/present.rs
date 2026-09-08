@@ -50,6 +50,7 @@ pub struct SwapchainRuntimeCreateInfo {
     pub info: SwapchainInfo,
     pub images: SwapchainImages,
     pub capture_enabled: bool,
+    pub vulkan_api_version: u32,
     pub window: Option<u64>,
     pub fullscreen: bool,
     pub monitor: Option<[i32; 4]>,
@@ -500,6 +501,7 @@ impl SwapchainRuntime {
             info,
             images,
             capture_enabled,
+            vulkan_api_version,
             window,
             fullscreen,
             monitor,
@@ -540,6 +542,7 @@ impl SwapchainRuntime {
                 physical,
                 device,
                 info,
+                vulkan_api_version,
                 resolution,
                 config: &config,
                 capture_enabled,
@@ -1224,10 +1227,12 @@ impl SwapchainRuntime {
                                 vk::CommandBufferResetFlags::empty(),
                             )
                             .and_then(|()| {
+                                let inheritance = vk::CommandBufferInheritanceInfo::default();
                                 self.device.begin_command_buffer(
                                     slot.backend_command,
                                     &vk::CommandBufferBeginInfo::default()
-                                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
+                                        .inheritance_info(&inheritance),
                                 )
                             })
                             .map_err(|error| {

@@ -32,7 +32,7 @@ cargo xtask fidelityfx-check
 
 `cargo xtask check` is the preferred host-only command. `gpu-check` runs ignored GPU tests. `smoke` exercises multiple swapchains, grouped presents, resize, capture, optical flow, virtual-output fallback, and validation synchronization.
 
-Pass `--backend fsr_3_1_4` to `gpu-check`, `smoke`, or `vkcube` to exercise the experimental FidelityFX path. `Reference` remains the default.
+Pass `--backend fsr_3_1_4` to `gpu-check`, `smoke`, or `vkcube` to exercise the experimental FidelityFX path. The FSR GPU check includes the adapter, lifecycle, deterministic captured-sequence quality, and static quality gates. `Reference` remains the default.
 
 The debug WSI harness sets `TUXSCALING_TEST_FORCE_VIRTUAL=1` so it can validate small logical game images against the discovered monitor output without depending on a window manager fullscreen transition. Release builds ignore this test-only override.
 

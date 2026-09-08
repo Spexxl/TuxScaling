@@ -344,6 +344,22 @@ pub mod quality {
         result
     }
 
+    /// A deterministic high-frequency residual models sensor and particle noise.
+    pub fn noise(width: u32, height: u32) -> SequenceFixture {
+        let mut result = base_translation(width, height, 0.5, -0.5, 19);
+        for (index, pixel) in result.current.iter_mut().enumerate() {
+            let value = (index as u32)
+                .wrapping_mul(0x9e37_79b9)
+                .rotate_left(11)
+                .wrapping_add(0x85eb_ca6b);
+            let noise = ((value >> 24) & 0x1f) as f32 / 255.0 - 0.0625;
+            pixel[0] = (pixel[0] + noise).clamp(0.0, 1.0);
+            pixel[1] = (pixel[1] + noise * 0.75).clamp(0.0, 1.0);
+            pixel[2] = (pixel[2] - noise * 0.5).clamp(0.0, 1.0);
+        }
+        result
+    }
+
     /// A semi-transparent rectangle has a known alpha-like composition label.
     pub fn transparency(width: u32, height: u32) -> SequenceFixture {
         let mut result = base_translation(width, height, 1.0, 0.0, 5);

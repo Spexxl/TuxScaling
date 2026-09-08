@@ -245,13 +245,15 @@ unsafe fn create_instance_inner(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
     let chain = link;
-    let link = unsafe { (*chain).data.layer_info };
+    let link = unsafe { (*chain).data.layer_info.cast::<InstanceLayerLink>() };
     if link.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
     let get_instance_proc_addr = unsafe { (*link).get_instance_proc_addr };
+    *next_gpdpa().lock().unwrap_or_else(|e| e.into_inner()) =
+        unsafe { (*link).get_physical_device_proc_addr };
     let next = unsafe { (*link).next };
-    unsafe { (*chain).data.layer_info = next };
+    unsafe { (*chain).data.layer_info = next.cast() };
     *next_gipa().lock().unwrap_or_else(|e| e.into_inner()) = Some(get_instance_proc_addr);
 
     let Some(proc) =
@@ -260,7 +262,44 @@ unsafe fn create_instance_inner(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
     let create_instance: vk::PFN_vkCreateInstance = unsafe { std::mem::transmute(proc) };
-    let result = unsafe { create_instance(create_info, allocation_callbacks, instance) };
+    let requested_api_version = unsafe {
+        (*create_info)
+            .p_application_info
+            .as_ref()
+            .map(|application| application.api_version)
+            .filter(|version| *version != 0)
+            .unwrap_or(vk::API_VERSION_1_0)
+    };
+    let mut supported_api_version = vk::API_VERSION_1_0;
+    if let Some(proc) = unsafe {
+        get_instance_proc_addr(vk::Instance::null(), c"vkEnumerateInstanceVersion".as_ptr())
+    } {
+        let enumerate_instance_version: vk::PFN_vkEnumerateInstanceVersion =
+            unsafe { std::mem::transmute(proc) };
+        let _ = unsafe { enumerate_instance_version(&mut supported_api_version) };
+    }
+    let vulkan_api_version = if requested_api_version < vk::API_VERSION_1_2
+        && supported_api_version >= vk::API_VERSION_1_2
+    {
+        vk::API_VERSION_1_2
+    } else {
+        requested_api_version
+    };
+    let mut modified_application_info = unsafe {
+        (*create_info)
+            .p_application_info
+            .as_ref()
+            .copied()
+            .unwrap_or_default()
+    };
+    if modified_application_info.s_type == vk::StructureType::APPLICATION_INFO {
+        modified_application_info.api_version = vulkan_api_version;
+    } else {
+        modified_application_info = vk::ApplicationInfo::default().api_version(vulkan_api_version);
+    }
+    let mut modified_create_info = unsafe { *create_info };
+    modified_create_info.p_application_info = &modified_application_info;
+    let result = unsafe { create_instance(&modified_create_info, allocation_callbacks, instance) };
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if result == vk::Result::SUCCESS {
             crate::state::instance_dispatch()
@@ -279,6 +318,10 @@ unsafe fn create_instance_inner(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(unsafe { *instance }, ash_instance);
+            instance_api_versions()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(unsafe { *instance }, vulkan_api_version);
         }
         result
     }));
@@ -316,7 +359,7 @@ unsafe fn create_device_inner(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
     let chain = link;
-    let link = unsafe { (*chain).data.layer_info };
+    let link = unsafe { (*chain).data.layer_info.cast::<DeviceLayerLink>() };
     if link.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
@@ -332,9 +375,15 @@ unsafe fn create_device_inner(
     }) else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
+    let vulkan_api_version = instance_api_versions()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&instance.handle())
+        .copied()
+        .unwrap_or(vk::API_VERSION_1_0);
     let get_device_proc_addr = unsafe { (*link).get_device_proc_addr };
     let next = unsafe { (*link).next };
-    unsafe { (*chain).data.layer_info = next };
+    unsafe { (*chain).data.layer_info = next.cast() };
     let Some(proc) = (unsafe {
         ((*link).get_instance_proc_addr)(instance.handle(), c"vkCreateDevice".as_ptr())
     }) else {
@@ -342,6 +391,7 @@ unsafe fn create_device_inner(
     };
     let create_device: vk::PFN_vkCreateDevice = unsafe { std::mem::transmute(proc) };
     let physical_features = unsafe { instance.get_physical_device_features(physical_device) };
+    let physical_properties = unsafe { instance.get_physical_device_properties(physical_device) };
     let mut modified_info = unsafe { *create_info };
     let original_p_next = unsafe { (*create_info).p_next };
     let original_p_enabled_features = unsafe { (*create_info).p_enabled_features };
@@ -349,31 +399,69 @@ unsafe fn create_device_inner(
         .copied()
         .unwrap_or_default();
     let mut features2_override = vk::PhysicalDeviceFeatures2::default();
-    let mut use_features2_override = false;
-    if physical_features.shader_storage_image_write_without_format != 0 {
-        let mut next = unsafe { (*create_info).p_next.cast::<vk::BaseInStructure<'_>>() };
-        let mut has_features2 = false;
-        while !next.is_null() {
-            if unsafe { (*next).s_type } == vk::StructureType::PHYSICAL_DEVICE_FEATURES_2 {
-                has_features2 = true;
-                break;
+    let mut vulkan12_override = vk::PhysicalDeviceVulkan12Features::default();
+    let mut supported_vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
+    if physical_properties.api_version >= vk::API_VERSION_1_2 {
+        let mut supported_features2 = vk::PhysicalDeviceFeatures2 {
+            p_next: &mut supported_vulkan12 as *mut _ as *mut c_void,
+            ..Default::default()
+        };
+        unsafe {
+            instance.get_physical_device_features2(physical_device, &mut supported_features2)
+        };
+    }
+    let mut next = unsafe { (*create_info).p_next.cast::<vk::BaseInStructure<'_>>() };
+    let mut has_features2 = false;
+    let mut existing_vulkan12: *mut vk::PhysicalDeviceVulkan12Features<'static> =
+        std::ptr::null_mut();
+    while !next.is_null() {
+        match unsafe { (*next).s_type } {
+            vk::StructureType::PHYSICAL_DEVICE_FEATURES_2 => has_features2 = true,
+            vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES => {
+                existing_vulkan12 = next.cast_mut().cast();
             }
-            next = unsafe { (*next).p_next.cast() };
+            _ => {}
         }
-        if !has_features2 {
-            features2_override.features = enabled_features;
+        next = unsafe { (*next).p_next.cast() };
+    }
+    let enable_storage_write = physical_features.shader_storage_image_write_without_format != 0;
+    let enable_shader_int16 = physical_features.shader_int16 != 0;
+    let enable_shader_float16 = supported_vulkan12.shader_float16 != 0;
+    let mut use_features2_override = false;
+    if !has_features2 && (enable_storage_write || enable_shader_int16 || enable_shader_float16) {
+        features2_override.features = enabled_features;
+        if enable_storage_write {
             features2_override
                 .features
                 .shader_storage_image_write_without_format = vk::TRUE;
-            features2_override.p_next = original_p_next as *mut c_void;
-            modified_info.p_enabled_features = std::ptr::null();
-            modified_info.p_next = &features2_override as *const _ as *const c_void;
-            use_features2_override = true;
         }
+        if enable_shader_int16 {
+            features2_override.features.shader_int16 = vk::TRUE;
+        }
+        if enable_shader_float16 {
+            if existing_vulkan12.is_null() {
+                vulkan12_override.shader_float16 = vk::TRUE;
+                vulkan12_override.p_next = original_p_next as *mut c_void;
+                features2_override.p_next = &mut vulkan12_override as *mut _ as *mut c_void;
+            } else {
+                unsafe {
+                    (*existing_vulkan12).shader_float16 = vk::TRUE;
+                }
+                features2_override.p_next = original_p_next as *mut c_void;
+            }
+        } else {
+            features2_override.p_next = original_p_next as *mut c_void;
+        }
+        modified_info.p_enabled_features = std::ptr::null();
+        modified_info.p_next = &features2_override as *const _ as *const c_void;
+        use_features2_override = true;
     }
     if !use_features2_override && !original_p_enabled_features.is_null() {
-        if physical_features.shader_storage_image_write_without_format != 0 {
+        if enable_storage_write {
             enabled_features.shader_storage_image_write_without_format = vk::TRUE;
+        }
+        if enable_shader_int16 {
+            enabled_features.shader_int16 = vk::TRUE;
         }
         modified_info.p_enabled_features = &enabled_features;
     }
@@ -405,6 +493,7 @@ unsafe fn create_device_inner(
             unsafe { *device },
             DeviceState {
                 overlay_supported: !unsafe { has_present_fences((*create_info).p_next) },
+                vulkan_api_version,
                 queue_families: unsafe {
                     instance.get_physical_device_queue_family_properties(physical_device)
                 },
@@ -568,7 +657,8 @@ unsafe fn create_swapchain_inner(
     }
     let needed = vk::ImageUsageFlags::TRANSFER_SRC
         | vk::ImageUsageFlags::TRANSFER_DST
-        | vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        | vk::ImageUsageFlags::COLOR_ATTACHMENT
+        | vk::ImageUsageFlags::STORAGE;
     let mut capture_enabled = false;
     if let Some(state) = &state
         && state.overlay_supported
@@ -804,6 +894,7 @@ unsafe fn create_swapchain_inner(
                         output_images,
                     },
                     capture_enabled,
+                    vulkan_api_version: device_state.vulkan_api_version,
                     window,
                     fullscreen: window
                         .and_then(|window| {

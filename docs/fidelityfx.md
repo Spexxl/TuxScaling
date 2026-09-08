@@ -84,6 +84,12 @@ VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
 cargo xtask vkcube --seconds 10 --release --backend fsr_3_1_4
 ```
 
+The GPU check replays twelve deterministic capture fixtures covering
+translation, rotation, scaling, camera pan, thin geometry, HUD, transparency,
+particles, occlusion/disocclusion, noise, scene cuts, and pause/resume. It
+reports FSR, bilinear, and Reference PSNR/SSIM plus motion-compensated
+temporal flicker, and fails unless FSR improves the aggregate bilinear result.
+
 FSR currently receives zero camera jitter and synthetic flat/relative depth
 derived from estimated color guidance. These are explicit limitations:
 TuxScaling does not intercept native game jitter or native motion/depth

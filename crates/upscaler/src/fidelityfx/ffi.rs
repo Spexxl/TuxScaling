@@ -31,11 +31,18 @@ pub struct TuxFfxCreateInfo {
     pub physical_device: u64,
     pub device: u64,
     pub get_device_proc_addr: u64,
+    pub enumerate_device_extension_properties: u64,
+    pub get_physical_device_features: u64,
+    pub get_physical_device_features2: u64,
+    pub get_physical_device_memory_properties: u64,
+    pub get_physical_device_properties: u64,
+    pub get_physical_device_properties2: u64,
     pub max_render_width: u32,
     pub max_render_height: u32,
     pub max_output_width: u32,
     pub max_output_height: u32,
     pub flags: u32,
+    pub vulkan_api_version: u32,
 }
 
 #[repr(C)]
@@ -101,7 +108,7 @@ const _: () = {
     assert!(std::mem::align_of::<TuxFfxVersion>() == 4);
     assert!(std::mem::size_of::<TuxFfxImage>() == 32);
     assert!(std::mem::align_of::<TuxFfxImage>() == 8);
-    assert!(std::mem::size_of::<TuxFfxCreateInfo>() == 48);
+    assert!(std::mem::size_of::<TuxFfxCreateInfo>() == 96);
     assert!(std::mem::align_of::<TuxFfxCreateInfo>() == 8);
     assert!(std::mem::size_of::<TuxFfxDispatchInfo>() == 296);
     assert!(std::mem::align_of::<TuxFfxDispatchInfo>() == 8);

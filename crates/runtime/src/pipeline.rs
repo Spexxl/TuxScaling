@@ -97,6 +97,7 @@ pub struct TemporalPipelineDescriptor<'a> {
     pub physical: vk::PhysicalDevice,
     pub device: &'a ash::Device,
     pub info: SwapchainInfo,
+    pub vulkan_api_version: u32,
     pub resolution: ResolutionPlan,
     pub config: &'a Config,
     pub capture_enabled: bool,
@@ -172,6 +173,7 @@ fn ema(previous: Duration, sample: Duration) -> Duration {
 
 pub struct TemporalPipeline {
     pub(crate) resolution: ResolutionPlan,
+    pub(crate) vulkan_api_version: u32,
     pub(crate) capture: Option<Capture>,
     pub(crate) motion: Option<MotionEstimator>,
     pub(crate) guidance: Option<GuidanceEstimator>,
@@ -204,6 +206,7 @@ impl TemporalPipeline {
             physical,
             device,
             info,
+            vulkan_api_version,
             resolution,
             config,
             capture_enabled,
@@ -321,7 +324,12 @@ impl TemporalPipeline {
                     );
                 } else {
                     let backend_config = backend_config(info, resolution, backend_view);
-                    let environment = BackendEnvironment::new(instance, physical, device);
+                    let environment = BackendEnvironment::new_with_api_version(
+                        instance,
+                        physical,
+                        device,
+                        vulkan_api_version,
+                    );
                     match unsafe {
                         create_upscaler(
                             config.upscaler,
@@ -376,6 +384,7 @@ impl TemporalPipeline {
         };
         Ok(Self {
             resolution,
+            vulkan_api_version,
             capture,
             motion,
             guidance,
@@ -493,7 +502,12 @@ impl TemporalPipeline {
             let backend_view = replacement_resolver
                 .as_ref()
                 .map_or(raw_view, |value| value.view(raw_view));
-            let environment = BackendEnvironment::new(instance, physical, device);
+            let environment = BackendEnvironment::new_with_api_version(
+                instance,
+                physical,
+                device,
+                self.vulkan_api_version,
+            );
             let replacement_backend = match unsafe {
                 create_upscaler(
                     self.active_upscaler,
@@ -571,7 +585,12 @@ impl TemporalPipeline {
         if selection == self.active_upscaler {
             return Ok(false);
         }
-        let environment = BackendEnvironment::new(instance, physical, device);
+        let environment = BackendEnvironment::new_with_api_version(
+            instance,
+            physical,
+            device,
+            self.vulkan_api_version,
+        );
         let config = backend_config(info, self.resolution, guidance);
         let result = unsafe {
             replace_upscaler(
@@ -603,6 +622,7 @@ impl TemporalPipeline {
     pub(crate) fn for_test(resolution: ResolutionPlan) -> Self {
         Self {
             resolution,
+            vulkan_api_version: vk::API_VERSION_1_2,
             capture: None,
             motion: None,
             guidance: None,

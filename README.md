@@ -36,7 +36,7 @@ xtask/        Workspace validation commands
 
 ## Development
 
-See [docs/development.md](docs/development.md) for toolchain setup and validation commands. Run `cargo xtask gpu-check` for GPU motion/capture tests and `cargo xtask gpu-check --backend fsr_3_1_4` for the FidelityFX adapter, lifecycle, and output-quality checks. Run `cargo xtask smoke --backend fsr_3_1_4` for the multi-swapchain WSI test and `cargo xtask fidelityfx-check` for the prebuilt companion's ELF, ABI-symbol, and loader checks. The runtime logs per-phase GPU medians and p95 values after warm-up when timestamp queries are available.
+See [docs/development.md](docs/development.md) for toolchain setup and validation commands. Run `cargo xtask gpu-check` for GPU motion/capture tests and `cargo xtask gpu-check --backend fsr_3_1_4` for the FidelityFX adapter, lifecycle, captured-sequence quality, and output-quality checks. Run `cargo xtask smoke --backend fsr_3_1_4` for the multi-swapchain WSI test and `cargo xtask fidelityfx-check` for the prebuilt companion's ELF, ABI-symbol, and loader checks. The runtime logs per-phase GPU medians and p95 values after warm-up when timestamp queries are available.
 
 The packaged Linux companion library lives under `lib/`. To replace it with
 another local build:

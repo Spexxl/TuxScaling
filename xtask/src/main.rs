@@ -504,6 +504,22 @@ fn run_gpu_check(backend: BackendSelection) -> bool {
             ]))
             .output(),
         )
+        && report(
+            validation(Command::new("cargo").args([
+                "test",
+                "-p",
+                "tuxscaling-upscaler",
+                "--test",
+                "fidelityfx_sequence_quality_gpu",
+                "--features",
+                "fidelityfx",
+                "--",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ]))
+            .output(),
+        )
 }
 
 fn fidelityfx_check(root: &Path) -> bool {

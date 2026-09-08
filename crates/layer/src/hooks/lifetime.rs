@@ -153,6 +153,10 @@ unsafe fn destroy_instance_inner(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&instance);
+        crate::state::instance_api_versions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&instance);
         crate::state::instance_dispatch()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
