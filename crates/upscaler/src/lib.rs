@@ -5,6 +5,9 @@ use tuxscaling_temporal::{GuidanceCapabilities, GuidanceSignal, GuidanceView, Si
 mod reference;
 pub use reference::{ReferenceUpscaler, scaled_extent};
 
+#[cfg(feature = "fidelityfx")]
+pub mod fidelityfx;
+
 pub const CRATE_NAME: &str = "tuxscaling-upscaler";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
