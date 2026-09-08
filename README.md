@@ -35,3 +35,13 @@ xtask/        Workspace validation commands
 ## Development
 
 See [docs/development.md](docs/development.md) for toolchain setup and validation commands. Run `cargo xtask gpu-check` for GPU motion/capture tests and `cargo xtask smoke` for the multi-swapchain WSI test. The runtime logs per-phase GPU medians and p95 values after warm-up when timestamp queries are available.
+
+Clone the repository with its pinned FidelityFX dependency:
+
+```bash
+git clone --recurse-submodules <repository-url>
+git submodule update --init --recursive
+```
+
+Run `scripts/fidelityfx/verify-source.sh` to verify the upstream revision
+before building the optional FidelityFX backend.
