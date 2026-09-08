@@ -1,0 +1,46 @@
+#version 450
+
+layout(set = 0, binding = 0) uniform sampler2D motion_image;
+layout(set = 0, binding = 1) uniform sampler2D confidence_image;
+layout(set = 0, binding = 2) uniform sampler2D disocclusion_image;
+layout(set = 0, binding = 3) uniform sampler2D reactive_image;
+layout(set = 0, binding = 4) uniform sampler2D depth_image;
+layout(set = 0, binding = 5) uniform sampler2D composition_image;
+
+layout(rg16f, set = 0, binding = 6) uniform image2D fsr_motion;
+layout(r32f, set = 0, binding = 7) uniform image2D fsr_depth;
+layout(r8, set = 0, binding = 8) uniform image2D fsr_reactive;
+layout(r8, set = 0, binding = 9) uniform image2D fsr_composition;
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint relative_depth;
+} params;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(params.width) || pixel.y >= int(params.height)) {
+        return;
+    }
+
+    vec2 motion = texelFetch(motion_image, pixel, 0).xy;
+    float confidence = texelFetch(confidence_image, pixel, 0).r;
+    float disocclusion = texelFetch(disocclusion_image, pixel, 0).r;
+    float reactive = texelFetch(reactive_image, pixel, 0).r;
+    float composition = texelFetch(composition_image, pixel, 0).r;
+
+    vec2 sanitized_motion = confidence > 0.05 ? motion : vec2(0.0);
+    float fsr_reactive_value = max(reactive, disocclusion * (1.0 - confidence));
+    float fsr_composition_value = max(composition, disocclusion);
+    float fsr_depth_value = params.relative_depth != 0u
+        ? clamp(texelFetch(depth_image, pixel, 0).r, 0.0, 1.0)
+        : 1.0;
+
+    imageStore(fsr_motion, pixel, vec4(sanitized_motion, 0.0, 1.0));
+    imageStore(fsr_depth, pixel, vec4(fsr_depth_value, 0.0, 0.0, 1.0));
+    imageStore(fsr_reactive, pixel, vec4(fsr_reactive_value, 0.0, 0.0, 1.0));
+    imageStore(fsr_composition, pixel, vec4(fsr_composition_value, 0.0, 0.0, 1.0));
+}
