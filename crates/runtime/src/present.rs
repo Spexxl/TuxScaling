@@ -2,12 +2,14 @@
 use ash::vk;
 use std::{collections::VecDeque, time::Instant};
 use tuxscaling_capture::Capture;
-use tuxscaling_config::DebugView;
+use tuxscaling_config::{DebugView, Upscaler};
 use tuxscaling_motion::MotionQuality;
 use tuxscaling_overlay::FrameDiagnostics;
 use tuxscaling_overlay_vulkan::{OverlayRenderer, SwapchainInfo};
 use tuxscaling_temporal::{DepthSemantics, FrameExtent, GuidanceReset, SignalState};
-use tuxscaling_upscaler::{BackendFrame, BackendImage, ResolutionPlan, content_viewport};
+use tuxscaling_upscaler::{
+    BackendError, BackendFrame, BackendImage, ResolutionPlan, content_viewport,
+};
 use tuxscaling_vulkan::{compute_memory_barrier, image_barrier, transfer_memory_barrier};
 
 #[path = "pipeline.rs"]
@@ -55,8 +57,30 @@ pub struct SwapchainRuntimeCreateInfo {
 
 struct Slot {
     command: vk::CommandBuffer,
+    backend_command: vk::CommandBuffer,
     fence: vk::Fence,
     semaphore: vk::Semaphore,
+}
+
+fn record_secondary_transaction<E>(
+    begin: impl FnOnce() -> Result<(), E>,
+    record: impl FnOnce() -> Result<(), E>,
+    end: impl FnOnce() -> Result<(), E>,
+    reset: impl FnOnce(),
+    execute: impl FnOnce(),
+    fallback: impl FnOnce(),
+) -> Result<(), E> {
+    if let Err(error) = begin() {
+        fallback();
+        return Err(error);
+    }
+    if let Err(error) = record().and_then(|()| end()) {
+        reset();
+        fallback();
+        return Err(error);
+    }
+    execute();
+    Ok(())
 }
 const GPU_PHASES: usize = 15;
 const GPU_TIMESTAMPS: usize = 18;
@@ -156,6 +180,17 @@ fn mode_name(mode: u32) -> &'static str {
     .get(mode as usize)
     .copied()
     .unwrap_or("Original")
+}
+
+fn upscaler_name(upscaler: Upscaler) -> &'static str {
+    match upscaler {
+        Upscaler::Reference => "Reference",
+        Upscaler::Fsr314 => "FSR 3.1.4",
+    }
+}
+
+fn backend_vk_error(operation: &'static str, error: vk::Result) -> BackendError {
+    BackendError::Internal(format!("{operation}: {error:?}"))
 }
 
 fn debug_mode_id(name: &str) -> Option<u32> {
@@ -534,6 +569,7 @@ impl SwapchainRuntime {
             },
             |[x, y, width, height]| format!("{width}x{height} at {x},{y}"),
         );
+        let active_upscaler = temporal.active_upscaler;
         Ok(Self {
             instance: instance.clone(),
             physical,
@@ -561,6 +597,8 @@ impl SwapchainRuntime {
                 .into(),
                 mode: mode_name(mode).into(),
                 quality: config.motion_quality,
+                upscaler: active_upscaler,
+                active_upscaler,
                 jitter_mode: config.jitter_mode,
                 debug_view: config.debug_view,
                 reset_reason: reset_name(GuidanceReset::Initialize).into(),
@@ -657,7 +695,15 @@ impl SwapchainRuntime {
                     .command_buffer_count(self.output_images.len() as u32),
             )
         }?;
-        for command in commands {
+        let backend_commands = unsafe {
+            self.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.pool)
+                    .level(vk::CommandBufferLevel::SECONDARY)
+                    .command_buffer_count(self.output_images.len() as u32),
+            )
+        }?;
+        for (command, backend_command) in commands.into_iter().zip(backend_commands) {
             if let Some(set) = self.set_loader_data {
                 use ash::vk::Handle;
                 let result = unsafe {
@@ -669,9 +715,19 @@ impl SwapchainRuntime {
                 if result != vk::Result::SUCCESS {
                     return Err(result);
                 }
+                let result = unsafe {
+                    set(
+                        self.device.handle(),
+                        backend_command.as_raw() as *mut std::ffi::c_void,
+                    )
+                };
+                if result != vk::Result::SUCCESS {
+                    return Err(result);
+                }
             }
             self.slots.push(Slot {
                 command,
+                backend_command,
                 fence: vk::Fence::null(),
                 semaphore: vk::Semaphore::null(),
             });
@@ -724,6 +780,8 @@ impl SwapchainRuntime {
             resolution.guidance_extent.width,
             resolution.guidance_extent.height,
         ];
+        self.diagnostics.upscaler = self.temporal.active_upscaler;
+        self.diagnostics.active_upscaler = self.temporal.active_upscaler;
         self.diagnostics.state = "Guidance scale changed; history reset".into();
         Ok(())
     }
@@ -845,6 +903,9 @@ impl SwapchainRuntime {
             &mut self.diagnostics,
         )?;
         self.diagnostics.overlay_cpu_ms = cpu_overlay_start.elapsed().as_secs_f32() * 1_000.0;
+        if let Some(selection) = frame.requested_upscaler {
+            self.temporal.request_upscaler(selection);
+        }
         if let Some(quality) = frame.requested_quality {
             self.temporal.pending_quality = Some(motion_quality(quality));
         }
@@ -1099,11 +1160,43 @@ impl SwapchainRuntime {
                 layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             });
             let mut backend_failed = false;
+            let requested_upscaler = self.temporal.pending_upscaler;
+            if let (Some(guidance), Some(source)) = (guidance_view, backend_source)
+                && requested_upscaler.is_some()
+            {
+                match self.temporal.apply_pending_upscaler(
+                    &self.instance,
+                    self.physical,
+                    &self.device,
+                    self.info,
+                    source.view,
+                    guidance,
+                ) {
+                    Ok(true) => {
+                        self.diagnostics.active_upscaler = self.temporal.active_upscaler;
+                        self.diagnostics.upscaler = self.temporal.active_upscaler;
+                        self.diagnostics.state = "Upscaler changed; history reset".into();
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.diagnostics.upscaler = self.temporal.active_upscaler;
+                        self.diagnostics.requested_upscaler = None;
+                        self.diagnostics.state = format!(
+                            "{} unavailable; keeping {}",
+                            upscaler_name(
+                                requested_upscaler.unwrap_or(self.temporal.active_upscaler),
+                            ),
+                            upscaler_name(self.temporal.active_upscaler),
+                        );
+                        eprintln!("TuxScaling: upscaler replacement failed: {error}");
+                    }
+                }
+            }
             if let (Some(upscaler), Some(guidance), Some(source)) =
                 (&mut self.temporal.upscaler, guidance_view, backend_source)
             {
                 let frame = BackendFrame {
-                    command_buffer: slot.command,
+                    command_buffer: slot.backend_command,
                     slot: index,
                     source,
                     output: BackendImage {
@@ -1123,12 +1216,48 @@ impl SwapchainRuntime {
                     debug_view: backend_debug_view(self.mode),
                 };
                 let cpu_start = Instant::now();
-                let result = pipeline::record_backend(upscaler.as_mut(), frame);
+                let result = record_secondary_transaction(
+                    || {
+                        self.device
+                            .reset_command_buffer(
+                                slot.backend_command,
+                                vk::CommandBufferResetFlags::empty(),
+                            )
+                            .and_then(|()| {
+                                self.device.begin_command_buffer(
+                                    slot.backend_command,
+                                    &vk::CommandBufferBeginInfo::default()
+                                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                                )
+                            })
+                            .map_err(|error| {
+                                backend_vk_error("begin backend command buffer", error)
+                            })
+                    },
+                    || pipeline::record_backend(upscaler.as_mut(), frame),
+                    || {
+                        self.device
+                            .end_command_buffer(slot.backend_command)
+                            .map_err(|error| backend_vk_error("end backend command buffer", error))
+                    },
+                    || {
+                        let _ = self.device.reset_command_buffer(
+                            slot.backend_command,
+                            vk::CommandBufferResetFlags::empty(),
+                        );
+                    },
+                    || {
+                        self.device
+                            .cmd_execute_commands(slot.command, &[slot.backend_command])
+                    },
+                    || {
+                        backend_failed = true;
+                    },
+                );
                 self.diagnostics.reconstruction_cpu_ms =
                     cpu_start.elapsed().as_secs_f32() * 1_000.0;
                 if let Err(error) = result {
                     eprintln!("TuxScaling: backend record failed: {error}");
-                    backend_failed = true;
                 }
             } else if self.game_images[index] != self.output_images[index]
                 && let Some(capture) = &self.temporal.capture
@@ -1144,6 +1273,11 @@ impl SwapchainRuntime {
             }
             if backend_failed {
                 self.temporal.reset_history(GuidanceReset::ProviderFailure);
+                let failed_backend = self.temporal.active_upscaler;
+                self.temporal.unavailable_upscaler = Some(failed_backend);
+                if failed_backend != Upscaler::Reference {
+                    self.temporal.pending_upscaler = Some(Upscaler::Reference);
+                }
                 self.diagnostics.state = "Backend failure; spatial fallback".into();
                 if self.game_images[index] != self.output_images[index]
                     && let Some(capture) = &self.temporal.capture
@@ -1297,6 +1431,9 @@ impl SwapchainRuntime {
             .prepare(queue, self.pool, index, &mut self.diagnostics)?;
         if let Some(quality) = frame.requested_quality {
             self.temporal.pending_quality = Some(motion_quality(quality));
+        }
+        if let Some(selection) = frame.requested_upscaler {
+            self.temporal.request_upscaler(selection);
         }
         if let Some(scale) = frame.requested_guidance_scale {
             self.temporal.pending_guidance_scale = Some(scale);
@@ -1456,6 +1593,9 @@ impl Drop for SwapchainRuntime {
                 summary
             );
         }
+        drop(self.temporal.upscaler.take());
+        drop(self.temporal.resolver.take());
+        drop(self.temporal.guidance.take());
         drop(self.temporal.motion.take());
         drop(self.temporal.capture.take());
         drop(self.overlay.take());
@@ -1475,7 +1615,10 @@ impl Drop for SwapchainRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{GPU_PHASES, GpuTimingWindow, backend_debug_view, debug_mode_id};
+    use super::{
+        GPU_PHASES, GpuTimingWindow, backend_debug_view, debug_mode_id,
+        record_secondary_transaction,
+    };
 
     #[test]
     fn assigns_stable_debug_mode_ids_for_guidance_views() {
@@ -1554,5 +1697,30 @@ mod tests {
 
         assert_eq!(window.range_summary(1, 13), Some((24.0, 24.0)));
         assert_eq!(window.range_summary(0, GPU_PHASES), Some((32.0, 32.0)));
+    }
+
+    #[test]
+    fn partial_secondary_recording_is_reset_and_never_executed() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = record_secondary_transaction(
+            || {
+                events.borrow_mut().push("begin");
+                Ok::<(), &'static str>(())
+            },
+            || {
+                events.borrow_mut().push("record");
+                Err("backend")
+            },
+            || {
+                events.borrow_mut().push("end");
+                Ok(())
+            },
+            || events.borrow_mut().push("reset"),
+            || events.borrow_mut().push("execute"),
+            || events.borrow_mut().push("fallback"),
+        );
+
+        assert_eq!(result, Err("backend"));
+        assert_eq!(*events.borrow(), ["begin", "record", "reset", "fallback"]);
     }
 }

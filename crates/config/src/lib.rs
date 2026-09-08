@@ -1,12 +1,22 @@
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 pub const CRATE_NAME: &str = "tuxscaling-config";
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Upscaler {
+    #[default]
+    Reference,
+    #[serde(rename = "fsr_3_1_4")]
+    Fsr314,
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
     pub enabled: bool,
+    pub upscaler: Upscaler,
     pub quality: String,
     pub toggle_key: String,
     pub debug_view: DebugView,
@@ -97,6 +107,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: true,
+            upscaler: Upscaler::Reference,
             quality: "balanced".into(),
             toggle_key: "Insert".into(),
             debug_view: DebugView::Original,
@@ -137,11 +148,22 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigError, DebugView, JitterMode, MotionQuality, OutputResolution};
+    use super::{
+        Config, ConfigError, DebugView, JitterMode, MotionQuality, OutputResolution, Upscaler,
+    };
 
     #[test]
     fn applies_defaults() {
         assert_eq!(Config::parse("").unwrap(), Config::default());
+    }
+
+    #[test]
+    fn parses_fidelityfx_upscaler_selection() {
+        assert_eq!(
+            Config::parse("upscaler = 'fsr_3_1_4'").unwrap().upscaler,
+            Upscaler::Fsr314
+        );
+        assert_eq!(Config::default().upscaler, Upscaler::Reference);
     }
 
     #[test]

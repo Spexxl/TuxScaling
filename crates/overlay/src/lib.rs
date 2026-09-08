@@ -1,5 +1,5 @@
 use egui::{ClippedPrimitive, Context, RawInput, Rect, TexturesDelta, vec2};
-use tuxscaling_config::{DebugView, JitterMode, MotionQuality};
+use tuxscaling_config::{DebugView, JitterMode, MotionQuality, Upscaler};
 
 pub const CRATE_NAME: &str = "tuxscaling-overlay";
 
@@ -8,6 +8,9 @@ pub struct FrameDiagnostics {
     pub frame_id: u64,
     pub state: String,
     pub mode: String,
+    pub upscaler: Upscaler,
+    pub requested_upscaler: Option<Upscaler>,
+    pub active_upscaler: Upscaler,
     pub quality: MotionQuality,
     pub requested_quality: Option<MotionQuality>,
     pub requested_guidance_scale: Option<f32>,
@@ -101,6 +104,7 @@ pub fn render_diagnostics(
     visible: bool,
 ) -> OverlayFrame {
     diagnostics.requested_quality = None;
+    diagnostics.requested_upscaler = None;
     diagnostics.requested_guidance_scale = None;
     diagnostics.requested_jitter_mode = None;
     diagnostics.requested_debug_view = None;
@@ -122,6 +126,27 @@ pub fn render_diagnostics(
                         size[0], size[1], diagnostics.frame_id
                     ));
                     ui.label(format!("View: {}", diagnostics.mode));
+                    egui::ComboBox::from_label("Upscaler")
+                        .selected_text(format_upscaler(diagnostics.upscaler))
+                        .show_ui(ui, |ui| {
+                            for upscaler in [Upscaler::Reference, Upscaler::Fsr314] {
+                                if ui
+                                    .selectable_value(
+                                        &mut diagnostics.upscaler,
+                                        upscaler,
+                                        format_upscaler(upscaler),
+                                    )
+                                    .changed()
+                                {
+                                    diagnostics.requested_upscaler =
+                                        upscaler_request(diagnostics.active_upscaler, upscaler);
+                                }
+                            }
+                        });
+                    ui.label(format!(
+                        "Active upscaler: {}",
+                        format_upscaler(diagnostics.active_upscaler)
+                    ));
                     egui::ComboBox::from_label("Quality")
                         .selected_text(format_quality(diagnostics.quality))
                         .show_ui(ui, |ui| {
@@ -299,10 +324,22 @@ pub fn render_diagnostics(
         pixels_per_point: output.pixels_per_point,
         primitives: context.tessellate(output.shapes, output.pixels_per_point),
         textures_delta: output.textures_delta,
+        requested_upscaler: diagnostics.requested_upscaler,
         requested_quality: diagnostics.requested_quality,
         requested_guidance_scale: diagnostics.requested_guidance_scale,
         requested_jitter_mode: diagnostics.requested_jitter_mode,
         requested_debug_view: diagnostics.requested_debug_view,
+    }
+}
+
+pub fn upscaler_request(active: Upscaler, selected: Upscaler) -> Option<Upscaler> {
+    (active != selected).then_some(selected)
+}
+
+fn format_upscaler(upscaler: Upscaler) -> &'static str {
+    match upscaler {
+        Upscaler::Reference => "Reference",
+        Upscaler::Fsr314 => "FSR 3.1.4",
     }
 }
 
@@ -327,6 +364,7 @@ pub struct OverlayFrame {
     pub pixels_per_point: f32,
     pub primitives: Vec<ClippedPrimitive>,
     pub textures_delta: TexturesDelta,
+    pub requested_upscaler: Option<Upscaler>,
     pub requested_quality: Option<MotionQuality>,
     pub requested_guidance_scale: Option<f32>,
     pub requested_jitter_mode: Option<JitterMode>,
@@ -363,6 +401,7 @@ pub fn render_smoke_frame(
         pixels_per_point: output_pixels_per_point,
         primitives,
         textures_delta: output.textures_delta,
+        requested_upscaler: None,
         requested_quality: None,
         requested_guidance_scale: None,
         requested_jitter_mode: None,
@@ -396,7 +435,7 @@ mod tests {
     use super::{
         OverlayState, debug_view_label, guidance_scale_request, render_smoke_frame, resolution_mode,
     };
-    use tuxscaling_config::DebugView;
+    use tuxscaling_config::{DebugView, Upscaler};
 
     #[test]
     fn starts_hidden() {
@@ -439,5 +478,17 @@ mod tests {
         assert_eq!(debug_view_label(DebugView::Depth), "Depth");
         assert_eq!(debug_view_label(DebugView::Composition), "Composition");
         assert_eq!(debug_view_label(DebugView::Exposure), "Exposure");
+    }
+
+    #[test]
+    fn selecting_fidelityfx_requests_only_the_upscaler() {
+        assert_eq!(
+            super::upscaler_request(Upscaler::Reference, Upscaler::Fsr314),
+            Some(Upscaler::Fsr314)
+        );
+        assert_eq!(
+            super::upscaler_request(Upscaler::Fsr314, Upscaler::Fsr314),
+            None
+        );
     }
 }

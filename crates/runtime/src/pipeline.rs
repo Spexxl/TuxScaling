@@ -2,14 +2,14 @@ use super::{Capture, GpuTimingWindow, SwapchainInfo};
 use ash::vk;
 use std::time::{Duration, Instant};
 use tuxscaling_capture::{GuidanceCapture, JitterState};
-use tuxscaling_config::Config;
+use tuxscaling_config::{Config, Upscaler};
 use tuxscaling_motion::{MotionEstimator, MotionQuality};
 use tuxscaling_temporal::{
-    FrameTiming, GuidanceEstimator, GuidanceReset, GuidanceResolver, History,
+    FrameTiming, GuidanceEstimator, GuidanceReset, GuidanceResolver, GuidanceView, History,
 };
 use tuxscaling_upscaler::{
-    BackendColorEncoding, BackendConfig, BackendError, BackendFrame, ReferenceUpscaler,
-    ResolutionPlan, UpscalerBackend, content_viewport,
+    BackendColorEncoding, BackendConfig, BackendEnvironment, BackendError, BackendFrame,
+    ReferenceUpscaler, ResolutionPlan, UpscalerBackend, content_viewport,
 };
 
 pub(crate) unsafe fn record_backend(
@@ -17,6 +17,79 @@ pub(crate) unsafe fn record_backend(
     frame: BackendFrame,
 ) -> Result<(), BackendError> {
     unsafe { backend.record(frame) }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn create_upscaler(
+    selection: Upscaler,
+    environment: &BackendEnvironment,
+    config: BackendConfig,
+    source_view: vk::ImageView,
+    guidance: tuxscaling_temporal::GuidanceView,
+    image_count: usize,
+) -> Result<Box<dyn UpscalerBackend>, BackendError> {
+    environment.validate()?;
+    let mut backend: Box<dyn UpscalerBackend> = match selection {
+        Upscaler::Reference => Box::new(
+            unsafe {
+                ReferenceUpscaler::new(
+                    &environment.device,
+                    &environment.memory,
+                    source_view,
+                    config.game_extent,
+                    config.output_extent,
+                    config.source_format,
+                    config.output_format,
+                    guidance,
+                    image_count,
+                )
+            }
+            .map_err(|error| BackendError::Internal(format!("reference backend: {error:?}")))?,
+        ),
+        Upscaler::Fsr314 => {
+            #[cfg(feature = "fidelityfx")]
+            {
+                Box::new(unsafe {
+                    tuxscaling_upscaler::fidelityfx::Fsr314Upscaler::new(
+                        environment,
+                        config,
+                        guidance,
+                        image_count,
+                    )
+                }?)
+            }
+            #[cfg(not(feature = "fidelityfx"))]
+            {
+                return Err(BackendError::Unavailable);
+            }
+        }
+    };
+    backend.configure(config)?;
+    Ok(backend)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn replace_upscaler(
+    current: &mut Option<Box<dyn UpscalerBackend>>,
+    selection: Upscaler,
+    environment: &BackendEnvironment,
+    config: BackendConfig,
+    source_view: vk::ImageView,
+    guidance: tuxscaling_temporal::GuidanceView,
+    image_count: usize,
+) -> Result<(), BackendError> {
+    let replacement = unsafe {
+        create_upscaler(
+            selection,
+            environment,
+            config,
+            source_view,
+            guidance,
+            image_count,
+        )
+    }?;
+    *current = Some(replacement);
+    Ok(())
 }
 
 pub struct TemporalPipelineDescriptor<'a> {
@@ -112,6 +185,10 @@ pub struct TemporalPipeline {
     pub(crate) reset_reason: GuidanceReset,
     pub(crate) pending_quality: Option<MotionQuality>,
     pub(crate) pending_guidance_scale: Option<f32>,
+    pub(crate) active_upscaler: Upscaler,
+    pub(crate) pending_upscaler: Option<Upscaler>,
+    pub(crate) unavailable_upscaler: Option<Upscaler>,
+    pub(crate) image_count: usize,
     pub(crate) queries: vk::QueryPool,
     pub(crate) query_ready: Vec<bool>,
     pub(crate) timestamp_period: f32,
@@ -196,6 +273,7 @@ impl TemporalPipeline {
         };
         let mut resolver = None;
         let mut upscaler: Option<Box<dyn UpscalerBackend>> = None;
+        let mut active_upscaler = Upscaler::Reference;
         if let (Some(guidance), Some(motion), Some(capture)) = (&guidance, &motion, &capture) {
             let requires_guidance_resolve = resolution.game_extent != resolution.guidance_extent;
             let features =
@@ -239,46 +317,48 @@ impl TemporalPipeline {
                     .map_or(raw_view, |value| value.view(raw_view));
                 if requires_guidance_resolve && resolver.is_none() {
                     eprintln!(
-                        "TuxScaling: reference reconstruction disabled because guidance resolve is unavailable"
+                        "TuxScaling: reconstruction disabled because guidance resolve is unavailable"
                     );
                 } else {
+                    let backend_config = backend_config(info, resolution, backend_view);
+                    let environment = BackendEnvironment::new(instance, physical, device);
                     match unsafe {
-                        ReferenceUpscaler::new(
-                            device,
-                            &memory,
+                        create_upscaler(
+                            config.upscaler,
+                            &environment,
+                            backend_config,
                             capture.source.color.view,
-                            resolution.game_extent,
-                            resolution.output_extent,
-                            info.format,
-                            info.format,
                             backend_view,
                             image_count,
                         )
                     } {
-                        Ok(mut value) => {
-                            let backend_config = BackendConfig {
-                                game_extent: resolution.game_extent,
-                                output_extent: resolution.output_extent,
-                                source_format: info.format,
-                                output_format: info.format,
-                                color_encoding: BackendColorEncoding::from(info.color_space),
-                                viewport: content_viewport(
-                                    resolution.game_extent,
-                                    resolution.output_extent,
+                        Ok(value) => {
+                            upscaler = Some(value);
+                            active_upscaler = config.upscaler;
+                        }
+                        Err(error) if config.upscaler != Upscaler::Reference => {
+                            eprintln!(
+                                "TuxScaling: {} backend unavailable ({error}); using reference",
+                                upscaler_name(config.upscaler)
+                            );
+                            match unsafe {
+                                create_upscaler(
+                                    Upscaler::Reference,
+                                    &environment,
+                                    backend_config,
+                                    capture.source.color.view,
+                                    backend_view,
+                                    image_count,
+                                )
+                            } {
+                                Ok(value) => upscaler = Some(value),
+                                Err(error) => eprintln!(
+                                    "TuxScaling: reference reconstruction disabled: {error}"
                                 ),
-                                guidance: backend_view.capabilities(),
-                            };
-                            match value.configure(backend_config) {
-                                Ok(()) => upscaler = Some(Box::new(value)),
-                                Err(error) => {
-                                    eprintln!(
-                                        "TuxScaling: reference backend configuration failed: {error}"
-                                    )
-                                }
                             }
                         }
                         Err(error) => {
-                            eprintln!("TuxScaling: reference reconstruction disabled: {error:?}")
+                            eprintln!("TuxScaling: reference reconstruction disabled: {error}")
                         }
                     }
                 }
@@ -309,6 +389,10 @@ impl TemporalPipeline {
             reset_reason: GuidanceReset::Initialize,
             pending_quality: None,
             pending_guidance_scale: None,
+            active_upscaler,
+            pending_upscaler: None,
+            unavailable_upscaler: None,
+            image_count,
             queries: vk::QueryPool::null(),
             query_ready: vec![false; image_count],
             timestamp_period,
@@ -370,6 +454,14 @@ impl TemporalPipeline {
                     image_count,
                 )
             }?;
+            let raw_view = replacement_guidance.view(
+                &replacement_motion,
+                0,
+                resolution.guidance_extent,
+                false,
+                FrameTiming::default(),
+                GuidanceReset::PresetChanged,
+            );
             let replacement_resolver = if resolution.game_extent != resolution.guidance_extent {
                 let features = unsafe {
                     instance.get_physical_device_format_properties(physical, info.format)
@@ -385,14 +477,6 @@ impl TemporalPipeline {
                 {
                     return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
                 }
-                let raw_view = replacement_guidance.view(
-                    &replacement_motion,
-                    0,
-                    resolution.guidance_extent,
-                    false,
-                    FrameTiming::default(),
-                    GuidanceReset::PresetChanged,
-                );
                 Some(unsafe {
                     GuidanceResolver::new(
                         device,
@@ -406,12 +490,52 @@ impl TemporalPipeline {
             } else {
                 None
             };
+            let backend_view = replacement_resolver
+                .as_ref()
+                .map_or(raw_view, |value| value.view(raw_view));
+            let environment = BackendEnvironment::new(instance, physical, device);
+            let replacement_backend = match unsafe {
+                create_upscaler(
+                    self.active_upscaler,
+                    &environment,
+                    backend_config(info, resolution, backend_view),
+                    capture.source.color.view,
+                    backend_view,
+                    image_count,
+                )
+            } {
+                Ok(value) => Some(value),
+                Err(error) if self.active_upscaler != Upscaler::Reference => {
+                    eprintln!(
+                        "TuxScaling: {} backend unavailable after guidance resize ({error}); using reference",
+                        upscaler_name(self.active_upscaler)
+                    );
+                    self.active_upscaler = Upscaler::Reference;
+                    unsafe {
+                        create_upscaler(
+                            Upscaler::Reference,
+                            &environment,
+                            backend_config(info, resolution, backend_view),
+                            capture.source.color.view,
+                            backend_view,
+                            image_count,
+                        )
+                    }
+                    .ok()
+                }
+                Err(error) => {
+                    eprintln!("TuxScaling: backend disabled after guidance resize: {error}");
+                    None
+                }
+            };
 
             let capture = self.capture.as_mut().expect("capture checked above");
             capture.guidance = replacement_capture;
             self.motion = Some(replacement_motion);
             self.guidance = Some(replacement_guidance);
             self.resolver = replacement_resolver;
+            self.upscaler = replacement_backend;
+            self.image_count = image_count;
         }
         self.resolution = resolution;
         self.config = config.clone();
@@ -422,6 +546,57 @@ impl TemporalPipeline {
         self.reset_history(GuidanceReset::PresetChanged);
         self.jitter.reset();
         Ok(())
+    }
+
+    pub(crate) fn request_upscaler(&mut self, selection: Upscaler) {
+        self.pending_upscaler = (selection != self.active_upscaler).then_some(selection);
+        if self.pending_upscaler.is_some() {
+            self.unavailable_upscaler = None;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn apply_pending_upscaler(
+        &mut self,
+        instance: &ash::Instance,
+        physical: vk::PhysicalDevice,
+        device: &ash::Device,
+        info: SwapchainInfo,
+        source_view: vk::ImageView,
+        guidance: GuidanceView,
+    ) -> Result<bool, BackendError> {
+        let Some(selection) = self.pending_upscaler.take() else {
+            return Ok(false);
+        };
+        if selection == self.active_upscaler {
+            return Ok(false);
+        }
+        let environment = BackendEnvironment::new(instance, physical, device);
+        let config = backend_config(info, self.resolution, guidance);
+        let result = unsafe {
+            replace_upscaler(
+                &mut self.upscaler,
+                selection,
+                &environment,
+                config,
+                source_view,
+                guidance,
+                self.image_count,
+            )
+        };
+        match result {
+            Ok(()) => {
+                self.active_upscaler = selection;
+                self.unavailable_upscaler = None;
+                self.config.upscaler = selection;
+                self.reset_history(GuidanceReset::PresetChanged);
+                Ok(true)
+            }
+            Err(error) => {
+                self.unavailable_upscaler = Some(selection);
+                Err(error)
+            }
+        }
     }
 
     #[cfg(test)]
@@ -441,6 +616,10 @@ impl TemporalPipeline {
             reset_reason: GuidanceReset::Initialize,
             pending_quality: None,
             pending_guidance_scale: None,
+            active_upscaler: Upscaler::Reference,
+            pending_upscaler: None,
+            unavailable_upscaler: None,
+            image_count: 0,
             queries: vk::QueryPool::null(),
             query_ready: Vec::new(),
             timestamp_period: 0.0,
@@ -475,6 +654,29 @@ fn motion_quality(quality: tuxscaling_config::MotionQuality) -> MotionQuality {
         tuxscaling_config::MotionQuality::High => MotionQuality::High,
         tuxscaling_config::MotionQuality::Balanced => MotionQuality::Balanced,
         tuxscaling_config::MotionQuality::Performance => MotionQuality::Performance,
+    }
+}
+
+fn upscaler_name(upscaler: Upscaler) -> &'static str {
+    match upscaler {
+        Upscaler::Reference => "Reference",
+        Upscaler::Fsr314 => "FSR 3.1.4",
+    }
+}
+
+fn backend_config(
+    info: SwapchainInfo,
+    resolution: ResolutionPlan,
+    guidance: GuidanceView,
+) -> BackendConfig {
+    BackendConfig {
+        game_extent: resolution.game_extent,
+        output_extent: resolution.output_extent,
+        source_format: info.format,
+        output_format: info.format,
+        color_encoding: BackendColorEncoding::from(info.color_space),
+        viewport: content_viewport(resolution.game_extent, resolution.output_extent),
+        guidance: guidance.capabilities(),
     }
 }
 

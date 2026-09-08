@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["fidelityfx"]
+fidelityfx = ["tuxscaling-upscaler/fidelityfx"]
+
 [dependencies]
 bytemuck.workspace = true
 tuxscaling-capture = { path = "../capture" }
@@ -15,5 +19,5 @@ tuxscaling-vulkan = { path = "../vulkan" }
 tuxscaling-overlay-vulkan = { path = "../overlay-vulkan" }
 tuxscaling-config = { path = "../config" }
 tuxscaling-overlay = { path = "../overlay" }
-tuxscaling-upscaler = { path = "../upscaler" }
+tuxscaling-upscaler = { path = "../upscaler", default-features = false }
 tracing.workspace = true
