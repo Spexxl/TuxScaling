@@ -839,6 +839,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "bytemuck",
+ "libloading",
  "thiserror",
  "tuxscaling-temporal",
  "tuxscaling-vulkan",
