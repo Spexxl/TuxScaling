@@ -5,8 +5,8 @@ use tuxscaling_temporal::{DepthSemantics, GuidanceView};
 use tuxscaling_vulkan::{Image, compute_memory_barrier, image_barrier};
 
 use crate::{
-    BackendCapabilities, BackendConfig, BackendError, BackendFrame, BackendId, UpscalerBackend,
-    content_viewport,
+    BackendCapabilities, BackendConfig, BackendError, BackendFrame, BackendId, BackendImage,
+    UpscalerBackend, content_viewport,
 };
 
 const REFERENCE_COLOR_FORMATS: &[vk::Format] = &[
@@ -246,7 +246,6 @@ impl ReferenceUpscaler {
         slot: usize,
         debug_view: u32,
     ) {
-        let history_read = 1 - history_write;
         let layers = vk::ImageSubresourceLayers::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .layer_count(1);
@@ -282,18 +281,6 @@ impl ReferenceUpscaler {
                     );
                 }
             }
-            let sampled_history = [vk::DescriptorImageInfo::default()
-                .sampler(self.sampler)
-                .image_view(self.history[history_read].view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            self.device.update_descriptor_sets(
-                &[vk::WriteDescriptorSet::default()
-                    .dst_set(self.descriptor_sets[slot % self.descriptor_sets.len()])
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(&sampled_history)],
-                &[],
-            );
             image_barrier(
                 &self.device,
                 command,
@@ -420,6 +407,61 @@ impl ReferenceUpscaler {
         self.initialized = true;
     }
 
+    unsafe fn update_frame_descriptors(
+        &self,
+        slot: usize,
+        source: BackendImage,
+        guidance: GuidanceView,
+        history_read: usize,
+    ) {
+        let sampled = [
+            vk::DescriptorImageInfo::default()
+                .sampler(self.sampler)
+                .image_view(source.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            vk::DescriptorImageInfo::default()
+                .sampler(self.sampler)
+                .image_view(self.history[history_read].view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+        ];
+        let storage = [
+            guidance.motion.view,
+            guidance.confidence.view,
+            guidance.reactive.view,
+            guidance.disocclusion.view,
+            guidance.exposure.view,
+            guidance.depth.view,
+            guidance.transparency_composition.view,
+            self.output.view,
+        ]
+        .map(|view| {
+            vk::DescriptorImageInfo::default()
+                .image_view(view)
+                .image_layout(vk::ImageLayout::GENERAL)
+        });
+        let descriptor_set = self.descriptor_sets[slot % self.descriptor_sets.len()];
+        let mut writes = vec![
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&sampled[0..1]),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&sampled[1..2]),
+        ];
+        writes.extend(storage.iter().enumerate().map(|(index, image)| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(index as u32 + 2)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(image))
+        }));
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+    }
+
     pub unsafe fn record_debug(
         &self,
         command: vk::CommandBuffer,
@@ -541,6 +583,7 @@ impl UpscalerBackend for ReferenceUpscaler {
             frame.debug_view
         };
         unsafe {
+            self.update_frame_descriptors(slot, frame.source, frame.guidance, 1 - history_write);
             ReferenceUpscaler::record(
                 self,
                 frame.command_buffer,

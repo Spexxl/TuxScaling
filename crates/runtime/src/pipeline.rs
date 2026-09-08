@@ -1,7 +1,7 @@
 use super::{Capture, GpuTimingWindow, SwapchainInfo};
 use ash::vk;
 use std::time::{Duration, Instant};
-use tuxscaling_capture::JitterState;
+use tuxscaling_capture::{GuidanceCapture, JitterState};
 use tuxscaling_config::Config;
 use tuxscaling_motion::{MotionEstimator, MotionQuality};
 use tuxscaling_temporal::{
@@ -309,17 +309,109 @@ impl TemporalPipeline {
         })
     }
 
-    pub(crate) unsafe fn rebuild(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn rebuild_guidance_only(
         &mut self,
-        descriptor: TemporalPipelineDescriptor<'_>,
+        instance: &ash::Instance,
+        physical: vk::PhysicalDevice,
         device: &ash::Device,
+        info: SwapchainInfo,
+        resolution: ResolutionPlan,
+        config: &Config,
+        image_count: usize,
     ) -> Result<(), vk::Result> {
-        let replacement = unsafe { Self::new(descriptor) }?;
-        let query_pool = std::mem::replace(&mut self.queries, vk::QueryPool::null());
-        if query_pool != vk::QueryPool::null() {
-            unsafe { device.destroy_query_pool(query_pool, None) };
+        if resolution.game_extent != self.resolution.game_extent
+            || resolution.output_extent != self.resolution.output_extent
+        {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
-        *self = replacement;
+        if let Some(capture) = &self.capture {
+            let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
+            let replacement_capture = unsafe {
+                GuidanceCapture::new(device, &memory, resolution.guidance_extent, info.format)
+            }?;
+            let mut replacement_motion = unsafe {
+                MotionEstimator::new(
+                    device,
+                    &memory,
+                    resolution.guidance_extent,
+                    replacement_capture.current.view,
+                    matches!(
+                        info.format,
+                        vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
+                    ),
+                )
+            }?;
+            replacement_motion.set_quality(motion_quality(config.motion_quality));
+            replacement_motion.cut_thresholds = [
+                config.scene_distance_threshold,
+                config.scene_consistency_threshold,
+            ];
+            let replacement_guidance = unsafe {
+                GuidanceEstimator::new_with_slots(
+                    device,
+                    &memory,
+                    resolution.guidance_extent,
+                    replacement_capture.current.view,
+                    replacement_capture.previous.view,
+                    replacement_motion.confidence.view,
+                    replacement_motion.vectors.view,
+                    replacement_motion.metadata.handle,
+                    replacement_motion.stats.handle,
+                    image_count,
+                )
+            }?;
+            let replacement_resolver = if resolution.game_extent != resolution.guidance_extent {
+                let features = unsafe {
+                    instance.get_physical_device_format_properties(physical, info.format)
+                }
+                .optimal_tiling_features;
+                let device_features = unsafe { instance.get_physical_device_features(physical) };
+                let required = vk::FormatFeatureFlags::STORAGE_IMAGE
+                    | vk::FormatFeatureFlags::SAMPLED_IMAGE
+                    | vk::FormatFeatureFlags::BLIT_SRC
+                    | vk::FormatFeatureFlags::BLIT_DST;
+                if !features.contains(required)
+                    || device_features.shader_storage_image_write_without_format == 0
+                {
+                    return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
+                }
+                let raw_view = replacement_guidance.view(
+                    &replacement_motion,
+                    0,
+                    resolution.guidance_extent,
+                    false,
+                    FrameTiming::default(),
+                    GuidanceReset::PresetChanged,
+                );
+                Some(unsafe {
+                    GuidanceResolver::new(
+                        device,
+                        &memory,
+                        resolution.game_extent,
+                        resolution.guidance_extent,
+                        capture.source.color.view,
+                        raw_view,
+                    )
+                }?)
+            } else {
+                None
+            };
+
+            let capture = self.capture.as_mut().expect("capture checked above");
+            capture.guidance = replacement_capture;
+            self.motion = Some(replacement_motion);
+            self.guidance = Some(replacement_guidance);
+            self.resolver = replacement_resolver;
+        }
+        self.resolution = resolution;
+        self.config = config.clone();
+        self.pending_time = Duration::ZERO;
+        self.pending_timing = FrameTiming::default();
+        self.timings = GpuTimingWindow::default();
+        self.query_ready.fill(false);
+        self.reset_history(GuidanceReset::PresetChanged);
+        self.jitter.reset();
         Ok(())
     }
 

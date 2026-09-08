@@ -70,7 +70,7 @@ Run the acceptance benchmark with `cargo xtask benchmark`. It builds the release
 
 The deterministic acceptance gates are shared across presets and tested scales: mean motion EPE `<= 1.0 px`, p95 EPE `<= 2.0 px`, confidence AUROC `>= 0.90`, disocclusion F1 `>= 0.75`, reactive F1 `>= 0.70`, composition F1 `>= 0.65`, exposure error `<= 0.15 EV`, and depth ordering `>= 0.85`. `tests/fixtures/quality-baselines.txt` lists the stable metric names; it does not replace the actual estimator gate.
 
-Run a controlled visible `vkcube` session with `cargo xtask vkcube --seconds 10`. The runner builds the layer in the selected debug or release profile, enables the TuxScaling and Vulkan validation layers, prints an explicit startup marker, and terminates and reaps `vkcube` after the requested interval. Use `--release` for the release profile and `--seconds N` for a positive duration.
+Run a controlled visible `vkcube` session with `cargo xtask vkcube --seconds 10`. The runner builds the layer in the selected debug or release profile, enables the TuxScaling and Vulkan validation layers, captures both child output streams, requires the layer's `TuxScaling swapchain:` evidence, rejects validation errors, and terminates and reaps `vkcube` after the requested interval. Use `--release` for the release profile and `--seconds N` for a positive duration.
 
 The following is a historical RX 9060 XT/RADV telemetry snapshot at 1920x1080. It is informational and is not a latency-quality gate; rerun the release benchmark for current values:
 

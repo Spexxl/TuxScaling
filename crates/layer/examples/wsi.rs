@@ -21,7 +21,7 @@ fn game_extent_for(scenario: Option<&str>) -> vk::Extent2D {
     match scenario {
         Some(
             "upscale" | "windowed_promote" | "already_borderless" | "monitor_origin"
-            | "promotion_failure" | "temporal_failure",
+            | "promotion_failure" | "temporal_failure" | "guidance_resolve",
         ) => vk::Extent2D {
             width: 1280,
             height: 720,
@@ -155,6 +155,7 @@ mod tests {
             "monitor_origin",
             "promotion_failure",
             "temporal_failure",
+            "guidance_resolve",
         ] {
             assert!(
                 super::game_extent_for(Some(scenario)).width > 0,

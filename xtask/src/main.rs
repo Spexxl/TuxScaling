@@ -401,6 +401,8 @@ fn main() -> ExitCode {
             std::fs::write(&smoke_config, generated_config("native", 1.0, None)).unwrap();
             let direct_config = root.join("target/native-aa-smoke.toml");
             std::fs::write(&direct_config, generated_config("swapchain", 1.0, None)).unwrap();
+            let guidance_config = root.join("target/guidance-resolve-smoke.toml");
+            std::fs::write(&guidance_config, generated_config("native", 0.5, None)).unwrap();
             let run_wsi = |scenario: &str, force_temporal_failure, resize_failure| {
                 let mut command = Command::new(root.join("target/debug/examples/wsi"));
                 validation(&mut command)
@@ -415,6 +417,8 @@ fn main() -> ExitCode {
                         "TUXSCALING_CONFIG",
                         if scenario == "native" || scenario == "native_aa" {
                             &direct_config
+                        } else if scenario == "guidance_resolve" {
+                            &guidance_config
                         } else {
                             &smoke_config
                         },
@@ -440,6 +444,7 @@ fn main() -> ExitCode {
                 && run_wsi("windowed_promote", false, false)
                 && run_wsi("already_borderless", false, false)
                 && run_wsi("native_aa", false, false)
+                && run_wsi("guidance_resolve", false, false)
                 && run_wsi("aspect", false, false)
                 && run_wsi("resize", false, false)
                 && run_wsi("monitor_origin", false, false)

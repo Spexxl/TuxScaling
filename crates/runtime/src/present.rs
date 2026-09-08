@@ -707,36 +707,19 @@ impl SwapchainRuntime {
             self.temporal.resolution.output_extent,
             scale,
         );
-        let capture_enabled = self.temporal.capture.is_some();
         unsafe {
-            self.temporal.rebuild(
-                TemporalPipelineDescriptor {
-                    instance: &self.instance,
-                    physical: self.physical,
-                    device: &self.device,
-                    info: self.info,
-                    resolution,
-                    config: &config,
-                    capture_enabled,
-                    image_count: self.output_images.len(),
-                },
+            self.temporal.rebuild_guidance_only(
+                &self.instance,
+                self.physical,
                 &self.device,
+                self.info,
+                resolution,
+                &config,
+                self.output_images.len(),
             )?;
         }
         self.diagnostics.guidance_scale = scale;
-        self.temporal.reset_reason = GuidanceReset::PresetChanged;
-        self.temporal.jitter.reset();
         self.diagnostics.jitter_mode = self.temporal.jitter.mode();
-        if self.temporal.timestamp_period > 0.0 {
-            self.temporal.queries = unsafe {
-                self.device.create_query_pool(
-                    &vk::QueryPoolCreateInfo::default()
-                        .query_type(vk::QueryType::TIMESTAMP)
-                        .query_count(self.output_images.len() as u32 * GPU_TIMESTAMPS as u32),
-                    None,
-                )
-            }?;
-        }
         self.diagnostics.guidance_extent = [
             resolution.guidance_extent.width,
             resolution.guidance_extent.height,
