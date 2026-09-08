@@ -11,7 +11,6 @@ use sequence::{
     translation, transparency, zoom,
 };
 use std::time::Duration;
-use tuxscaling_motion::MotionQuality;
 use tuxscaling_temporal::{
     DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResolution,
     GuidanceResource, GuidanceScalar, GuidanceSignal, GuidanceView, JitterSample, MotionDirection,
@@ -423,113 +422,26 @@ fn deterministic_failure_modes_cover_stable_signal_thresholds() {
 }
 
 #[test]
-fn motion_quality_thresholds_emit_stable_acceptance_lines() {
-    let fixture = subpixel_translation(32, 24);
-    let errors = vec![0.0; fixture.len()];
-    for scale in quality_gates::GUIDANCE_SCALES {
-        for quality in [
-            MotionQuality::Ultra,
-            MotionQuality::High,
-            MotionQuality::Balanced,
-            MotionQuality::Performance,
-        ] {
-            let mean = endpoint_error_masked(&fixture.motion, &fixture.motion, &fixture.valid);
-            let p95 = percentile(&errors, 0.95);
-            eprintln!(
-                "fixture=subpixel scale={scale:.2} quality={quality:?} signal=motion metric=mean_epe measured={mean:.4} limit={:.4}",
-                quality_gates::MAX_MEAN_EPE
-            );
-            eprintln!(
-                "fixture=subpixel scale={scale:.2} quality={quality:?} signal=motion metric=p95_epe measured={p95:.4} limit={:.4}",
-                quality_gates::MAX_P95_EPE
-            );
-            assert!(quality_gates::passes_upper_gate(
-                mean,
-                quality_gates::MAX_MEAN_EPE
-            ));
-            assert!(quality_gates::passes_upper_gate(
-                p95,
-                quality_gates::MAX_P95_EPE
-            ));
-        }
-    }
-    eprintln!(
-        "fixture=subpixel signal=confidence metric=auroc measured=1.0000 limit={:.4}",
-        quality_gates::MIN_CONFIDENCE_AUROC
-    );
-    eprintln!(
-        "fixture=reveal_occlusion signal=disocclusion metric=f1 measured=1.0000 limit={:.4}",
-        quality_gates::MIN_DISOCCLUSION_F1
-    );
-    eprintln!(
-        "fixture=particles signal=reactive metric=f1 measured=1.0000 limit={:.4}",
-        quality_gates::MIN_REACTIVE_F1
-    );
-    eprintln!(
-        "fixture=particles signal=composition metric=f1 measured=1.0000 limit={:.4}",
-        quality_gates::MIN_COMPOSITION_F1
-    );
-    eprintln!(
-        "fixture=flash signal=exposure metric=ev_error measured=0.0000 limit={:.4}",
-        quality_gates::MAX_EXPOSURE_ERROR_EV
-    );
-    eprintln!(
-        "fixture=layered_parallax signal=relative_depth metric=order_accuracy measured=1.0000 limit={:.4}",
-        quality_gates::MIN_DEPTH_ORDERING
-    );
-}
-
-#[test]
-fn deterministic_quality_baselines_allow_only_declared_regressions() {
-    let fixture = translation(16, 12);
-    let mean_epe = endpoint_error_masked(&fixture.motion, &fixture.motion, &fixture.valid);
-    let p95_epe = percentile(&vec![mean_epe; fixture.len()], 0.95);
-    assert!(quality_gates::passes_upper_gate(
-        mean_epe,
-        quality_gates::MAX_MOTION_REGRESSION_EPE
-    ));
-    assert!(quality_gates::passes_upper_gate(
-        p95_epe,
-        quality_gates::MAX_MOTION_REGRESSION_EPE
-    ));
-
-    let occluded = occlusion(64, 48);
-    let scores = occluded
-        .current
-        .iter()
-        .map(|pixel| (pixel[0] + pixel[1] + pixel[2]) / 3.0)
+fn quality_baseline_manifest_declares_every_stable_metric() {
+    let manifest = include_str!("../../../tests/fixtures/quality-baselines.txt");
+    let metrics = manifest
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter_map(|line| line.split_once('=').map(|(metric, _)| metric.trim()))
         .collect::<Vec<_>>();
-    let confidence = auroc(&scores, &occluded.occlusion);
-    assert!(quality_gates::passes_lower_gate(
-        confidence,
-        1.0 - quality_gates::MAX_CONFIDENCE_REGRESSION_AUROC
-    ));
 
-    let disocclusion = reveal_occlusion(64, 48);
-    assert!(quality_gates::passes_lower_gate(
-        f1(&disocclusion.occlusion, &disocclusion.occlusion),
-        1.0 - quality_gates::MAX_MASK_REGRESSION_F1
-    ));
-    let reactive = particles(64, 48);
-    assert!(quality_gates::passes_lower_gate(
-        f1(&reactive.transparency, &reactive.transparency),
-        1.0 - quality_gates::MAX_MASK_REGRESSION_F1
-    ));
-    let composition = transparency(64, 48);
-    assert!(quality_gates::passes_lower_gate(
-        f1(&composition.transparency, &composition.transparency),
-        1.0 - quality_gates::MAX_MASK_REGRESSION_F1
-    ));
-    let flash_fixture = flash(64, 48);
-    assert!(quality_gates::passes_upper_gate(
-        ev_error(flash_fixture.exposure_ev, flash_fixture.exposure_ev),
-        quality_gates::MAX_EXPOSURE_REGRESSION_EV
-    ));
-
-    let parallax = layered_parallax(64, 48);
-    let depth = depth_order(&parallax.depth, &parallax.depth);
-    assert!(quality_gates::passes_lower_gate(
-        depth,
-        1.0 - quality_gates::MAX_DEPTH_REGRESSION_ORDERING
-    ));
+    assert_eq!(
+        metrics,
+        [
+            "motion.mean_epe",
+            "motion.p95_epe",
+            "confidence.auroc",
+            "disocclusion.f1",
+            "reactive.f1",
+            "composition.f1",
+            "exposure.error_ev",
+            "depth.ordering",
+        ]
+    );
+    assert_eq!(quality_gates::GUIDANCE_SCALES, &[1.0, 0.75, 0.5]);
 }

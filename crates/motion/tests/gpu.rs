@@ -436,6 +436,64 @@ fn all_quality_presets_keep_dense_odd_extent_translation() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
+fn guidance_scale_matrix_measures_estimator_output_for_every_quality() {
+    let input_extent = vk::Extent2D {
+        width: 128,
+        height: 96,
+    };
+    let source_motion = (5_i32, -3_i32);
+
+    for &scale in quality_gates::GUIDANCE_SCALES {
+        let width = (input_extent.width as f32 * scale).round() as u32;
+        let height = (input_extent.height as f32 * scale).round() as u32;
+        let dx = (source_motion.0 as f32 * scale).round() as i32;
+        let dy = (source_motion.1 as f32 * scale).round() as i32;
+        let previous = pattern(width, height, 0, 0);
+        let current = pattern(width, height, dx, dy);
+        let margin = 12.min(width / 4).min(height / 4);
+
+        for quality in [
+            MotionQuality::Ultra,
+            MotionQuality::High,
+            MotionQuality::Balanced,
+            MotionQuality::Performance,
+        ] {
+            let (vectors, _, cut, _) =
+                unsafe { pair_quality(width, height, &previous, &current, quality) };
+            let mut errors = Vec::new();
+            for y in margin..height - margin {
+                for x in margin..width - margin {
+                    let motion = vectors[(y * width + x) as usize];
+                    errors.push(
+                        ((motion[0] + dx as f32).powi(2) + (motion[1] + dy as f32).powi(2)).sqrt(),
+                    );
+                }
+            }
+            let mean = errors.iter().sum::<f32>() / errors.len() as f32;
+            let p95 = percentile95(errors);
+            eprintln!(
+                "fixture=translation scale={scale:.2} quality={quality:?} signal=motion metric=mean_epe measured={mean:.4} limit={:.4}",
+                quality_gates::MAX_MEAN_EPE
+            );
+            eprintln!(
+                "fixture=translation scale={scale:.2} quality={quality:?} signal=motion metric=p95_epe measured={p95:.4} limit={:.4}",
+                quality_gates::MAX_P95_EPE
+            );
+            assert_eq!(cut, 0, "scale={scale} quality={quality:?}");
+            assert!(
+                quality_gates::passes_upper_gate(mean, quality_gates::MAX_MEAN_EPE),
+                "scale={scale} quality={quality:?} mean EPE={mean}"
+            );
+            assert!(
+                quality_gates::passes_upper_gate(p95, quality_gates::MAX_P95_EPE),
+                "scale={scale} quality={quality:?} p95 EPE={p95}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
 fn rotation_zoom_and_affine_fixture_remain_finite_and_calibrated() {
     let width = 129;
     let height = 97;

@@ -57,8 +57,8 @@ impl MotionQuality {
             },
             Self::Performance => MotionProfile {
                 levels: 3,
-                patch_radius: 1,
-                coarse_radius: 2,
+                patch_radius: 2,
+                coarse_radius: 3,
                 fine_radius: 1,
             },
         };
@@ -687,8 +687,8 @@ mod tests {
         let performance = MotionQuality::Performance.profile(4);
         assert_eq!(ultra.levels, 4);
         assert!(balanced.levels < ultra.levels);
-        assert!(performance.patch_radius < balanced.patch_radius);
-        assert!(performance.coarse_radius < ultra.coarse_radius);
+        assert_eq!(performance.patch_radius, balanced.patch_radius);
+        assert_eq!(performance.coarse_radius, balanced.coarse_radius);
         assert_eq!(balanced.fine_radius, 1);
         assert_eq!(performance.fine_radius, 1);
     }
