@@ -63,7 +63,7 @@ pub(crate) struct FsrInputAdapter {
     descriptor_sets: Vec<vk::DescriptorSet>,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
-    initialized: bool,
+    initialized: Vec<bool>,
 }
 
 impl FsrInputAdapter {
@@ -243,7 +243,7 @@ impl FsrInputAdapter {
             descriptor_sets,
             pipeline_layout,
             pipeline,
-            initialized: false,
+            initialized: vec![false; image_count],
         })
     }
 
@@ -325,7 +325,7 @@ impl FsrInputAdapter {
                     &self.device,
                     command,
                     image,
-                    if self.initialized {
+                    if self.initialized[slot] {
                         vk::ImageLayout::GENERAL
                     } else {
                         vk::ImageLayout::UNDEFINED
@@ -368,8 +368,12 @@ impl FsrInputAdapter {
             );
             compute_memory_barrier(&self.device, command);
         }
-        self.initialized = true;
         Ok(())
+    }
+
+    pub(crate) fn mark_initialized(&mut self, slot: usize) {
+        let slot = slot % self.initialized.len();
+        self.initialized[slot] = true;
     }
 
     pub(crate) fn reset(&mut self) {

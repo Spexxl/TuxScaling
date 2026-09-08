@@ -34,6 +34,23 @@ fn main() {
         );
         println!(
             "cargo:rerun-if-changed={}",
+            repo_root
+                .join("crates/upscaler/native/fidelityfx/CMakeLists.txt")
+                .display()
+        );
+        for native_path in [
+            "crates/upscaler/native/fidelityfx/include/tux_fidelityfx.h",
+            "crates/upscaler/native/fidelityfx/src/tux_fidelityfx.cpp",
+            "crates/upscaler/native/fidelityfx/src/tux_fidelityfx_provider.cpp",
+            "crates/upscaler/native/fidelityfx/src/tux_fidelityfx_linux_compat.h",
+        ] {
+            println!(
+                "cargo:rerun-if-changed={}",
+                repo_root.join(native_path).display()
+            );
+        }
+        println!(
+            "cargo:rerun-if-changed={}",
             repo_root.join("third_party/fidelityfx-sdk").display()
         );
 

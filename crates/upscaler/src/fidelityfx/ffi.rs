@@ -90,6 +90,11 @@ pub const TUX_FFX_CREATE_DYNAMIC_RESOLUTION: u32 = 1 << 6;
 pub const TUX_FFX_CREATE_DEBUG_CHECKING: u32 = 1 << 7;
 pub const TUX_FFX_CREATE_NON_LINEAR_COLORSPACE: u32 = 1 << 8;
 
+pub const TUX_FFX_IMAGE_USAGE_READ_ONLY: u32 = 0;
+pub const TUX_FFX_IMAGE_USAGE_UAV: u32 = 1 << 1;
+pub const TUX_FFX_IMAGE_STATE_COMPUTE_READ: u32 = 1 << 2;
+pub const TUX_FFX_IMAGE_STATE_UNORDERED_ACCESS: u32 = 1 << 1;
+
 const _: () = {
     assert!(std::mem::size_of::<TuxFfxContext>() == 0);
     assert!(std::mem::size_of::<TuxFfxVersion>() == 12);

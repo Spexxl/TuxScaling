@@ -173,6 +173,25 @@ diff --git a/sdk/src/backends/vk/ffx_vk.cpp b/sdk/src/backends/vk/ffx_vk.cpp
 -    strcpy_s(outputBuffer, outputLen, converter.to_bytes(inputName).c_str());
 +    tux_fidelityfx::wide_to_utf8(inputName, outputBuffer, outputLen);
  }
+@@ -1487,1 +1487,3 @@
+         backendContext->vkFunctionTable.vkGetBufferMemoryRequirements2KHR = (PFN_vkGetBufferMemoryRequirements2KHR)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkGetBufferMemoryRequirements2KHR");
++        if (!backendContext->vkFunctionTable.vkGetBufferMemoryRequirements2KHR)
++            backendContext->vkFunctionTable.vkGetBufferMemoryRequirements2KHR = (PFN_vkGetBufferMemoryRequirements2KHR)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkGetBufferMemoryRequirements2");
+diff --git a/sdk/src/backends/vk/ffx_vk.cpp b/sdk/src/backends/vk/ffx_vk.cpp
+--- a/sdk/src/backends/vk/ffx_vk.cpp
++++ b/sdk/src/backends/vk/ffx_vk.cpp
+@@ -288,1 +288,2 @@
+     uint32_t contextArraySize = FFX_ALIGN_UP(maxContexts * sizeof(BackendContext_VK::EffectContext), sizeof(uint32_t));
++    uint32_t contextAlignmentPadding = alignof(BackendContext_VK::EffectContext) - 1;
+@@ -290,3 +291,3 @@
+     return FFX_ALIGN_UP(sizeof(BackendContext_VK) + extensionPropArraySize + gpuJobDescArraySize + resourceViewArraySize + stagingRingBufferArraySize +
+-                            pipelineArraySize + resourceArraySize + contextArraySize,
++                            pipelineArraySize + resourceArraySize + contextAlignmentPadding + contextArraySize,
+                         sizeof(uint64_t));
+@@ -1411,1 +1411,2 @@
+         uint8_t* pMem = (uint8_t*)((BackendContext_VK*)(backendContext + 1));
++        pMem = reinterpret_cast<uint8_t*>(FFX_ALIGN_UP(reinterpret_cast<uintptr_t>(pMem), alignof(BackendContext_VK::EffectContext)));
+@@
 diff --git a/ffx-api/src/ffx_provider.h b/ffx-api/src/ffx_provider.h
 --- a/ffx-api/src/ffx_provider.h
 +++ b/ffx-api/src/ffx_provider.h
@@ -185,6 +204,19 @@ diff --git a/ffx-api/src/backends.h b/ffx-api/src/backends.h
 @@ -26,1 +26,1 @@
 -#include <FidelityFx/host/ffx_interface.h>
 +#include <FidelityFX/host/ffx_interface.h>
+diff --git a/sdk/src/backends/vk/ffx_vk.cpp b/sdk/src/backends/vk/ffx_vk.cpp
+--- a/sdk/src/backends/vk/ffx_vk.cpp
++++ b/sdk/src/backends/vk/ffx_vk.cpp
+@@ -931,3 +931,9 @@
+    if (allocInfo.memoryTypeIndex == UINT32_MAX) {
++        if (requiredMemoryProperties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
++            requiredMemoryProperties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
++            allocInfo.memoryTypeIndex = findMemoryTypeIndex(backendContext->physicalDevice, memRequirements, requiredMemoryProperties, backendResource->memoryProperties);
++        }
++    }
++    if (allocInfo.memoryTypeIndex == UINT32_MAX) {
+        return FFX_ERROR_BACKEND_API_ERROR;
+    }
 diff --git a/sdk/include/FidelityFX/host/ffx_types.h b/sdk/include/FidelityFX/host/ffx_types.h
 --- a/sdk/include/FidelityFX/host/ffx_types.h
 +++ b/sdk/include/FidelityFX/host/ffx_types.h
@@ -209,6 +241,15 @@ diff --git a/ffx-api/src/ffx_provider_fsr3upscale.cpp b/ffx-api/src/ffx_provider
 @@ -71,1 +71,1 @@ uint64_t ffxProvider_FSR3Upscale::GetId() const
 -    return 0xF5A5'CA1Eui64 << 32 | (FFX_SDK_MAKE_VERSION(FFX_FSR3UPSCALER_VERSION_MAJOR, FFX_FSR3UPSCALER_VERSION_MINOR, FFX_FSR3UPSCALER_VERSION_PATCH) & 0xFFFF'FFFF);
 +    return 0xF5A5'CA1EULL << 32 | (FFX_SDK_MAKE_VERSION(FFX_FSR3UPSCALER_VERSION_MAJOR, FFX_FSR3UPSCALER_VERSION_MINOR, FFX_FSR3UPSCALER_VERSION_PATCH) & 0xFFFF'FFFF);
+@@ -82,7 +82,7 @@ struct InternalFsr3UpscalerUContext
+     InternalContextHeader   header;
+     FfxInterface            backendInterface;
+     FfxResourceInternal     sharedResources[FFX_FSR3_RESOURCE_IDENTIFIER_COUNT];
+-    FfxFsr3UpscalerContext  context;
++    alignas(8) FfxFsr3UpscalerContext context;
+     ffxApiMessage           fpMessage;
+     uint32_t                debugLevel;
+ };
 diff --git a/ffx-api/CMakeLists.txt b/ffx-api/CMakeLists.txt
 --- a/ffx-api/CMakeLists.txt
 +++ b/ffx-api/CMakeLists.txt

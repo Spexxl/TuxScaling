@@ -84,6 +84,10 @@ pub(crate) struct NativeContext {
     pub(crate) handle: std::ptr::NonNull<ffi::TuxFfxContext>,
 }
 
+// The context is owned by one backend and is only moved between runtime
+// owners; dispatch itself remains serialized by the backend contract.
+unsafe impl Send for NativeContext {}
+
 impl NativeContext {
     pub(crate) fn create(
         library: Arc<FidelityFxLibrary>,
