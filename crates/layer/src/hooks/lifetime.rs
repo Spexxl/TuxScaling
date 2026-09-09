@@ -15,6 +15,10 @@ unsafe fn destroy_swapchain_inner(
     swapchain: vk::SwapchainKHR,
     allocation_callbacks: *const vk::AllocationCallbacks<'_>,
 ) {
+    eprintln!(
+        "TuxScaling evidence event=swapchain_destroy_request swapchain=0x{:x}",
+        swapchain.as_raw(),
+    );
     let destroy = unsafe { device_downstream(device, c"vkDestroySwapchainKHR") };
     let state = swapchains()
         .lock()

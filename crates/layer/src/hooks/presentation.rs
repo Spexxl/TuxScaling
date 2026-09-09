@@ -73,6 +73,10 @@ fn release_presented_images(translation: &PresentTranslation) {
     }
 }
 
+fn should_retry_native_publication(result: vk::Result) -> bool {
+    matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR)
+}
+
 unsafe fn observe_presented_surfaces(queue_state: QueueState, info: &vk::PresentInfoKHR<'_>) {
     if info.swapchain_count == 0 || info.p_swapchains.is_null() {
         return;
@@ -461,8 +465,21 @@ unsafe fn queue_present_inner(
             }
         }
         let result = unsafe { present(queue, &modified) };
+        if result != vk::Result::SUCCESS && result != vk::Result::SUBOPTIMAL_KHR {
+            eprintln!(
+                "TuxScaling evidence event=present_result result={result:?} swapchains={}",
+                info.swapchain_count,
+            );
+        }
         if let Some(translation) = &translation {
             release_presented_images(translation);
+        }
+        if should_retry_native_publication(result) {
+            // The pre-present observation intentionally cannot replace a
+            // generation while the submitted logical slot is still mapped.
+            // Retry after releasing it so the next generation sees an idle
+            // mapping without delaying or changing the WSI result.
+            unsafe { observe_presented_surfaces(queue_state, info) };
         }
         if result != vk::Result::SUCCESS && !info.p_swapchains.is_null() {
             let presented = unsafe {
@@ -496,7 +513,7 @@ pub(super) unsafe extern "system" fn queue_present_khr(
 
 #[cfg(test)]
 mod tests {
-    use super::translate_present;
+    use super::{should_retry_native_publication, translate_present};
     use crate::state::retire_swapchain;
     use ash::vk;
     use ash::vk::Handle;
@@ -514,6 +531,15 @@ mod tests {
         assert!(matches!(
             unsafe { translate_present(&info) },
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+        ));
+    }
+
+    #[test]
+    fn retries_native_publication_after_a_successful_present_release() {
+        assert!(should_retry_native_publication(vk::Result::SUCCESS));
+        assert!(should_retry_native_publication(vk::Result::SUBOPTIMAL_KHR));
+        assert!(!should_retry_native_publication(
+            vk::Result::ERROR_OUT_OF_DATE_KHR
         ));
     }
 }

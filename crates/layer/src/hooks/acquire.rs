@@ -218,6 +218,12 @@ unsafe fn acquire_next_image_inner(
             image_index,
         )
     };
+    if !acquired(result) {
+        eprintln!(
+            "TuxScaling evidence event=acquire_result swapchain=0x{:x} result={result:?}",
+            swapchain.as_raw(),
+        );
+    }
     if let Some((state, _)) = virtual_swapchain {
         if acquired(result) {
             if let Some(logical_index) = reserved_logical

@@ -4,7 +4,7 @@ use crate::recovery::{LogicalSwapchainContract, PhysicalGeneration};
 use ash::vk::Handle;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use tuxscaling_display::{Extent, PresentationNegotiation, SurfaceExtent};
+use tuxscaling_display::{Extent, PresentationNegotiation, PresentationState, SurfaceExtent};
 
 fn virtual_swapchain_supported(info: &vk::SwapchainCreateInfoKHR<'_>) -> bool {
     if !info.flags.is_empty()
@@ -85,7 +85,10 @@ fn publish_negotiation(
     let states = swapchains()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    for swapchain in states.values() {
+    for (logical_handle, swapchain) in states.iter() {
+        if is_retired_swapchain(*logical_handle) {
+            continue;
+        }
         if let Ok(mut swapchain) = swapchain.lock()
             && swapchain.surface == surface_handle
         {
@@ -358,6 +361,17 @@ pub(super) unsafe fn observe_surface_negotiation(
         surface_extent(capabilities),
         now,
     );
+    if negotiation.output_recreation_ready() {
+        eprintln!(
+            "TuxScaling evidence event=native_publication_attempt window={}x{}+{}+{} fullscreen={} surface={:?}",
+            window.rect.width,
+            window.rect.height,
+            window.rect.x,
+            window.rect.y,
+            window.fullscreen,
+            surface_extent(capabilities),
+        );
+    }
     let mut state = negotiation.public_state();
     if negotiation.failure().is_some() {
         super::lifetime::restore_surface_window(surface);
@@ -380,18 +394,25 @@ pub(super) unsafe fn publish_native_generation(
     device_state: &DeviceState,
     surface: vk::SurfaceKHR,
 ) -> bool {
+    let Some(_recreation_guard) = SurfaceRecreationGuard::try_new(surface) else {
+        return false;
+    };
     let state = swapchains()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .values()
-        .find(|state| {
-            state
-                .lock()
-                .ok()
-                .is_some_and(|state| state.surface == surface && state.mapping.is_some())
+        .iter()
+        .find(|(logical_handle, state)| {
+            !is_retired_swapchain(**logical_handle)
+                && state
+                    .lock()
+                    .ok()
+                    .is_some_and(|state| state.surface == surface && state.mapping.is_some())
         })
-        .cloned();
+        .map(|(_, state)| state.clone());
     let Some(state) = state else {
+        eprintln!(
+            "TuxScaling evidence event=native_publication_skipped reason=no_active_swapchain"
+        );
         return false;
     };
     let display = match tuxscaling_display::X11Display::connect() {
@@ -432,6 +453,7 @@ pub(super) unsafe fn publish_native_generation(
         surface_extent,
         Instant::now(),
     ) {
+        eprintln!("TuxScaling evidence event=native_publication_skipped reason=stale_observation");
         drop(guard);
         super::lifetime::restore_surface_window(surface);
         return false;
@@ -441,6 +463,7 @@ pub(super) unsafe fn publish_native_generation(
         .as_ref()
         .is_some_and(crate::mapping::Mapping::is_idle)
     {
+        eprintln!("TuxScaling evidence event=native_publication_skipped reason=mapping_busy");
         return false;
     }
     let Some(template) = guard.template.as_ref() else {
@@ -609,6 +632,13 @@ fn physical_swapchain_info(info: &vk::SwapchainCreateInfoKHR<'_>) -> SwapchainIn
         color_space: info.image_color_space,
         extent: info.image_extent,
     }
+}
+
+fn temporal_enabled_for_logical_creation(
+    virtual_eligible: bool,
+    previous_state: Option<PresentationState>,
+) -> bool {
+    !virtual_eligible || previous_state == Some(PresentationState::Virtualized)
 }
 
 unsafe fn has_present_fences(mut next: *const c_void) -> bool {
@@ -1382,7 +1412,12 @@ unsafe fn create_swapchain_inner(
                         })
                         .is_some_and(|target| target.is_fullscreen()),
                     monitor,
-                    temporal_enabled: !virtual_eligible,
+                    temporal_enabled: temporal_enabled_for_logical_creation(
+                        virtual_eligible,
+                        old_logical
+                            .as_ref()
+                            .map(|old| old.negotiation.public_state()),
+                    ),
                 },
                 device_state.set_loader_data,
             )
@@ -1582,8 +1617,8 @@ pub(super) unsafe extern "system" fn create_swapchain_khr(
 #[cfg(test)]
 mod tests {
     use super::{
-        logical_image_count, physical_swapchain_info, translate_old_swapchain,
-        translate_recreation_create_info, virtual_swapchain_supported,
+        logical_image_count, physical_swapchain_info, temporal_enabled_for_logical_creation,
+        translate_old_swapchain, translate_recreation_create_info, virtual_swapchain_supported,
     };
     use crate::recovery::{LogicalSwapchainContract, PhysicalGeneration};
     use crate::state::SwapchainTemplate;
@@ -1760,5 +1795,18 @@ mod tests {
         assert_eq!(new_contract.handle(), new_logical);
         assert_eq!(new_contract.logical_images(), new_logical_images.as_slice());
         assert_eq!(new_contract.game_extent(), logical_extent);
+    }
+
+    #[test]
+    fn active_logical_recreation_keeps_temporal_processing_enabled() {
+        assert!(!temporal_enabled_for_logical_creation(
+            true,
+            Some(PresentationState::Negotiating)
+        ));
+        assert!(temporal_enabled_for_logical_creation(
+            true,
+            Some(PresentationState::Virtualized)
+        ));
+        assert!(temporal_enabled_for_logical_creation(false, None));
     }
 }
