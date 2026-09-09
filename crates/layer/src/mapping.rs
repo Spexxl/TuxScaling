@@ -54,6 +54,7 @@ struct PhysicalImage {
 pub(crate) struct Mapping {
     generation: u64,
     logical_slots: Vec<Option<PhysicalImage>>,
+    reserved_slots: Vec<bool>,
 }
 
 impl Mapping {
@@ -61,6 +62,7 @@ impl Mapping {
         Self {
             generation,
             logical_slots: vec![None; logical_image_count],
+            reserved_slots: vec![false; logical_image_count],
         }
     }
 
@@ -70,6 +72,32 @@ impl Mapping {
     }
 
     pub(crate) fn acquire(&mut self, physical_index: u32) -> Result<u32, AcquireError> {
+        let logical_index = self.reserve_slot()?;
+        if let Err(error) = self.bind_reserved(logical_index, physical_index) {
+            self.cancel_reservation(logical_index);
+            return Err(error);
+        }
+        Ok(logical_index)
+    }
+
+    pub(crate) fn reserve_slot(&mut self) -> Result<u32, AcquireError> {
+        let Some((index, reserved)) = self
+            .reserved_slots
+            .iter_mut()
+            .enumerate()
+            .find(|(index, reserved)| !**reserved && self.logical_slots[*index].is_none())
+        else {
+            return Err(AcquireError::NoLogicalSlot);
+        };
+        *reserved = true;
+        Ok(index as u32)
+    }
+
+    pub(crate) fn bind_reserved(
+        &mut self,
+        logical_index: u32,
+        physical_index: u32,
+    ) -> Result<(), AcquireError> {
         if self
             .logical_slots
             .iter()
@@ -78,19 +106,24 @@ impl Mapping {
         {
             return Err(AcquireError::PhysicalBusy);
         }
-        let Some((logical_index, slot)) = self
-            .logical_slots
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| slot.is_none())
-        else {
+        let index = logical_index as usize;
+        if !self.reserved_slots.get(index).copied().unwrap_or(false)
+            || self.logical_slots.get(index).is_none_or(Option::is_some)
+        {
             return Err(AcquireError::NoLogicalSlot);
-        };
-        *slot = Some(PhysicalImage {
+        }
+        self.reserved_slots[index] = false;
+        self.logical_slots[index] = Some(PhysicalImage {
             generation: self.generation,
             index: physical_index,
         });
-        Ok(logical_index as u32)
+        Ok(())
+    }
+
+    pub(crate) fn cancel_reservation(&mut self, logical_index: u32) {
+        if let Some(reserved) = self.reserved_slots.get_mut(logical_index as usize) {
+            *reserved = false;
+        }
     }
 
     pub(crate) fn present(&mut self, logical_index: u32) -> Result<u32, PresentError> {
@@ -116,7 +149,9 @@ impl Mapping {
 
     #[allow(dead_code)] // Kept here so publication cannot retain old mappings.
     pub(crate) fn replace_generation(&mut self, generation: u64) -> bool {
-        if self.logical_slots.iter().any(Option::is_some) {
+        if self.logical_slots.iter().any(Option::is_some)
+            || self.reserved_slots.iter().any(|reserved| *reserved)
+        {
             return false;
         }
         self.generation = generation;
@@ -203,6 +238,16 @@ mod tests {
         assert_eq!(mapping.acquire(3), Ok(2));
         assert_eq!(mapping.present(1), Ok(1));
         assert_eq!(mapping.acquire(0), Ok(1));
+    }
+
+    #[test]
+    fn reserves_a_logical_slot_before_unequal_count_downstream_acquire() {
+        let mut mapping = Mapping::new(1, 1);
+        let reservation = mapping.reserve_slot().unwrap();
+
+        assert_eq!(mapping.reserve_slot(), Err(AcquireError::NoLogicalSlot));
+        assert_eq!(mapping.bind_reserved(reservation, 7), Ok(()));
+        assert_eq!(mapping.present(reservation), Ok(7));
     }
 
     #[test]

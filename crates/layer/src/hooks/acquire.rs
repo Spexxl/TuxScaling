@@ -26,6 +26,7 @@ fn virtual_physical_swapchain(
 
 fn map_acquired_image(
     state: &Arc<Mutex<SwapchainState>>,
+    logical_index: u32,
     image_index: *mut u32,
 ) -> Result<(), vk::Result> {
     if image_index.is_null() {
@@ -35,10 +36,32 @@ fn map_acquired_image(
     let Some(mapping) = state.mapping.as_mut() else {
         return Ok(());
     };
-    let logical = map_acquire_result(mapping, vk::Result::SUCCESS, unsafe { *image_index })?
-        .expect("successful acquire must produce a logical slot");
-    unsafe { *image_index = logical };
+    mapping
+        .bind_reserved(logical_index, unsafe { *image_index })
+        .map_err(|_| vk::Result::ERROR_OUT_OF_DATE_KHR)?;
+    unsafe { *image_index = logical_index };
     Ok(())
+}
+
+fn reserve_image_slot(state: &Arc<Mutex<SwapchainState>>) -> Result<Option<u32>, vk::Result> {
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(mapping) = state.mapping.as_mut() else {
+        return Ok(None);
+    };
+    mapping
+        .reserve_slot()
+        .map(Some)
+        .map_err(|_| vk::Result::ERROR_OUT_OF_DATE_KHR)
+}
+
+fn cancel_reserved_image(state: &Arc<Mutex<SwapchainState>>, logical_index: Option<u32>) {
+    let Some(logical_index) = logical_index else {
+        return;
+    };
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(mapping) = state.mapping.as_mut() {
+        mapping.cancel_reservation(logical_index);
+    }
 }
 
 fn acquired(result: vk::Result) -> bool {
@@ -142,7 +165,21 @@ unsafe fn acquire_next_image_inner(
     let physical_swapchain = virtual_swapchain
         .as_ref()
         .map_or(swapchain, |(_, physical)| *physical);
+    if image_index.is_null() {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    let reserved_logical = if let Some((state, _)) = virtual_swapchain.as_ref() {
+        match reserve_image_slot(state) {
+            Ok(reserved) => reserved,
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
     let Some(proc) = (unsafe { device_downstream(device, c"vkAcquireNextImageKHR") }) else {
+        if let Some((state, _)) = virtual_swapchain.as_ref() {
+            cancel_reserved_image(state, reserved_logical);
+        }
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
     let acquire: vk::PFN_vkAcquireNextImageKHR = unsafe { std::mem::transmute(proc) };
@@ -156,11 +193,17 @@ unsafe fn acquire_next_image_inner(
             image_index,
         )
     };
-    if acquired(result)
-        && let Some((state, _)) = virtual_swapchain
-        && let Err(error) = map_acquired_image(&state, image_index)
-    {
-        return error;
+    if let Some((state, _)) = virtual_swapchain {
+        if acquired(result) {
+            if let Some(logical_index) = reserved_logical
+                && let Err(error) = map_acquired_image(&state, logical_index, image_index)
+            {
+                cancel_reserved_image(&state, Some(logical_index));
+                return error;
+            }
+        } else {
+            cancel_reserved_image(&state, reserved_logical);
+        }
     }
     result
 }
@@ -187,25 +230,45 @@ unsafe fn acquire_next_image2_inner(
     if info.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
+    if image_index.is_null() {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
     let logical_swapchain = unsafe { (*info).swapchain };
     if let Err(error) = reject_retired_swapchain(logical_swapchain) {
         return error;
     }
     let virtual_swapchain = virtual_physical_swapchain(logical_swapchain);
+    let reserved_logical = if let Some((state, _)) = virtual_swapchain.as_ref() {
+        match reserve_image_slot(state) {
+            Ok(reserved) => reserved,
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
     let mut modified = unsafe { *info };
     if let Some((_, physical)) = &virtual_swapchain {
         modified.swapchain = *physical;
     }
     let Some(proc) = (unsafe { device_downstream(device, c"vkAcquireNextImage2KHR") }) else {
+        if let Some((state, _)) = virtual_swapchain.as_ref() {
+            cancel_reserved_image(state, reserved_logical);
+        }
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
     let acquire: vk::PFN_vkAcquireNextImage2KHR = unsafe { std::mem::transmute(proc) };
     let result = unsafe { acquire(device, &modified, image_index) };
-    if acquired(result)
-        && let Some((state, _)) = virtual_swapchain
-        && let Err(error) = map_acquired_image(&state, image_index)
-    {
-        return error;
+    if let Some((state, _)) = virtual_swapchain {
+        if acquired(result) {
+            if let Some(logical_index) = reserved_logical
+                && let Err(error) = map_acquired_image(&state, logical_index, image_index)
+            {
+                cancel_reserved_image(&state, Some(logical_index));
+                return error;
+            }
+        } else {
+            cancel_reserved_image(&state, reserved_logical);
+        }
     }
     result
 }
@@ -302,5 +365,25 @@ mod tests {
             map_acquire_result(&mut mapping, vk::Result::ERROR_OUT_OF_DATE_KHR, 1),
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
         );
+    }
+
+    #[test]
+    fn unequal_logical_count_rejects_before_downstream_acquire() {
+        use crate::mapping::Mapping;
+
+        let mut mapping = Mapping::new(3, 1);
+        assert_eq!(mapping.acquire(2), Ok(0));
+
+        let mut downstream_acquires = 0;
+        let reservation = mapping.reserve_slot();
+        if reservation.is_ok() {
+            downstream_acquires += 1;
+        }
+
+        assert_eq!(
+            reservation,
+            Err(crate::mapping::AcquireError::NoLogicalSlot)
+        );
+        assert_eq!(downstream_acquires, 0);
     }
 }

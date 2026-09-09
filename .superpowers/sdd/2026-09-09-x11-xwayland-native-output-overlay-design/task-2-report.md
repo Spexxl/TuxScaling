@@ -282,3 +282,38 @@ test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured
 
 Live X11/XWayland WSI validation was not available; no claim is made for
 compositor or ICD behavior beyond these deterministic hook/state checks.
+
+## Task 2 review cycle 4: acquire reservation fix
+
+The acquire path now reserves a free logical slot before invoking either
+downstream acquire command. If all logical slots are occupied, it returns
+`ERROR_OUT_OF_DATE_KHR` without calling the ICD. Reservations are canceled on
+non-successful downstream results, missing downstream dispatch, and mapping
+failure; a successful result is bound to that reserved slot before its index
+is exposed to the application. Null output pointers are rejected before any
+reservation or driver call. This keeps unequal logical/physical image counts
+safe at the acquire boundary: physical acquisition is attempted only when a
+logical destination is already available.
+
+The mapping unit still rejects a duplicate physical image and the hook returns
+an error rather than forwarding a tagged token or exposing an unbound index.
+Under the Vulkan WSI contract a successful acquire returns an available
+physical image; the pre-reservation test covers the layer-controlled failure
+case that can otherwise leak an acquired physical image when logical and
+physical counts differ. No live ICD was available to exercise an invalid
+duplicate-image driver response.
+
+### Cycle 4 verification
+
+```text
+$ cargo fmt --all
+$ cargo test -p tuxscaling-layer hooks::acquire::tests --lib
+running 6 tests
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 28 filtered out
+$ cargo test -p tuxscaling-layer mapping::tests --lib
+running 12 tests
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out
+$ git diff --check
+```
+
+Live X11/XWayland WSI and ICD-driver behavior were not run in this cycle.
