@@ -44,6 +44,7 @@ fn clear_surface_virtualization(surface: vk::SurfaceKHR) {
         state.logical_extent = None;
         state.logical_capabilities = None;
         state.borderless_lease = None;
+        state.negotiation = PresentationNegotiation::direct();
     }
 }
 
@@ -288,50 +289,93 @@ unsafe fn virtual_output_extent(
     }
     let now = Instant::now();
     let mut negotiation = surface_state.negotiation;
-    let requested_now =
-        if negotiation.public_state() == tuxscaling_display::PresentationState::Direct {
-            if !negotiation.request_borderless(target_info.monitor.rect, now) {
-                return None;
-            }
-            true
+    if negotiation.public_state() == tuxscaling_display::PresentationState::Direct {
+        if !negotiation.request_borderless(target_info.monitor.rect, now)
+            || !negotiation.borderless_requested(now)
+        {
+            return None;
+        }
+        let lease = if let Some(lease) = existing_lease {
+            lease
         } else {
-            false
+            display.promote_borderless(surface_state.window).ok()?
         };
-    if requested_now && !negotiation.borderless_requested(Instant::now()) {
+        if let Some(surface) = surfaces()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_mut(&surface)
+        {
+            surface.borderless_lease = Some(lease);
+            surface.negotiation = negotiation;
+        }
+        if debug_test {
+            eprintln!("TuxScaling native negotiation started; waiting for a later boundary");
+        }
         return None;
     }
-    let lease = if let Some(lease) = existing_lease {
-        lease
-    } else {
-        display.promote_borderless(surface_state.window).ok()?
+    if !negotiation.output_recreation_ready() {
+        return None;
+    }
+    let Some(lease) = existing_lease else {
+        return None;
     };
-    let resized = ResizedWindow { lease, negotiation };
     let Some(device_state) = device_state else {
-        resized.restore();
         return None;
     };
     let Some(capabilities) = (unsafe { downstream_surface_capabilities(device_state, surface) })
     else {
-        resized.restore();
         return None;
     };
     let Ok(observed) = display.describe_window(surface_state.window) else {
-        resized.restore();
         return None;
     };
-    let mut resized = resized;
-    if !negotiation.observe(
+    let observed_surface = surface_extent(capabilities);
+    let observation_now = Instant::now();
+    if !negotiation.native_observation_is_current(
         observed.rect,
         observed.fullscreen,
-        surface_extent(capabilities),
-        Instant::now(),
+        observed_surface,
+        observation_now,
     ) {
         if debug_test {
             eprintln!("TuxScaling virtual output skipped: exact native confirmation unavailable");
         }
-        resized.restore();
         return None;
     }
+    Some((target, ResizedWindow { lease, negotiation }))
+}
+
+pub(super) unsafe fn observe_surface_negotiation(
+    device_state: &DeviceState,
+    surface: vk::SurfaceKHR,
+    now: Instant,
+) -> tuxscaling_display::PresentationState {
+    let Some(snapshot) = surfaces()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&surface)
+        .copied()
+    else {
+        return tuxscaling_display::PresentationState::Direct;
+    };
+    let Ok(display) = tuxscaling_display::X11Display::connect() else {
+        return snapshot.negotiation.public_state();
+    };
+    let Ok(window) = display.describe_window(snapshot.window) else {
+        return snapshot.negotiation.public_state();
+    };
+    let Some(capabilities) = (unsafe { downstream_surface_capabilities(device_state, surface) })
+    else {
+        return snapshot.negotiation.public_state();
+    };
+    let mut negotiation = snapshot.negotiation;
+    let _ = negotiation.observe(
+        window.rect,
+        window.fullscreen,
+        surface_extent(capabilities),
+        now,
+    );
+    let state = negotiation.public_state();
     if let Some(surface) = surfaces()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -339,8 +383,17 @@ unsafe fn virtual_output_extent(
     {
         surface.negotiation = negotiation;
     }
-    resized.negotiation = negotiation;
-    Some((target, resized))
+    let states = swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for swapchain in states.values() {
+        if let Ok(mut swapchain) = swapchain.lock()
+            && swapchain.surface == surface
+        {
+            swapchain.negotiation = negotiation;
+        }
+    }
+    state
 }
 
 unsafe fn has_present_fences(mut next: *const c_void) -> bool {
@@ -1083,6 +1136,11 @@ unsafe fn create_swapchain_inner(
             .unwrap_or_else(|error| error.into_inner())
             .get(&original.surface)
             .map(|surface| surface.window);
+        let persisted_negotiation = surfaces()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&original.surface)
+            .map(|surface| surface.negotiation);
         let was_virtual = virtual_window.is_some();
         let active_negotiation = virtual_window.as_ref().map(|window| window.negotiation);
         let monitor = virtual_window.as_ref().map(|window| {
@@ -1133,6 +1191,7 @@ unsafe fn create_swapchain_inner(
                                 .as_ref()
                                 .map(|images| Mapping::new(0, images.len())),
                             negotiation: active_negotiation
+                                .or(persisted_negotiation)
                                 .unwrap_or_else(PresentationNegotiation::direct),
                             overlay,
                             virtual_images,

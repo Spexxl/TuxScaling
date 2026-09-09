@@ -250,6 +250,23 @@ impl PresentationNegotiation {
             _ => None,
         }
     }
+
+    pub const fn output_recreation_ready(self) -> bool {
+        matches!(self.stage, NegotiationStage::RecreatingOutput { .. })
+    }
+
+    pub fn native_observation_is_current(
+        self,
+        window: Rect,
+        fullscreen: bool,
+        surface: SurfaceExtent,
+        now: Instant,
+    ) -> bool {
+        let NegotiationStage::RecreatingOutput { target, deadline } = self.stage else {
+            return false;
+        };
+        now < deadline && is_native(target, window, fullscreen, surface)
+    }
 }
 
 fn is_native(target: Rect, window: Rect, fullscreen: bool, surface: SurfaceExtent) -> bool {

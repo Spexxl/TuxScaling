@@ -224,3 +224,26 @@ $ git diff --check
 No live X11/Xwayland WSI validation was run. The first commit attempt was
 blocked because `.git/index.lock` could not be created: `.git` is read-only in
 this execution context.
+
+## Async negotiation completion
+
+The prior synchronous create-time activation has been removed. On the first
+eligible `vkCreateSwapchainKHR`, the layer requests borderless mode, stores
+the `PresentationNegotiation` and lease on the surface, and returns the
+application's direct swapchain unchanged. It does not query native geometry
+to activate virtualization and does not wait or sleep.
+
+Every `vkQueuePresentKHR` now observes each presented surface at the frame
+boundary using the current X11 geometry, EWMH fullscreen state, and fresh
+downstream `SurfaceExtent`. A mismatch leaves the persistent negotiation in
+`Negotiating`; an exact later observation moves it to
+`RecreatingOutput`. The next application swapchain recreation is the
+recreation boundary: the layer revalidates the observation, creates the
+native physical swapchain, calls `output_recreated`, and only then publishes
+`Virtualized`. Any mismatch, unavailable observation, or monotonic five-second
+deadline expiry fails open and keeps direct presentation.
+
+Deterministic evidence now covers the first mismatch, later exact observation,
+recreation revalidation, the ready predicate, and deadline expiry to
+`Failed/Direct` behavior. The extension rejection handlers remain present for
+`vkReleaseSwapchainImagesEXT` and `vkGetSwapchainStatusKHR`.

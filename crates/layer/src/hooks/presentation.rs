@@ -1,6 +1,7 @@
 use super::*;
 use crate::mapping::{LogicalSwapchainHandle, rewrite_present_array};
 use ash::vk::Handle;
+use std::time::Instant;
 
 struct PresentTranslation {
     swapchains: Vec<vk::SwapchainKHR>,
@@ -64,6 +65,37 @@ fn release_presented_images(translation: &PresentTranslation) {
             && let Some(mapping) = state.mapping.as_mut()
         {
             let _ = mapping.present(*logical_index);
+        }
+    }
+}
+
+unsafe fn observe_presented_surfaces(queue_state: QueueState, info: &vk::PresentInfoKHR<'_>) {
+    if info.swapchain_count == 0 || info.p_swapchains.is_null() {
+        return;
+    }
+    let handles =
+        unsafe { std::slice::from_raw_parts(info.p_swapchains, info.swapchain_count as usize) };
+    let surfaces = {
+        let states = swapchains()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        handles
+            .iter()
+            .filter_map(|handle| states.get(handle))
+            .filter_map(|state| state.lock().ok().map(|state| state.surface))
+            .collect::<Vec<_>>()
+    };
+    let Some(device_state) = devices()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&queue_state.device)
+        .cloned()
+    else {
+        return;
+    };
+    for surface in surfaces {
+        unsafe {
+            super::creation::observe_surface_negotiation(&device_state, surface, Instant::now());
         }
     }
 }
@@ -269,6 +301,7 @@ unsafe fn queue_present_inner(
         return unsafe { present(queue, present_info) };
     }
     let info = unsafe { &*present_info };
+    unsafe { observe_presented_surfaces(queue_state, info) };
     let translation = unsafe { translate_present(info) };
     let translation = match translation {
         Ok(translation) => translation,

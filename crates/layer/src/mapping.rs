@@ -244,6 +244,13 @@ mod tests {
             now + Duration::from_millis(2),
         ));
         assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+        assert!(negotiation.output_recreation_ready());
+        assert!(negotiation.native_observation_is_current(
+            target,
+            true,
+            SurfaceExtent::fixed(Extent::new(1920, 1080)),
+            now + Duration::from_millis(2),
+        ));
         assert!(negotiation.output_recreated(
             target,
             true,
@@ -251,6 +258,33 @@ mod tests {
             now + Duration::from_millis(3),
         ));
         assert_eq!(negotiation.public_state(), PresentationState::Virtualized);
+    }
+
+    #[test]
+    fn persistent_negotiation_fails_open_after_monotonic_deadline() {
+        use std::time::{Duration, Instant};
+        use tuxscaling_display::{
+            Extent, NEGOTIATION_TIMEOUT, NegotiationFailure, PresentationNegotiation,
+            PresentationState, Rect, SurfaceExtent,
+        };
+
+        let now = Instant::now();
+        let target = Rect::new(0, 0, 1920, 1080);
+        let mut negotiation = PresentationNegotiation::direct();
+        assert!(negotiation.request_borderless(target, now));
+        assert!(negotiation.borderless_requested(now));
+        assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+        assert!(!negotiation.observe(
+            Rect::new(0, 0, 1920, 1040),
+            true,
+            SurfaceExtent::fixed(Extent::new(1920, 1040)),
+            now + NEGOTIATION_TIMEOUT + Duration::from_nanos(1),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Failed);
+        assert_eq!(
+            negotiation.failure(),
+            Some(NegotiationFailure::DeadlineExpired)
+        );
     }
 
     #[test]
