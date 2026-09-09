@@ -113,9 +113,7 @@ unsafe fn uses_virtual_output(info: &vk::PresentInfoKHR<'_>) -> bool {
     presented.iter().any(|swapchain| {
         states.get(swapchain).is_some_and(|state| {
             let state = state.lock().unwrap_or_else(|error| error.into_inner());
-            state.virtual_images.is_some()
-                && state.negotiation.public_state()
-                    == tuxscaling_display::PresentationState::Virtualized
+            state.contract.is_some()
         })
     })
 }
@@ -206,10 +204,11 @@ unsafe fn submit_overlay(
         {
             continue;
         }
-        let pending_negotiation = swapchain_state.contract.as_ref().is_some_and(|contract| {
-            contract.presentation_path() == PresentationPath::SpatialBypass
-        });
-        let prepared_frame = if pending_negotiation {
+        let temporal_allowed = swapchain_state
+            .contract
+            .as_ref()
+            .is_some_and(|contract| contract.presentation_path() == PresentationPath::Temporal);
+        let prepared_frame = if swapchain_state.contract.is_some() && !temporal_allowed {
             unsafe {
                 swapchain_state.overlay.prepare_spatial_fallback(
                     queue,

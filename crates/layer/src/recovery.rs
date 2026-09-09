@@ -164,6 +164,10 @@ impl LogicalSwapchainContract {
         self.state = state;
     }
 
+    pub(crate) const fn is_failed(&self) -> bool {
+        matches!(self.state, PresentationState::Failed)
+    }
+
     pub(crate) fn bind(&self, binding: FrameBinding) -> Result<FrameBinding, &'static str> {
         if binding.logical_index() as usize >= self.logical.images.len()
             || binding.physical_index() as usize >= self.physical.image_count()
@@ -175,9 +179,11 @@ impl LogicalSwapchainContract {
 
     pub(crate) const fn presentation_path(&self) -> PresentationPath {
         match self.state {
-            PresentationState::Negotiating => PresentationPath::SpatialBypass,
+            PresentationState::Negotiating | PresentationState::Failed => {
+                PresentationPath::SpatialBypass
+            }
             PresentationState::Virtualized => PresentationPath::Temporal,
-            PresentationState::Direct | PresentationState::Failed => PresentationPath::Direct,
+            PresentationState::Direct => PresentationPath::Direct,
         }
     }
 }
@@ -335,6 +341,23 @@ mod tests {
             Ok(FrameBinding::new(1, 2))
         );
         assert_eq!(contract.presentation_path(), PresentationPath::Temporal);
+    }
+
+    #[test]
+    fn failed_virtual_generation_keeps_spatial_fallback_available() {
+        let contract = LogicalSwapchainContract::new(
+            vk::SwapchainKHR::from_raw(0x8000_0000_0000_0005),
+            vec![vk::Image::from_raw(81), vk::Image::from_raw(82)],
+            extent(1280, 720),
+            generation(0, 91, 1280, 720, 3),
+            PresentationState::Failed,
+        )
+        .unwrap();
+
+        assert_eq!(
+            contract.presentation_path(),
+            PresentationPath::SpatialBypass
+        );
     }
 
     #[test]

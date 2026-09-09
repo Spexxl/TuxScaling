@@ -103,9 +103,16 @@ pub(super) fn restore_surface_window(surface: vk::SurfaceKHR) {
         if let Ok(mut state) = state.lock()
             && state.surface == surface
         {
-            state.negotiation = tuxscaling_display::PresentationNegotiation::direct();
+            let has_contract = state.contract.is_some();
+            if has_contract {
+                let mut failed = tuxscaling_display::PresentationNegotiation::direct();
+                failed.fail(tuxscaling_display::NegotiationFailure::OutputRecreation);
+                state.negotiation = failed;
+            } else {
+                state.negotiation = tuxscaling_display::PresentationNegotiation::direct();
+            }
             if let Some(contract) = state.contract.as_mut() {
-                contract.set_state(tuxscaling_display::PresentationState::Direct);
+                contract.set_state(tuxscaling_display::PresentationState::Failed);
             }
         }
     }

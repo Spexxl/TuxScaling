@@ -89,6 +89,14 @@ fn publish_negotiation(
         if let Ok(mut swapchain) = swapchain.lock()
             && swapchain.surface == surface_handle
         {
+            if negotiation.public_state() == tuxscaling_display::PresentationState::Direct
+                && swapchain
+                    .contract
+                    .as_ref()
+                    .is_some_and(LogicalSwapchainContract::is_failed)
+            {
+                continue;
+            }
             swapchain.negotiation = negotiation;
             if let Some(contract) = swapchain.contract.as_mut() {
                 contract.set_state(negotiation.public_state());
@@ -460,11 +468,25 @@ pub(super) unsafe fn publish_native_generation(
     if let Some(contract) = guard.contract.as_mut() {
         contract.set_state(published_negotiation.public_state());
     }
+    let logical_handle = guard.logical_handle;
+    let logical_extent = guard
+        .contract
+        .as_ref()
+        .map_or(vk::Extent2D::default(), |contract| contract.game_extent());
     guard.physical_handle = new_physical;
     guard.physical_images = new_images;
     guard.generation = next_generation;
     drop(guard);
     publish_negotiation(surface, published_negotiation);
+    eprintln!(
+        "TuxScaling evidence event=virtual_swapchain_active logical_handle=0x{:x} logical={}x{} physical={}x{} generation={}",
+        logical_handle.as_raw(),
+        logical_extent.width,
+        logical_extent.height,
+        target_extent.width,
+        target_extent.height,
+        next_generation,
+    );
     unsafe { loader.destroy_swapchain(old_physical, None) };
     true
 }
@@ -1245,6 +1267,21 @@ unsafe fn create_swapchain_inner(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(logical_handle, state);
+        eprintln!(
+            "TuxScaling evidence event=logical_swapchain_created logical_handle=0x{:x} physical_handle=0x{:x} logical={}x{} physical={}x{} virtual={} negotiation={}",
+            logical_handle.as_raw(),
+            handle.as_raw(),
+            original.image_extent.width,
+            original.image_extent.height,
+            info.extent.width,
+            info.extent.height,
+            u8::from(virtual_eligible),
+            if virtual_eligible {
+                "negotiating"
+            } else {
+                "direct"
+            },
+        );
         if virtual_eligible {
             let target = initial_target.expect("virtual target checked above");
             let display = match tuxscaling_display::X11Display::connect() {
@@ -1305,6 +1342,14 @@ unsafe fn create_swapchain_inner(
             }
             unsafe { *swapchain = logical_handle };
             publish_negotiation(original.surface, negotiation);
+            eprintln!(
+                "TuxScaling evidence event=virtual_swapchain_negotiating logical_handle=0x{:x} logical={}x{} physical={}x{}",
+                logical_handle.as_raw(),
+                original.image_extent.width,
+                original.image_extent.height,
+                info.extent.width,
+                info.extent.height,
+            );
         }
         result
     }));

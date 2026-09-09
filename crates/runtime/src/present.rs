@@ -509,6 +509,9 @@ pub struct SwapchainRuntime {
     output_presented: Vec<bool>,
     pending_output: Option<usize>,
     diagnostics: FrameDiagnostics,
+    evidence_fsr_dispatches: u64,
+    evidence_reconstructed_presents: u64,
+    last_backend_dispatch: bool,
 }
 impl SwapchainRuntime {
     pub unsafe fn new(
@@ -669,6 +672,9 @@ impl SwapchainRuntime {
                 ],
                 ..Default::default()
             },
+            evidence_fsr_dispatches: 0,
+            evidence_reconstructed_presents: 0,
+            last_backend_dispatch: false,
         })
     }
     pub fn disable(&mut self) {
@@ -777,6 +783,15 @@ impl SwapchainRuntime {
         self.diagnostics.output_extent = [info.extent.width, info.extent.height];
         self.diagnostics.presentation_mode = "Virtual upscale".into();
         self.diagnostics.window_mode = "Promoted borderless".into();
+        eprintln!(
+            "TuxScaling evidence event=native_generation_published logical={}x{} physical={}x{} backend={} images={}",
+            self.temporal.resolution.game_extent.width,
+            self.temporal.resolution.game_extent.height,
+            info.extent.width,
+            info.extent.height,
+            upscaler_name(self.temporal.active_upscaler),
+            self.output_images.len(),
+        );
 
         drop(old_overlay);
         drop(old_temporal);
@@ -1407,6 +1422,21 @@ impl SwapchainRuntime {
                     cpu_start.elapsed().as_secs_f32() * 1_000.0;
                 if let Err(error) = result {
                     eprintln!("TuxScaling: backend record failed: {error}");
+                    self.last_backend_dispatch = false;
+                } else {
+                    self.last_backend_dispatch = true;
+                    if self.temporal.active_upscaler == Upscaler::Fsr314
+                        && self.evidence_fsr_dispatches == 0
+                    {
+                        self.evidence_fsr_dispatches = 1;
+                        eprintln!(
+                            "TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical={}x{} physical={}x{}",
+                            self.temporal.resolution.game_extent.width,
+                            self.temporal.resolution.game_extent.height,
+                            self.temporal.resolution.output_extent.width,
+                            self.temporal.resolution.output_extent.height,
+                        );
+                    }
                 }
             } else if game_image != self.output_images[index]
                 && let Some(capture) = &self.temporal.capture
@@ -1685,6 +1715,15 @@ impl SwapchainRuntime {
             self.output_presented[index] = true;
         }
         self.diagnostics.frame_id = self.temporal.history.frame_id;
+        if self.last_backend_dispatch && self.evidence_reconstructed_presents == 0 {
+            self.evidence_reconstructed_presents = 1;
+            eprintln!(
+                "TuxScaling evidence event=reconstructed_present backend={} frame={}",
+                upscaler_name(self.temporal.active_upscaler),
+                self.diagnostics.frame_id,
+            );
+        }
+        self.last_backend_dispatch = false;
     }
     pub fn presentation_failed(&mut self) {
         self.temporal.reset_history(GuidanceReset::Presentation);
