@@ -1,4 +1,5 @@
 use super::*;
+use crate::recovery::LeaseCleanup;
 
 fn suppress_unknown_swapchain_destroy(swapchain: vk::SwapchainKHR) -> bool {
     is_retired_swapchain(swapchain) || is_unknown_logical_swapchain(swapchain)
@@ -85,10 +86,28 @@ pub(super) fn restore_surface_window(surface: vk::SurfaceKHR) {
             state.negotiation = tuxscaling_display::PresentationNegotiation::direct();
             state.borderless_lease.take()
         });
-    if let Some(lease) = lease
-        && let Ok(display) = tuxscaling_display::X11Display::connect()
+    if let Some(lease) = lease {
+        let mut cleanup = LeaseCleanup::acquired();
+        if let Ok(display) = tuxscaling_display::X11Display::connect()
+            && cleanup.restore_once()
+        {
+            let _ = display.restore(lease);
+        }
+        debug_assert!(cleanup.restore_count() <= 1);
+    }
+    for state in swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .values()
     {
-        let _ = display.restore(lease);
+        if let Ok(mut state) = state.lock()
+            && state.surface == surface
+        {
+            state.negotiation = tuxscaling_display::PresentationNegotiation::direct();
+            if let Some(contract) = state.contract.as_mut() {
+                contract.set_state(tuxscaling_display::PresentationState::Direct);
+            }
+        }
     }
 }
 

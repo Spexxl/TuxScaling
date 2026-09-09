@@ -1,15 +1,10 @@
 use super::*;
 use crate::mapping::{LogicalSwapchainHandle, Mapping, OldSwapchain};
+use crate::recovery::{LogicalSwapchainContract, PhysicalGeneration};
 use ash::vk::Handle;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tuxscaling_display::{Extent, PresentationNegotiation, SurfaceExtent};
-
-#[derive(Clone, Copy)]
-struct ResizedWindow {
-    lease: tuxscaling_display::BorderlessLease,
-    negotiation: PresentationNegotiation,
-}
 
 fn virtual_swapchain_supported(info: &vk::SwapchainCreateInfoKHR<'_>) -> bool {
     if !info.flags.is_empty()
@@ -19,17 +14,13 @@ fn virtual_swapchain_supported(info: &vk::SwapchainCreateInfoKHR<'_>) -> bool {
     {
         return false;
     }
-    let mut next = info.p_next.cast::<vk::BaseInStructure<'_>>();
-    while !next.is_null() {
-        let structure_type = unsafe { (*next).s_type };
-        if structure_type == vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR {
-            return false;
-        }
-        next = unsafe { (*next).p_next.cast() };
-    }
-    true
+    // The physical-generation template deliberately owns only the core
+    // create parameters.  Unknown pNext chains therefore fail open instead
+    // of being silently dropped during an internal generation replacement.
+    info.p_next.is_null()
 }
 
+#[cfg(test)]
 fn logical_image_count(requested: u32, physical: usize) -> usize {
     let requested = requested as usize;
     if requested != 0 { requested } else { physical }
@@ -80,19 +71,6 @@ unsafe fn allocate_logical_images(
         .collect()
 }
 
-fn clear_surface_virtualization(surface: vk::SurfaceKHR) {
-    if let Some(state) = surfaces()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get_mut(&surface)
-    {
-        state.logical_extent = None;
-        state.logical_capabilities = None;
-        state.borderless_lease = None;
-        state.negotiation = PresentationNegotiation::direct();
-    }
-}
-
 fn publish_negotiation(
     surface_handle: vk::SurfaceKHR,
     negotiation: tuxscaling_display::PresentationNegotiation,
@@ -112,6 +90,9 @@ fn publish_negotiation(
             && swapchain.surface == surface_handle
         {
             swapchain.negotiation = negotiation;
+            if let Some(contract) = swapchain.contract.as_mut() {
+                contract.set_state(negotiation.public_state());
+            }
         }
     }
 }
@@ -173,74 +154,6 @@ fn allocate_logical_swapchain(physical: vk::SwapchainKHR) -> Option<vk::Swapchai
     None
 }
 
-impl ResizedWindow {
-    fn restore(self) {
-        if let Ok(display) = tuxscaling_display::X11Display::connect() {
-            let _ = display.restore(self.lease);
-        }
-    }
-
-    unsafe fn output_recreated(&mut self, state: &DeviceState, surface: vk::SurfaceKHR) -> bool {
-        let Some(capabilities) = (unsafe { downstream_surface_capabilities(state, surface) })
-        else {
-            return false;
-        };
-        let Ok(display) = tuxscaling_display::X11Display::connect() else {
-            return false;
-        };
-        let Ok(observed) = display.describe_window(self.lease.window) else {
-            return false;
-        };
-        self.negotiation.output_recreated(
-            observed.rect,
-            observed.fullscreen,
-            surface_extent(capabilities),
-            Instant::now(),
-        )
-    }
-}
-
-struct DirectSwapchain<'a> {
-    create_swapchain: vk::PFN_vkCreateSwapchainKHR,
-    loader: &'a ash::khr::swapchain::Device,
-    device: vk::Device,
-    create_info: *const vk::SwapchainCreateInfoKHR<'a>,
-    allocation_callbacks: *const vk::AllocationCallbacks<'a>,
-    swapchain: *mut vk::SwapchainKHR,
-    surface: vk::SurfaceKHR,
-}
-
-impl DirectSwapchain<'_> {
-    unsafe fn recreate(
-        self,
-        resized_window: Option<ResizedWindow>,
-    ) -> Result<Vec<vk::Image>, vk::Result> {
-        if let Some(window) = resized_window {
-            window.restore();
-        }
-        clear_surface_virtualization(self.surface);
-        unsafe {
-            self.loader
-                .destroy_swapchain(*self.swapchain, self.allocation_callbacks.as_ref())
-        };
-        let result = unsafe {
-            (self.create_swapchain)(
-                self.device,
-                self.create_info,
-                self.allocation_callbacks,
-                self.swapchain,
-            )
-        };
-        if result != vk::Result::SUCCESS {
-            return Err(result);
-        }
-        unsafe { self.loader.get_swapchain_images(*self.swapchain) }.inspect_err(|_| unsafe {
-            self.loader
-                .destroy_swapchain(*self.swapchain, self.allocation_callbacks.as_ref())
-        })
-    }
-}
-
 unsafe fn downstream_surface_capabilities(
     state: &DeviceState,
     surface: vk::SurfaceKHR,
@@ -278,25 +191,18 @@ fn surface_extent(capabilities: vk::SurfaceCapabilitiesKHR) -> SurfaceExtent {
     }
 }
 
-unsafe fn virtual_output_extent(
+#[derive(Clone, Copy)]
+struct InitialOutputTarget {
+    window: u64,
+    monitor: tuxscaling_display::Monitor,
+}
+
+fn initial_output_target(
     surface: vk::SurfaceKHR,
     game_extent: vk::Extent2D,
-    device_state: Option<&DeviceState>,
     preflight_eligible: bool,
-) -> Option<(vk::Extent2D, ResizedWindow)> {
-    let debug_test = cfg!(debug_assertions)
-        && std::env::var("TUXSCALING_TEST_FORCE_VIRTUAL")
-            .ok()
-            .as_deref()
-            == Some("1");
-    if debug_test {
-        eprintln!(
-            "TuxScaling virtual output probe: game={}x{}",
-            game_extent.width, game_extent.height
-        );
-    }
+) -> Option<InitialOutputTarget> {
     if !preflight_eligible {
-        super::lifetime::restore_surface_window(surface);
         return None;
     }
     let config = if let Ok(path) = std::env::var("TUXSCALING_CONFIG") {
@@ -305,121 +211,27 @@ unsafe fn virtual_output_extent(
     } else {
         tuxscaling_config::Config::default()
     };
-    let target = match config.output_resolution {
-        tuxscaling_config::OutputResolution::Swapchain => return None,
-        tuxscaling_config::OutputResolution::Native => None,
-        tuxscaling_config::OutputResolution::Fixed { width, height } => {
-            Some(vk::Extent2D { width, height })
-        }
-    };
-    let surface_state = match surfaces()
+    if !matches!(
+        config.output_resolution,
+        tuxscaling_config::OutputResolution::Native
+    ) {
+        return None;
+    }
+    let window = surfaces()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(&surface)
-        .copied()
-    {
-        Some(surface) => surface,
-        None => {
-            if debug_test {
-                eprintln!("TuxScaling virtual output skipped: unknown surface");
-            }
-            return None;
-        }
-    };
-    let display = match tuxscaling_display::X11Display::connect() {
-        Ok(display) => display,
-        Err(error) => {
-            if debug_test {
-                eprintln!("TuxScaling virtual output skipped: display {error}");
-            }
-            return None;
-        }
-    };
-    let target_info = match display.target_for_window(surface_state.window) {
-        Ok(target) => target,
-        Err(error) => {
-            if debug_test {
-                eprintln!("TuxScaling virtual output skipped: target {error}");
-            }
-            return None;
-        }
-    };
-    let existing_lease = surface_state.borderless_lease;
-    let target = target.unwrap_or(vk::Extent2D {
-        width: target_info.monitor.rect.width,
-        height: target_info.monitor.rect.height,
-    });
-    if target == game_extent || target.width == 0 || target.height == 0 {
-        return None;
-    }
-    if cfg!(debug_assertions)
-        && std::env::var("TUXSCALING_TEST_FORCE_RESIZE_FAILURE").as_deref() == Ok("1")
-        && existing_lease.is_some()
-    {
-        super::lifetime::restore_surface_window(surface);
-        eprintln!("TuxScaling: injected fullscreen resize failure; using direct presentation");
-        return None;
-    }
-    let now = Instant::now();
-    let mut negotiation = surface_state.negotiation;
-    if negotiation.public_state() == tuxscaling_display::PresentationState::Direct {
-        if !negotiation.request_borderless(target_info.monitor.rect, now)
-            || !negotiation.borderless_requested(now)
-        {
-            return None;
-        }
-        let lease = if let Some(lease) = existing_lease {
-            lease
-        } else {
-            display.promote_borderless(surface_state.window).ok()?
-        };
-        if let Some(surface) = surfaces()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get_mut(&surface)
-        {
-            surface.borderless_lease = Some(lease);
-            surface.negotiation = negotiation;
-        }
-        if debug_test {
-            eprintln!("TuxScaling native negotiation started; waiting for a later boundary");
-        }
-        return None;
-    }
-    if !negotiation.output_recreation_ready() {
-        return None;
-    }
-    let Some(lease) = existing_lease else {
-        return None;
-    };
-    let Some(device_state) = device_state else {
-        super::lifetime::restore_surface_window(surface);
-        return None;
-    };
-    let Some(capabilities) = (unsafe { downstream_surface_capabilities(device_state, surface) })
-    else {
-        super::lifetime::restore_surface_window(surface);
-        return None;
-    };
-    let Ok(observed) = display.describe_window(surface_state.window) else {
-        super::lifetime::restore_surface_window(surface);
-        return None;
-    };
-    let observed_surface = surface_extent(capabilities);
-    let observation_now = Instant::now();
-    if !negotiation.native_observation_is_current(
-        observed.rect,
-        observed.fullscreen,
-        observed_surface,
-        observation_now,
-    ) {
-        if debug_test {
-            eprintln!("TuxScaling virtual output skipped: exact native confirmation unavailable");
-        }
-        super::lifetime::restore_surface_window(surface);
-        return None;
-    }
-    Some((target, ResizedWindow { lease, negotiation }))
+        .copied()?
+        .window;
+    let display = tuxscaling_display::X11Display::connect().ok()?;
+    let target = display.target_for_window(window).ok()?;
+    let target_extent = target.monitor.rect.extent();
+    (target_extent.is_valid()
+        && target_extent != Extent::new(game_extent.width, game_extent.height))
+    .then_some(InitialOutputTarget {
+        window,
+        monitor: target.monitor,
+    })
 }
 
 pub(super) unsafe fn observe_surface_negotiation(
@@ -459,7 +271,216 @@ pub(super) unsafe fn observe_surface_negotiation(
         state = tuxscaling_display::PresentationState::Direct;
     }
     publish_negotiation(surface, negotiation);
+    if negotiation.output_recreation_ready()
+        && unsafe { publish_native_generation(device_state, surface) }
+    {
+        state = tuxscaling_display::PresentationState::Virtualized;
+    }
     state
+}
+
+/// Replaces only the downstream WSI generation after exact X11 and Vulkan
+/// confirmation.  The logical handle, images, extent, and mapping stay in
+/// the state entry throughout this operation.
+pub(super) unsafe fn publish_native_generation(
+    device_state: &DeviceState,
+    surface: vk::SurfaceKHR,
+) -> bool {
+    let state = swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .values()
+        .find(|state| {
+            state
+                .lock()
+                .ok()
+                .is_some_and(|state| state.surface == surface && state.mapping.is_some())
+        })
+        .cloned();
+    let Some(state) = state else {
+        return false;
+    };
+    let display = match tuxscaling_display::X11Display::connect() {
+        Ok(display) => display,
+        Err(_) => {
+            super::lifetime::restore_surface_window(surface);
+            return false;
+        }
+    };
+    let window = match surfaces()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&surface)
+        .copied()
+    {
+        Some(surface) => surface.window,
+        None => return false,
+    };
+    let observed = match display.describe_window(window) {
+        Ok(observed) => observed,
+        Err(_) => {
+            super::lifetime::restore_surface_window(surface);
+            return false;
+        }
+    };
+    let capabilities = match unsafe { downstream_surface_capabilities(device_state, surface) } {
+        Some(capabilities) => capabilities,
+        None => {
+            super::lifetime::restore_surface_window(surface);
+            return false;
+        }
+    };
+    let surface_extent = surface_extent(capabilities);
+    let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
+    if !guard.negotiation.native_observation_is_current(
+        observed.rect,
+        observed.fullscreen,
+        surface_extent,
+        Instant::now(),
+    ) {
+        drop(guard);
+        super::lifetime::restore_surface_window(surface);
+        return false;
+    }
+    if !guard
+        .mapping
+        .as_ref()
+        .is_some_and(crate::mapping::Mapping::is_idle)
+    {
+        return false;
+    }
+    let Some(template) = guard.template.as_ref() else {
+        drop(guard);
+        super::lifetime::restore_surface_window(surface);
+        return false;
+    };
+    let target_extent = vk::Extent2D {
+        width: observed.rect.width,
+        height: observed.rect.height,
+    };
+    if !surface_extent_accepts(surface_extent, target_extent) {
+        drop(guard);
+        super::lifetime::restore_surface_window(surface);
+        return false;
+    }
+    let Some(proc) =
+        (unsafe { device_downstream(device_state.device.handle(), c"vkCreateSwapchainKHR") })
+    else {
+        drop(guard);
+        super::lifetime::restore_surface_window(surface);
+        return false;
+    };
+    let create: vk::PFN_vkCreateSwapchainKHR = unsafe { std::mem::transmute(proc) };
+    let old_physical = guard.physical_handle;
+    let contract_generation = guard.contract.as_ref().map(|contract| {
+        debug_assert!(contract.game_extent().width > 0 && contract.game_extent().height > 0);
+        contract.generation()
+    });
+    let next_generation = contract_generation
+        .map_or(guard.generation, |generation| generation.id())
+        .saturating_add(1);
+    let mut published_negotiation = guard.negotiation;
+    if !published_negotiation.output_recreated(
+        observed.rect,
+        observed.fullscreen,
+        surface_extent,
+        Instant::now(),
+    ) {
+        drop(guard);
+        super::lifetime::restore_surface_window(surface);
+        return false;
+    }
+    let create_info = template.create_info(surface, target_extent, old_physical);
+    let mut new_physical = vk::SwapchainKHR::null();
+    let result = unsafe {
+        create(
+            device_state.device.handle(),
+            &create_info,
+            std::ptr::null(),
+            &mut new_physical,
+        )
+    };
+    if result != vk::Result::SUCCESS || new_physical == vk::SwapchainKHR::null() {
+        drop(guard);
+        super::lifetime::restore_surface_window(surface);
+        return false;
+    }
+    let loader = ash::khr::swapchain::Device::new(&device_state.instance, &device_state.device);
+    let new_images = match unsafe { loader.get_swapchain_images(new_physical) } {
+        Ok(images) => images,
+        Err(_) => {
+            unsafe { loader.destroy_swapchain(new_physical, None) };
+            drop(guard);
+            super::lifetime::restore_surface_window(surface);
+            return false;
+        }
+    };
+    let info = SwapchainInfo {
+        format: template.image_format,
+        color_space: template.image_color_space,
+        extent: target_extent,
+    };
+    if unsafe { guard.overlay.reconfigure_output(info, new_images.clone()) }.is_err() {
+        unsafe { loader.destroy_swapchain(new_physical, None) };
+        drop(guard);
+        super::lifetime::restore_surface_window(surface);
+        return false;
+    }
+    let Some(mapping) = guard.mapping.as_mut() else {
+        unsafe { loader.destroy_swapchain(new_physical, None) };
+        drop(guard);
+        super::lifetime::restore_surface_window(surface);
+        return false;
+    };
+    if !mapping.replace_generation(next_generation) {
+        unsafe { loader.destroy_swapchain(new_physical, None) };
+        drop(guard);
+        super::lifetime::restore_surface_window(surface);
+        return false;
+    }
+    if let Some(contract) = guard.contract.as_mut()
+        && contract
+            .replace_generation(
+                PhysicalGeneration::new(
+                    next_generation,
+                    new_physical,
+                    target_extent,
+                    new_images.len(),
+                ),
+                published_negotiation.public_state(),
+            )
+            .is_err()
+    {
+        unsafe { loader.destroy_swapchain(new_physical, None) };
+        drop(guard);
+        super::lifetime::restore_surface_window(surface);
+        return false;
+    }
+    guard.negotiation = published_negotiation;
+    if let Some(contract) = guard.contract.as_mut() {
+        contract.set_state(published_negotiation.public_state());
+    }
+    guard.physical_handle = new_physical;
+    guard.physical_images = new_images;
+    guard.generation = next_generation;
+    drop(guard);
+    publish_negotiation(surface, published_negotiation);
+    unsafe { loader.destroy_swapchain(old_physical, None) };
+    true
+}
+
+fn surface_extent_accepts(surface: SurfaceExtent, target: vk::Extent2D) -> bool {
+    match surface {
+        SurfaceExtent::Fixed(extent) => {
+            extent.width == target.width && extent.height == target.height
+        }
+        SurfaceExtent::Range { minimum, maximum } => {
+            target.width >= minimum.width
+                && target.width <= maximum.width
+                && target.height >= minimum.height
+                && target.height <= maximum.height
+        }
+    }
 }
 
 unsafe fn has_present_fences(mut next: *const c_void) -> bool {
@@ -1005,21 +1026,14 @@ unsafe fn create_swapchain_inner(
     if !virtual_preflight_eligible {
         super::lifetime::restore_surface_window(original.surface);
     }
-    let mut resized = unsafe {
-        virtual_output_extent(
-            original.surface,
-            original.image_extent,
-            state.as_ref(),
-            virtual_preflight_eligible,
-        )
-    };
-    if let Some((extent, _)) = resized {
-        modified.image_extent = extent;
-        eprintln!(
-            "TuxScaling virtual output requested: game={}x{} output={}x{}",
-            original.image_extent.width, original.image_extent.height, extent.width, extent.height
-        );
-    }
+    // Probe X11 only.  The physical swapchain is intentionally created at
+    // the extent accepted by the surface now; promotion happens only after
+    // the logical token and images have been installed below.
+    let initial_target = initial_output_target(
+        original.surface,
+        original.image_extent,
+        virtual_preflight_eligible,
+    );
     let mut capture_enabled = false;
     if let Some(state) = &state
         && state.overlay_supported
@@ -1044,16 +1058,6 @@ unsafe fn create_swapchain_inner(
         if unsafe { get(state.physical_device, original.surface, &mut caps) } == vk::Result::SUCCESS
             && caps.supported_usage_flags.contains(needed)
         {
-            if let Some((extent, _)) = resized
-                && (extent.width < caps.min_image_extent.width
-                    || extent.height < caps.min_image_extent.height
-                    || extent.width > caps.max_image_extent.width
-                    || extent.height > caps.max_image_extent.height)
-            {
-                resized.take().unwrap().1.restore();
-                modified = driver_original;
-                eprintln!("TuxScaling: physical output extent rejected; using direct presentation");
-            }
             let features = unsafe {
                 state.instance.get_physical_device_format_properties(
                     state.physical_device,
@@ -1069,33 +1073,21 @@ unsafe fn create_swapchain_inner(
             }
         }
     }
-    if resized.is_some() && !capture_enabled {
-        resized.take().unwrap().1.restore();
-        modified = driver_original;
-    }
     let mut result =
         unsafe { create_swapchain(device, &modified, allocation_callbacks, swapchain) };
-    if result != vk::Result::SUCCESS {
-        if let Some((_, resized_window)) = resized.take() {
-            resized_window.restore();
-            modified = driver_original;
-            capture_enabled = false;
-            result = unsafe {
-                create_swapchain(device, &driver_original, allocation_callbacks, swapchain)
-            };
-        } else if capture_enabled && modified.image_usage != original.image_usage {
-            capture_enabled = false;
-            modified = driver_original;
-            result = unsafe {
-                create_swapchain(device, &driver_original, allocation_callbacks, swapchain)
-            };
-        }
+    if result != vk::Result::SUCCESS
+        && capture_enabled
+        && modified.image_usage != original.image_usage
+    {
+        capture_enabled = false;
+        modified = driver_original;
+        result =
+            unsafe { create_swapchain(device, &driver_original, allocation_callbacks, swapchain) };
     }
     if result != vk::Result::SUCCESS {
         super::lifetime::restore_surface_window(original.surface);
         return result;
     }
-    let recovery_window = resized.map(|(_, window)| window);
     let post_result = catch_unwind(AssertUnwindSafe(|| {
         let Some(device_state) = devices()
             .lock()
@@ -1117,121 +1109,44 @@ unsafe fn create_swapchain_inner(
         {
             return result;
         }
-        let mut handle = unsafe { *swapchain };
+        let handle = unsafe { *swapchain };
         eprintln!(
             "TuxScaling swapchain: format={:?} color_space={:?} flags={:?} capture={capture_enabled} usage={:?}",
             original.image_format, original.image_color_space, original.flags, modified.image_usage
         );
-        let mut info = SwapchainInfo {
+        let info = SwapchainInfo {
             format: modified.image_format,
             color_space: modified.image_color_space,
-            extent: modified.image_extent,
+            extent: original.image_extent,
         };
         let loader = ash::khr::swapchain::Device::new(&device_state.instance, &device_state.device);
-        let direct = || DirectSwapchain {
-            create_swapchain,
-            loader: &loader,
-            device,
-            create_info: &driver_original,
-            allocation_callbacks,
-            swapchain,
-            surface: original.surface,
-        };
-        let mut resized_window = resized.map(|(_, window)| window);
-        let mut output_images = match unsafe { loader.get_swapchain_images(handle) } {
+        let output_images = match unsafe { loader.get_swapchain_images(handle) } {
             Ok(images) => images,
-            Err(_) if resized_window.is_some() => {
-                match unsafe { direct().recreate(resized_window.take()) } {
-                    Ok(images) => {
-                        handle = unsafe { *swapchain };
-                        capture_enabled = false;
-                        info = SwapchainInfo {
-                            format: original.image_format,
-                            color_space: original.image_color_space,
-                            extent: original.image_extent,
-                        };
-                        images
-                    }
-                    Err(error) => return error,
-                }
-            }
             Err(_) => return result,
         };
-        if resized_window.as_mut().is_some_and(|window| unsafe {
-            !window.output_recreated(&device_state, original.surface)
-        }) {
-            eprintln!("TuxScaling: native output confirmation failed; using direct presentation");
-            match unsafe { direct().recreate(resized_window.take()) } {
-                Ok(images) => {
-                    handle = unsafe { *swapchain };
-                    output_images = images;
-                    capture_enabled = false;
-                    info = SwapchainInfo {
-                        format: original.image_format,
-                        color_space: original.image_color_space,
-                        extent: original.image_extent,
-                    };
-                }
-                Err(error) => return error,
-            }
-        }
-        let mut virtual_images = None;
-        let mut virtual_window = None;
-        let mut logical_handle = handle;
-        if let Some(resized_window) = resized_window.take() {
-            let virtual_eligible = virtual_preflight_eligible
-                && virtual_swapchain_supported(original)
-                && preallocated_virtual_images.is_some();
-            let virtual_result = if virtual_eligible {
-                preallocated_virtual_images
-                    .take()
-                    .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)
-                    .and_then(|images| {
-                        allocate_logical_swapchain(handle)
-                            .map(|logical| (logical, images))
-                            .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)
-                    })
-            } else {
-                Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
-            };
-            match virtual_result {
-                Ok((logical, images)) => {
-                    surfaces()
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .entry(original.surface)
-                        .and_modify(|surface| {
-                            surface.logical_extent = Some(original.image_extent);
-                            surface.logical_capabilities = logical_capabilities;
-                            surface.negotiation = resized_window.negotiation;
-                            if surface.borderless_lease.is_none() {
-                                surface.borderless_lease = Some(resized_window.lease);
-                            }
-                        });
-                    publish_negotiation(original.surface, resized_window.negotiation);
-                    logical_handle = logical;
-                    virtual_images = Some(images);
-                    virtual_window = Some(resized_window);
-                }
-                Err(error) => {
-                    eprintln!("TuxScaling: virtual swapchain bypassed: {error:?}");
-                    let recreated = unsafe { direct().recreate(Some(resized_window)) };
-                    let Ok(images) = recreated else {
-                        return recreated
-                            .err()
-                            .unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED);
-                    };
-                    output_images = images;
-                    handle = unsafe { *swapchain };
-                    info = SwapchainInfo {
-                        format: original.image_format,
-                        color_space: original.image_color_space,
-                        extent: original.image_extent,
-                    };
-                    capture_enabled = false;
+        let mut virtual_eligible = initial_target.is_some()
+            && virtual_preflight_eligible
+            && virtual_swapchain_supported(original)
+            && preallocated_virtual_images.is_some();
+        // Allocate both logical identity and logical images before the X11
+        // promotion call.  The token is installed on the first create path,
+        // so the application never gets a physical identity during pending.
+        let logical_handle = if virtual_eligible {
+            match allocate_logical_swapchain(handle) {
+                Some(logical) => logical,
+                None => {
+                    virtual_eligible = false;
+                    handle
                 }
             }
-        }
+        } else {
+            handle
+        };
+        let virtual_images = if virtual_eligible {
+            preallocated_virtual_images.take()
+        } else {
+            None
+        };
         let game_images = virtual_images.as_ref().map_or_else(
             || output_images.clone(),
             |images| images.iter().map(|image| image.handle).collect(),
@@ -1251,10 +1166,8 @@ unsafe fn create_swapchain_inner(
             .unwrap_or_else(|error| error.into_inner())
             .get(&original.surface)
             .map(|surface| surface.negotiation);
-        let was_virtual = virtual_window.is_some();
-        let active_negotiation = virtual_window.as_ref().map(|window| window.negotiation);
-        let monitor = virtual_window.as_ref().map(|window| {
-            let rect = window.lease.monitor.rect;
+        let monitor = initial_target.map(|target| {
+            let rect = target.monitor.rect;
             [rect.x, rect.y, rect.width as i32, rect.height as i32]
         });
         let overlay = unsafe {
@@ -1267,7 +1180,7 @@ unsafe fn create_swapchain_inner(
                     images: SwapchainImages {
                         game_images,
                         game_extent,
-                        output_images,
+                        output_images: output_images.clone(),
                     },
                     capture_enabled,
                     vulkan_api_version: device_state.vulkan_api_version,
@@ -1281,53 +1194,121 @@ unsafe fn create_swapchain_inner(
                         })
                         .is_some_and(|target| target.is_fullscreen()),
                     monitor,
+                    temporal_enabled: !virtual_eligible,
                 },
                 device_state.set_loader_data,
             )
         };
-        match overlay {
-            Ok(overlay) => {
-                swapchains()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(
-                        logical_handle,
-                        Arc::new(Mutex::new(SwapchainState {
-                            device,
-                            surface: original.surface,
-                            logical_handle,
-                            physical_handle: handle,
-                            mapping: virtual_images
-                                .as_ref()
-                                .map(|images| Mapping::new(0, images.len())),
-                            negotiation: active_negotiation
-                                .or(persisted_negotiation)
-                                .unwrap_or_else(PresentationNegotiation::direct),
-                            overlay,
-                            virtual_images,
-                        })),
-                    );
-                if was_virtual {
-                    unsafe { *swapchain = logical_handle };
+        let Ok(overlay) = overlay else {
+            eprintln!("TuxScaling: overlay disabled for swapchain");
+            return result;
+        };
+        let template =
+            virtual_eligible.then(|| crate::state::SwapchainTemplate::from_create_info(&modified));
+        let mut negotiation = if virtual_eligible {
+            initial_target.map_or_else(PresentationNegotiation::direct, |_| {
+                let mut negotiation = PresentationNegotiation::direct();
+                let _ = negotiation
+                    .request_borderless(initial_target.unwrap().monitor.rect, Instant::now());
+                negotiation
+            })
+        } else {
+            persisted_negotiation.unwrap_or_else(PresentationNegotiation::direct)
+        };
+        let contract = virtual_images.as_ref().and_then(|images| {
+            LogicalSwapchainContract::new(
+                logical_handle,
+                images.iter().map(|image| image.handle).collect(),
+                original.image_extent,
+                PhysicalGeneration::new(0, handle, info.extent, output_images.len()),
+                negotiation.public_state(),
+            )
+            .ok()
+        });
+        let state = Arc::new(Mutex::new(SwapchainState {
+            device,
+            surface: original.surface,
+            logical_handle,
+            physical_handle: handle,
+            mapping: virtual_images
+                .as_ref()
+                .map(|images| Mapping::new(0, images.len())),
+            negotiation,
+            overlay,
+            virtual_images,
+            physical_images: output_images.clone(),
+            generation: 0,
+            template,
+            contract,
+        }));
+        swapchains()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(logical_handle, state);
+        if virtual_eligible {
+            let target = initial_target.expect("virtual target checked above");
+            let display = match tuxscaling_display::X11Display::connect() {
+                Ok(display) => display,
+                Err(_) => {
+                    if let Some(state) = swapchains()
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .remove(&logical_handle)
+                        && let Ok(state) = Arc::try_unwrap(state)
+                    {
+                        let overlay = state
+                            .into_inner()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .overlay;
+                        unsafe { overlay.destroy(&device_state.device) };
+                    }
+                    return result;
+                }
+            };
+            let lease = match display.promote_borderless(target.window) {
+                Ok(lease) => lease,
+                Err(_) => {
+                    if let Some(state) = swapchains()
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .remove(&logical_handle)
+                        && let Ok(state) = Arc::try_unwrap(state)
+                    {
+                        let overlay = state
+                            .into_inner()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .overlay;
+                        unsafe { overlay.destroy(&device_state.device) };
+                    }
+                    return result;
+                }
+            };
+            let state = swapchains()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&logical_handle)
+                .cloned()
+                .expect("initial virtual state is installed before promotion");
+            negotiation = {
+                let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+                let _ = state.negotiation.borderless_requested(Instant::now());
+                state.negotiation
+            };
+            {
+                let mut surfaces = surfaces().lock().unwrap_or_else(|error| error.into_inner());
+                if let Some(surface) = surfaces.get_mut(&original.surface) {
+                    surface.logical_extent = Some(original.image_extent);
+                    surface.logical_capabilities = logical_capabilities;
+                    surface.negotiation = negotiation;
+                    surface.borderless_lease = Some(lease);
                 }
             }
-            Err(error) if was_virtual => {
-                eprintln!(
-                    "TuxScaling: overlay initialization failed; restoring direct swapchain: {error:?}"
-                );
-                let recreated = unsafe { direct().recreate(virtual_window) };
-                if let Err(error) = recreated {
-                    return error;
-                }
-            }
-            Err(error) => {
-                eprintln!("TuxScaling: overlay disabled for swapchain: {error:?}");
-            }
+            unsafe { *swapchain = logical_handle };
+            publish_negotiation(original.surface, negotiation);
         }
         result
     }));
     if post_result.is_err() {
-        let _ = recovery_window;
         super::lifetime::restore_surface_window(original.surface);
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }

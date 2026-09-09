@@ -79,6 +79,12 @@ pub(crate) struct LogicalSnapshot {
     game_extent: vk::Extent2D,
 }
 
+impl LogicalSnapshot {
+    pub(crate) fn images(&self) -> &[vk::Image] {
+        &self.images
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LogicalSwapchainContract {
     logical: LogicalSnapshot,
@@ -154,6 +160,10 @@ impl LogicalSwapchainContract {
         Ok(())
     }
 
+    pub(crate) fn set_state(&mut self, state: PresentationState) {
+        self.state = state;
+    }
+
     pub(crate) fn bind(&self, binding: FrameBinding) -> Result<FrameBinding, &'static str> {
         if binding.logical_index() as usize >= self.logical.images.len()
             || binding.physical_index() as usize >= self.physical.image_count()
@@ -204,8 +214,9 @@ impl LeaseCleanup {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameBinding, LeaseCleanup, LogicalSwapchainContract, PhysicalGeneration,
-        PresentationPath};
+    use super::{
+        FrameBinding, LeaseCleanup, LogicalSwapchainContract, PhysicalGeneration, PresentationPath,
+    };
     use ash::{vk, vk::Handle};
     use tuxscaling_display::PresentationState;
 
@@ -213,8 +224,19 @@ mod tests {
         vk::Extent2D { width, height }
     }
 
-    fn generation(id: u64, handle: u64, width: u32, height: u32, image_count: usize) -> PhysicalGeneration {
-        PhysicalGeneration::new(id, vk::SwapchainKHR::from_raw(handle), extent(width, height), image_count)
+    fn generation(
+        id: u64,
+        handle: u64,
+        width: u32,
+        height: u32,
+        image_count: usize,
+    ) -> PhysicalGeneration {
+        PhysicalGeneration::new(
+            id,
+            vk::SwapchainKHR::from_raw(handle),
+            extent(width, height),
+            image_count,
+        )
     }
 
     #[test]
@@ -233,7 +255,10 @@ mod tests {
         assert_eq!(contract.handle(), logical_handle);
         assert_eq!(contract.logical_images(), logical_images.as_slice());
         assert_eq!(contract.game_extent(), extent(1280, 720));
-        assert_eq!(contract.presentation_path(), PresentationPath::SpatialBypass);
+        assert_eq!(
+            contract.presentation_path(),
+            PresentationPath::SpatialBypass
+        );
     }
 
     #[test]
@@ -247,8 +272,18 @@ mod tests {
         )
         .unwrap();
 
-        contract.replace_generation(generation(1, 42, 3440, 1408, 3), PresentationState::Negotiating).unwrap();
-        contract.replace_generation(generation(2, 43, 3440, 1440, 3), PresentationState::Virtualized).unwrap();
+        contract
+            .replace_generation(
+                generation(1, 42, 3440, 1408, 3),
+                PresentationState::Negotiating,
+            )
+            .unwrap();
+        contract
+            .replace_generation(
+                generation(2, 43, 3440, 1440, 3),
+                PresentationState::Virtualized,
+            )
+            .unwrap();
 
         assert_eq!(contract.game_extent(), extent(1280, 720));
         assert_eq!(contract.generation().extent(), extent(3440, 1440));
@@ -268,12 +303,20 @@ mod tests {
         .unwrap();
         let before = contract.logical_snapshot();
 
-        contract.replace_generation(generation(1, 62, 3440, 1440, 3), PresentationState::Virtualized).unwrap();
+        contract
+            .replace_generation(
+                generation(1, 62, 3440, 1440, 3),
+                PresentationState::Virtualized,
+            )
+            .unwrap();
 
         assert_eq!(contract.logical_snapshot(), before);
         assert_eq!(contract.handle(), logical_handle);
         assert_eq!(contract.logical_images(), logical_images.as_slice());
-        assert_eq!(contract.bind(FrameBinding::new(1, 2)), Ok(FrameBinding::new(1, 2)));
+        assert_eq!(
+            contract.bind(FrameBinding::new(1, 2)),
+            Ok(FrameBinding::new(1, 2))
+        );
     }
 
     #[test]
@@ -287,7 +330,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(contract.bind(FrameBinding::new(1, 2)), Ok(FrameBinding::new(1, 2)));
+        assert_eq!(
+            contract.bind(FrameBinding::new(1, 2)),
+            Ok(FrameBinding::new(1, 2))
+        );
         assert_eq!(contract.presentation_path(), PresentationPath::Temporal);
     }
 

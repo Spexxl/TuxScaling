@@ -66,11 +66,17 @@ impl Mapping {
         }
     }
 
-    #[allow(dead_code)] // Consumed when Task 3 publishes a replacement generation.
+    #[cfg(test)]
     pub(crate) const fn generation(&self) -> u64 {
         self.generation
     }
 
+    pub(crate) fn is_idle(&self) -> bool {
+        !self.logical_slots.iter().any(Option::is_some)
+            && !self.reserved_slots.iter().any(|reserved| *reserved)
+    }
+
+    #[cfg(test)]
     pub(crate) fn acquire(&mut self, physical_index: u32) -> Result<u32, AcquireError> {
         let logical_index = self.reserve_slot()?;
         if let Err(error) = self.bind_reserved(logical_index, physical_index) {
@@ -147,11 +153,8 @@ impl Mapping {
             .map(|mapped| mapped.index)
     }
 
-    #[allow(dead_code)] // Kept here so publication cannot retain old mappings.
     pub(crate) fn replace_generation(&mut self, generation: u64) -> bool {
-        if self.logical_slots.iter().any(Option::is_some)
-            || self.reserved_slots.iter().any(|reserved| *reserved)
-        {
+        if !self.is_idle() {
             return false;
         }
         self.generation = generation;

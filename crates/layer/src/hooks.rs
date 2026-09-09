@@ -97,9 +97,7 @@ pub(crate) fn virtualization_extension_safe(create_info: &vk::DeviceCreateInfo<'
             return false;
         }
         let name = unsafe { CStr::from_ptr(*name) }.to_bytes();
-        VIRTUALIZATION_SAFE_EXTENSIONS
-            .iter()
-            .any(|extension| name == *extension)
+        VIRTUALIZATION_SAFE_EXTENSIONS.contains(&name)
     })
 }
 

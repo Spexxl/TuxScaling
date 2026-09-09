@@ -83,10 +83,7 @@ impl RuntimeGeneration {
     }
 
     pub fn publish(&mut self, output: OutputGeneration) -> Result<(), GenerationError> {
-        if output.extent().width == 0
-            || output.extent().height == 0
-            || output.image_count() == 0
-        {
+        if output.extent().width == 0 || output.extent().height == 0 || output.image_count() == 0 {
             return Err(GenerationError::Invalid);
         }
         if output.id() <= self.output.id() {
@@ -117,21 +114,40 @@ mod tests {
 
     #[test]
     fn generation_replacement_keeps_logical_contract_and_requests_history_reset() {
-        let mut runtime = RuntimeGeneration::new(extent(1280, 720), 2, OutputGeneration::new(0, extent(1280, 720), 3));
+        let mut runtime = RuntimeGeneration::new(
+            extent(1280, 720),
+            2,
+            OutputGeneration::new(0, extent(1280, 720), 3),
+        );
         let before = runtime.logical_snapshot();
 
-        runtime.publish(OutputGeneration::new(1, extent(3440, 1440), 3)).unwrap();
+        runtime
+            .publish(OutputGeneration::new(1, extent(3440, 1440), 3))
+            .unwrap();
 
         assert_eq!(runtime.logical_snapshot(), before);
-        assert_eq!(runtime.output(), OutputGeneration::new(1, extent(3440, 1440), 3));
+        assert_eq!(
+            runtime.output(),
+            OutputGeneration::new(1, extent(3440, 1440), 3)
+        );
         assert!(runtime.history_reset_requested());
     }
 
     #[test]
     fn pending_generation_uses_spatial_bypass_until_native_publication() {
-        let runtime = RuntimeGeneration::new(extent(1280, 720), 2, OutputGeneration::new(0, extent(1280, 720), 3));
+        let runtime = RuntimeGeneration::new(
+            extent(1280, 720),
+            2,
+            OutputGeneration::new(0, extent(1280, 720), 3),
+        );
 
-        assert_eq!(runtime.dispatch_mode(false), super::DispatchMode::SpatialBypass);
-        assert_eq!(runtime.dispatch_mode(true), super::DispatchMode::TemporalBackend);
+        assert_eq!(
+            runtime.dispatch_mode(false),
+            super::DispatchMode::SpatialBypass
+        );
+        assert_eq!(
+            runtime.dispatch_mode(true),
+            super::DispatchMode::TemporalBackend
+        );
     }
 }

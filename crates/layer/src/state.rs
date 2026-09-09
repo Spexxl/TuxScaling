@@ -7,6 +7,79 @@ use tuxscaling_runtime::{SetLoaderData, SwapchainRuntime as OverlaySwapchain};
 use tuxscaling_vulkan::Image;
 
 use crate::mapping::{LogicalSwapchainHandle, Mapping};
+use crate::recovery::LogicalSwapchainContract;
+
+#[derive(Clone)]
+pub(crate) struct SwapchainTemplate {
+    pub(crate) flags: vk::SwapchainCreateFlagsKHR,
+    pub(crate) min_image_count: u32,
+    pub(crate) image_format: vk::Format,
+    pub(crate) image_color_space: vk::ColorSpaceKHR,
+    pub(crate) image_array_layers: u32,
+    pub(crate) image_usage: vk::ImageUsageFlags,
+    pub(crate) image_sharing_mode: vk::SharingMode,
+    pub(crate) queue_family_indices: Vec<u32>,
+    pub(crate) pre_transform: vk::SurfaceTransformFlagsKHR,
+    pub(crate) composite_alpha: vk::CompositeAlphaFlagsKHR,
+    pub(crate) present_mode: vk::PresentModeKHR,
+    pub(crate) clipped: vk::Bool32,
+}
+
+impl SwapchainTemplate {
+    pub(crate) fn from_create_info(info: &vk::SwapchainCreateInfoKHR<'_>) -> Self {
+        let queue_family_indices = if info.image_sharing_mode == vk::SharingMode::CONCURRENT
+            && !info.p_queue_family_indices.is_null()
+        {
+            unsafe {
+                std::slice::from_raw_parts(
+                    info.p_queue_family_indices,
+                    info.queue_family_index_count as usize,
+                )
+                .to_vec()
+            }
+        } else {
+            Vec::new()
+        };
+        Self {
+            flags: info.flags,
+            min_image_count: info.min_image_count,
+            image_format: info.image_format,
+            image_color_space: info.image_color_space,
+            image_array_layers: info.image_array_layers,
+            image_usage: info.image_usage,
+            image_sharing_mode: info.image_sharing_mode,
+            queue_family_indices,
+            pre_transform: info.pre_transform,
+            composite_alpha: info.composite_alpha,
+            present_mode: info.present_mode,
+            clipped: info.clipped,
+        }
+    }
+
+    pub(crate) fn create_info<'a>(
+        &'a self,
+        surface: vk::SurfaceKHR,
+        extent: vk::Extent2D,
+        old_swapchain: vk::SwapchainKHR,
+    ) -> vk::SwapchainCreateInfoKHR<'a> {
+        vk::SwapchainCreateInfoKHR::default()
+            .flags(self.flags)
+            .surface(surface)
+            .min_image_count(self.min_image_count)
+            .image_format(self.image_format)
+            .image_color_space(self.image_color_space)
+            .image_extent(extent)
+            .image_array_layers(self.image_array_layers)
+            .image_usage(self.image_usage)
+            .image_sharing_mode(self.image_sharing_mode)
+            .queue_family_indices(&self.queue_family_indices)
+            .pre_transform(self.pre_transform)
+            .composite_alpha(self.composite_alpha)
+            .present_mode(self.present_mode)
+            .clipped(self.clipped != 0)
+            .old_swapchain(old_swapchain)
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct X11Surface {
@@ -28,6 +101,10 @@ pub(crate) struct SwapchainState {
     pub(crate) negotiation: tuxscaling_display::PresentationNegotiation,
     pub(crate) overlay: OverlaySwapchain,
     pub(crate) virtual_images: Option<Vec<Image>>,
+    pub(crate) physical_images: Vec<vk::Image>,
+    pub(crate) generation: u64,
+    pub(crate) template: Option<SwapchainTemplate>,
+    pub(crate) contract: Option<LogicalSwapchainContract>,
 }
 
 #[derive(Clone, Copy)]

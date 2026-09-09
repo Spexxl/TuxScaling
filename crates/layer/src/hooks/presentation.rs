@@ -1,5 +1,6 @@
 use super::*;
 use crate::mapping::{LogicalSwapchainHandle, rewrite_present_array};
+use crate::recovery::{FrameBinding, PresentationPath};
 use ash::vk::Handle;
 use std::time::Instant;
 
@@ -198,15 +199,38 @@ unsafe fn submit_overlay(
         if swapchain_state.device != queue_state.device {
             continue;
         }
-        match unsafe {
-            swapchain_state.overlay.prepare_frame(
-                &device_state.device,
-                queue,
-                queue_state.family_index,
-                logical_index,
-                physical_index,
-            )
-        } {
+        if let Some(contract) = swapchain_state.contract.as_ref()
+            && contract
+                .bind(FrameBinding::new(logical_index, physical_index))
+                .is_err()
+        {
+            continue;
+        }
+        let pending_negotiation = swapchain_state.contract.as_ref().is_some_and(|contract| {
+            contract.presentation_path() == PresentationPath::SpatialBypass
+        });
+        let prepared_frame = if pending_negotiation {
+            unsafe {
+                swapchain_state.overlay.prepare_spatial_fallback(
+                    queue,
+                    queue_state.family_index,
+                    logical_index,
+                    physical_index,
+                    vk::Result::NOT_READY,
+                )
+            }
+        } else {
+            unsafe {
+                swapchain_state.overlay.prepare_frame(
+                    &device_state.device,
+                    queue,
+                    queue_state.family_index,
+                    logical_index,
+                    physical_index,
+                )
+            }
+        };
+        match prepared_frame {
             Ok(frame) => prepared.push((state.clone(), frame)),
             Err(error) => match unsafe {
                 swapchain_state.overlay.prepare_spatial_fallback(

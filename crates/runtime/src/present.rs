@@ -1,6 +1,6 @@
 #![allow(clippy::missing_safety_doc)]
 use ash::vk;
-use std::{collections::VecDeque, time::Instant};
+use std::{collections::VecDeque, mem, time::Instant};
 use tuxscaling_capture::Capture;
 use tuxscaling_config::{DebugView, Upscaler};
 use tuxscaling_motion::MotionQuality;
@@ -69,6 +69,9 @@ pub struct SwapchainRuntimeCreateInfo {
     pub window: Option<u64>,
     pub fullscreen: bool,
     pub monitor: Option<[i32; 4]>,
+    /// Temporal reconstruction is withheld while a virtual swapchain is
+    /// negotiating its native physical generation.
+    pub temporal_enabled: bool,
 }
 
 struct Slot {
@@ -497,6 +500,9 @@ pub struct SwapchainRuntime {
     slots: Vec<Slot>,
     queue: Option<vk::Queue>,
     enabled: bool,
+    window: Option<u64>,
+    requested_config: tuxscaling_config::Config,
+    temporal_enabled: bool,
     set_loader_data: Option<SetLoaderData>,
     temporal: TemporalPipeline,
     mode: u32,
@@ -520,6 +526,7 @@ impl SwapchainRuntime {
             window,
             fullscreen,
             monitor,
+            temporal_enabled,
         } = create;
         let config = if let Ok(path) = std::env::var("TUXSCALING_CONFIG") {
             let source = std::fs::read_to_string(path).map_err(|error| {
@@ -538,6 +545,11 @@ impl SwapchainRuntime {
         }
         if !images.is_valid() {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        let requested_config = config.clone();
+        let mut temporal_config = config.clone();
+        if !temporal_enabled {
+            temporal_config.upscaler = Upscaler::Reference;
         }
         let resolution =
             ResolutionPlan::new(images.game_extent, info.extent, config.guidance_scale);
@@ -559,7 +571,7 @@ impl SwapchainRuntime {
                 info,
                 vulkan_api_version,
                 resolution,
-                config: &config,
+                config: &temporal_config,
                 capture_enabled,
                 image_count: images.output_images.len(),
             })
@@ -601,6 +613,9 @@ impl SwapchainRuntime {
             slots: Vec::new(),
             queue: None,
             enabled: true,
+            window,
+            requested_config,
+            temporal_enabled,
             set_loader_data,
             temporal,
             mode,
@@ -670,6 +685,113 @@ impl SwapchainRuntime {
         self.temporal.reset_reason = GuidanceReset::CaptureInterrupted;
         self.temporal.jitter.reset();
         self.diagnostics.reset_reason = reset_name(GuidanceReset::CaptureInterrupted).into();
+    }
+
+    /// Publishes a new physical output generation without changing anything
+    /// the application owns.  The device is idle only for this generation
+    /// boundary; normal frames continue to use per-slot synchronization.
+    pub unsafe fn reconfigure_output(
+        &mut self,
+        info: SwapchainInfo,
+        output_images: Vec<vk::Image>,
+    ) -> Result<(), vk::Result> {
+        if output_images.is_empty() || info.extent.width == 0 || info.extent.height == 0 {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        unsafe { self.device.device_wait_idle() }?;
+
+        let output_views =
+            unsafe { create_output_views(&self.device, &output_images, info.format) }?;
+        let overlay = match unsafe {
+            OverlayRenderer::new(
+                &self.instance,
+                self.physical,
+                &self.device,
+                info,
+                &output_images,
+                self.window,
+            )
+        } {
+            Ok(overlay) => overlay,
+            Err(error) => {
+                for view in output_views {
+                    unsafe { self.device.destroy_image_view(view, None) };
+                }
+                return Err(error);
+            }
+        };
+        let resolution = ResolutionPlan::new(
+            self.temporal.resolution.game_extent,
+            info.extent,
+            self.requested_config.guidance_scale,
+        );
+        let temporal = match unsafe {
+            TemporalPipeline::new(TemporalPipelineDescriptor {
+                instance: &self.instance,
+                physical: self.physical,
+                device: &self.device,
+                info,
+                vulkan_api_version: self.temporal.vulkan_api_version,
+                resolution,
+                config: &self.requested_config,
+                capture_enabled: self.temporal.capture.is_some(),
+                image_count: output_images.len(),
+            })
+        } {
+            Ok(temporal) => temporal,
+            Err(error) => {
+                drop(overlay);
+                for view in output_views {
+                    unsafe { self.device.destroy_image_view(view, None) };
+                }
+                return Err(error);
+            }
+        };
+
+        let old_views = mem::replace(&mut self.output_views, output_views);
+        let old_overlay = self.overlay.replace(overlay);
+        let old_temporal = mem::replace(&mut self.temporal, temporal);
+        let old_query_pool = old_temporal.queries;
+        let old_pool = mem::replace(&mut self.pool, vk::CommandPool::null());
+        let old_slots = mem::take(&mut self.slots);
+        self.queue = None;
+        self.info = info;
+        self.output_images = output_images;
+        self.output_presented = vec![false; self.output_images.len()];
+        self.pending_output = None;
+        self.temporal_enabled = true;
+        self.temporal.reset_history(GuidanceReset::Resize);
+        self.diagnostics.state = "Native generation published; temporal backend ready".into();
+        self.diagnostics.reset_reason = reset_name(GuidanceReset::Resize).into();
+        self.diagnostics.guidance_scale = self.requested_config.guidance_scale;
+        self.diagnostics.upscaler = self.temporal.active_upscaler;
+        self.diagnostics.active_upscaler = self.temporal.active_upscaler;
+        self.diagnostics.game_extent = [
+            self.temporal.resolution.game_extent.width,
+            self.temporal.resolution.game_extent.height,
+        ];
+        self.diagnostics.guidance_extent = [
+            self.temporal.resolution.guidance_extent.width,
+            self.temporal.resolution.guidance_extent.height,
+        ];
+        self.diagnostics.output_extent = [info.extent.width, info.extent.height];
+        self.diagnostics.presentation_mode = "Virtual upscale".into();
+        self.diagnostics.window_mode = "Promoted borderless".into();
+
+        drop(old_overlay);
+        drop(old_temporal);
+        unsafe {
+            for view in old_views {
+                self.device.destroy_image_view(view, None);
+            }
+            for slot in old_slots {
+                self.device.destroy_semaphore(slot.semaphore, None);
+                self.device.destroy_fence(slot.fence, None);
+            }
+            self.device.destroy_command_pool(old_pool, None);
+            self.device.destroy_query_pool(old_query_pool, None);
+        }
+        Ok(())
     }
     pub fn map_damage_rect(&self, rect: vk::Rect2D) -> vk::Rect2D {
         map_damage_rect(

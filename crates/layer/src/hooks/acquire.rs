@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(test)]
 use crate::mapping::Mapping;
 
 fn reject_retired_swapchain(swapchain: vk::SwapchainKHR) -> Result<(), vk::Result> {
@@ -17,10 +18,13 @@ fn virtual_physical_swapchain(
         .unwrap_or_else(|error| error.into_inner())
         .get(&logical)
         .cloned()?;
-    let physical = state
-        .lock()
-        .ok()
-        .and_then(|state| state.mapping.as_ref().map(|_| state.physical_handle))?;
+    let physical = state.lock().ok().and_then(|state| {
+        state
+            .mapping
+            .as_ref()
+            .and_then(|_| state.contract.as_ref().map(|contract| contract.handle()))
+            .map(|_| state.physical_handle)
+    })?;
     Some((state, physical))
 }
 
@@ -84,6 +88,7 @@ fn acquired(result: vk::Result) -> bool {
     matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR)
 }
 
+#[cfg(test)]
 fn map_acquire_result(
     mapping: &mut Mapping,
     result: vk::Result,
@@ -140,9 +145,13 @@ unsafe fn get_swapchain_images_inner(
             state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .virtual_images
+                .contract
                 .as_ref()
-                .map(|images| images.iter().map(|image| image.handle).collect::<Vec<_>>())
+                .map(|contract| {
+                    let snapshot = contract.logical_snapshot();
+                    debug_assert_eq!(contract.logical_images(), snapshot.images());
+                    snapshot.images().to_vec()
+                })
         });
     if let Some(virtual_images) = virtual_images {
         return unsafe { copy_virtual_images(&virtual_images, image_count, images) };
