@@ -73,3 +73,74 @@ workspace: all executed tests passed; GPU- and desktop-dependent tests were igno
 
 - The control plane is intentionally not wired into layer hooks, runtime, overlay, or xtask; that integration belongs to the next task and was excluded by this task's scope.
 - No live X11 or XWayland compositor session was available for a real borderless-promotion test. The X11 desktop-dependent test remains ignored by the workspace test command.
+
+## Fix Round 1
+
+### Status
+
+DONE_WITH_CONCERNS
+
+### Reviewer findings addressed
+
+- `RequestingBorderless` now starts the single five-second monotonic deadline, and that same deadline is carried through `WaitingForNativeExtent` and `RecreatingOutput`. Both an unacknowledged request and stalled output recreation fail with `DeadlineExpired`.
+- `observe` now receives the observed EWMH fullscreen state and requires it alongside exact X11 geometry and accepted downstream extent before entering `RecreatingOutput`.
+- `RecreatingOutput` now revalidates geometry, fullscreen, surface extent acceptance, and the unchanged deadline on every observation and immediately before `Active`. A failed revalidation returns to `WaitingForNativeExtent`; it cannot publish stale dimensions.
+- The existing first-failure-wins behavior remains stable.
+- No Vulkan dependency or out-of-scope crate was added.
+
+### TDD red verification
+
+Tests were changed first to require the corrected API and behaviors. Before the production fix, the focused command failed because the old implementation lacked the deadline-aware request, fullscreen observation, and final revalidation signatures:
+
+```text
+$ cargo test -p tuxscaling-display
+error[E0061]: this method takes 1 argument but 2 arguments were supplied
+error[E0061]: this method takes 3 arguments but 4 arguments were supplied
+error[E0061]: this method takes 0 arguments but 4 arguments were supplied
+error: could not compile `tuxscaling-display` (lib test) due to 30 previous errors
+```
+
+### Covering tests and green output
+
+The fix round added or expanded these focused tests:
+
+- `negotiation_times_out_while_borderless_request_is_unacknowledged`
+- `negotiation_times_out_during_output_recreation`
+- `negotiation_rejects_exact_geometry_with_rejected_surface_extent`
+- `negotiation_accepts_a_surface_extent_range_containing_the_target`
+- `negotiation_requires_ewmh_fullscreen_before_recreation`
+- `negotiation_revalidates_geometry_fullscreen_and_extent_during_recreation`
+- `output_recreation_does_not_activate_with_a_stale_surface_extent`
+
+```text
+$ cargo test -p tuxscaling-display
+running 19 tests
+test result: ok. 19 passed; 0 failed; 0 ignored
+```
+
+Final verification after the code fix:
+
+```text
+$ cargo fmt --all -- --check
+exit 0
+
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+Finished `dev` profile [unoptimized + debuginfo]
+
+$ cargo test --workspace --all-targets --all-features
+display: 19 passed; 0 failed
+workspace: all executed tests passed; GPU- and desktop-dependent tests were ignored as declared
+
+$ git diff --check
+exit 0
+```
+
+### Fix commits
+
+- `fae7296d57a919945138a2be1d4315f68ccdde54 fix: harden display negotiation gates`
+- `6960a7e830240d14045bd99b380536e8c722f65d docs: record display policy task`
+
+### Fix-round concerns
+
+- The state machine remains intentionally unintegrated with layer hooks, runtime, overlay, and xtask until the next task.
+- No live X11 or XWayland compositor validation was available; the deterministic tests cover the policy, but not compositor behavior.
