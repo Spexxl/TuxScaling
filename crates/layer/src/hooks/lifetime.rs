@@ -15,11 +15,23 @@ unsafe fn destroy_swapchain_inner(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&swapchain);
+    if state.is_none() && is_retired_swapchain(swapchain) {
+        return;
+    }
     let physical_swapchain = state
         .as_ref()
         .and_then(|state| state.lock().ok().map(|state| state.physical_handle))
         .unwrap_or(swapchain);
     let _ = catch_unwind(AssertUnwindSafe(|| {
+        if state.as_ref().is_some_and(|state| {
+            state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .mapping
+                .is_some()
+        }) {
+            retire_swapchain(swapchain);
+        }
         let restore_surface = state.as_ref().and_then(|state| {
             let state = state.lock().unwrap_or_else(|e| e.into_inner());
             state.mapping.as_ref().map(|_| state.surface)
@@ -102,8 +114,14 @@ unsafe fn destroy_device_inner(
             let handles = swapchains
                 .iter()
                 .filter_map(|(handle, state)| {
-                    (state.lock().unwrap_or_else(|e| e.into_inner()).device == device)
-                        .then_some(*handle)
+                    let state = state.lock().unwrap_or_else(|e| e.into_inner());
+                    if state.device != device {
+                        return None;
+                    }
+                    if state.mapping.is_some() {
+                        retire_swapchain(*handle);
+                    }
+                    Some(*handle)
                 })
                 .collect::<Vec<_>>();
             handles

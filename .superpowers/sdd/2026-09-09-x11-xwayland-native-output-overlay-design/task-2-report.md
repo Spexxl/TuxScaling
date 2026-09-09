@@ -81,3 +81,110 @@ handle translation and compositor behavior are unit/compile validated only.
 Physical-generation replacement and its runtime-resource reconstruction are
 explicitly deferred to Task 3; its implementation must invoke the already
 provided idle-generation invalidation and tagged-handle collision policy.
+
+## Round 1 review fixes
+
+The review findings were addressed in the layer integration and runtime
+adapter:
+
+1. Creation now performs the Task 1 `PresentationNegotiation` gate after
+   borderless promotion. It observes the exact native X11 `Rect`, EWMH
+   fullscreen state, and downstream fixed/range `SurfaceExtent`, then calls
+   `output_recreated` only when all requirements are accepted. The gate is
+   non-blocking and failure restores the borderless lease and keeps direct
+   swapchain creation; `vkCreateSwapchainKHR` is never blocked waiting for the
+   five-second deadline.
+2. Logical image allocation uses the requested logical count (falling back to
+   the physical count only when the request is zero). Runtime validation now
+   requires both vectors to be non-empty, while logical source selection and
+   physical output/resource selection use their respective indices and counts.
+3. Retired tagged logical tokens are recorded explicitly and return
+   `ERROR_OUT_OF_DATE_KHR` from acquire/present/oldSwapchain translation. They
+   are never treated as raw downstream handles. Destroy translates only active
+   virtual state to its physical handle, then retires the logical token.
+4. Focused hook-level tests cover acquire-to-present translation with distinct
+   logical/physical indices and counts, `SUBOPTIMAL_KHR` and
+   `ERROR_OUT_OF_DATE_KHR`, retired-token rejection, exact negotiation gating,
+   retired oldSwapchain rejection, and independent creation counts.
+
+### Fix-cycle red evidence
+
+Tests were added before their corresponding implementation and were run to
+capture the expected failures. The creation count test initially failed to
+compile:
+
+```text
+$ cargo test -p tuxscaling-layer hooks::creation::tests::creation_keeps_logical_image_count_independent_from_physical_count -- --exact
+error[E0432]: unresolved import `super::logical_image_count`
+    --> crates/layer/src/hooks/creation.rs:1137:32
+     |
+1137 |         confirm_native_output, logical_image_count, translate_old_swapchain,
+     |                                ^^^^^^^^^^^^^^^^^^^ no `logical_image_count` in `hooks::creation`
+error: could not compile `tuxscaling-layer` (lib test) due to 1 previous error
+```
+
+The runtime independence test initially failed at the old equal-count guard:
+
+```text
+$ cargo test -p tuxscaling-runtime present::tests::accepts_independent_logical_and_physical_image_counts -- --exact
+test present::tests::accepts_independent_logical_and_physical_image_counts ... FAILED
+assertion failed: swapchain.is_valid()
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 20 filtered out
+```
+
+The gate and retired-token tests also first failed against missing integration
+helpers, including:
+
+```text
+error[E0432]: unresolved import `super::confirm_native_output`
+    --> crates/layer/src/hooks/creation.rs:1040:17
+     |
+1040 |     use super::{confirm_native_output, virtual_swapchain_supported};
+     |                 ^^^^^^^^^^^^^^^^^^^^^ no `confirm_native_output` in `hooks::creation`
+
+error[E0425]: cannot find function `reject_retired_swapchain` in this scope
+    --> crates/layer/src/hooks/acquire.rs:250:20
+```
+
+### Fix-cycle green evidence
+
+After the minimal implementation, the focused tests passed:
+
+```text
+$ cargo test -p tuxscaling-layer hooks::creation::tests::creation_keeps_logical_image_count_independent_from_physical_count -- --exact
+test hooks::creation::tests::creation_keeps_logical_image_count_independent_from_physical_count ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out
+
+$ cargo test -p tuxscaling-layer hooks::creation::tests::layer_gate_requires_exact_observed_native_output_before_recreation -- --exact
+test hooks::creation::tests::layer_gate_requires_exact_observed_native_output_before_recreation ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out
+
+$ cargo test -p tuxscaling-layer hooks::creation::tests::retired_old_swapchain_is_rejected_instead_of_forwarded -- --exact
+test hooks::creation::tests::retired_old_swapchain_is_rejected_instead_of_forwarded ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out
+
+$ cargo test -p tuxscaling-layer hooks::acquire::tests::hook_acquire_present_round_trip_supports_distinct_indices_and_statuses -- --exact
+test hooks::acquire::tests::hook_acquire_present_round_trip_supports_distinct_indices_and_statuses ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out
+
+$ cargo test -p tuxscaling-layer hooks::acquire::tests::retired_logical_tokens_return_a_safe_error_without_driver_fallback -- --exact
+test hooks::acquire::tests::retired_logical_tokens_return_a_safe_error_without_driver_fallback ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out
+
+$ cargo test -p tuxscaling-layer hooks::presentation::tests::present_hook_rejects_a_retired_logical_token_without_translation_fallback -- --exact
+test hooks::presentation::tests::present_hook_rejects_a_retired_logical_token_without_translation_fallback ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out
+
+$ cargo test -p tuxscaling-runtime present::tests::accepts_independent_logical_and_physical_image_counts -- --exact
+test present::tests::accepts_independent_logical_and_physical_image_counts ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out
+
+$ cargo test -p tuxscaling-runtime present::tests::selects_source_by_logical_index_and_output_by_physical_index -- --exact
+test present::tests::selects_source_by_logical_index_and_output_by_physical_index ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out
+```
+
+The complete focused package runs passed with 25 layer tests and 21 runtime
+tests. Formatting, workspace tests, Clippy with `-D warnings`, and
+`git diff --check` were also run before commit. A real X11/Xwayland WSI run
+remains unavailable in this environment.

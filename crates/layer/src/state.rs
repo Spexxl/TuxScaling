@@ -53,6 +53,8 @@ static DEVICES: OnceLock<Mutex<HashMap<vk::Device, DeviceState>>> = OnceLock::ne
 static QUEUES: OnceLock<Mutex<HashMap<vk::Queue, QueueState>>> = OnceLock::new();
 static SWAPCHAINS: OnceLock<Mutex<HashMap<vk::SwapchainKHR, Arc<Mutex<SwapchainState>>>>> =
     OnceLock::new();
+static RETIRED_SWAPCHAINS: OnceLock<Mutex<std::collections::HashSet<vk::SwapchainKHR>>> =
+    OnceLock::new();
 static SURFACES: OnceLock<Mutex<HashMap<vk::SurfaceKHR, X11Surface>>> = OnceLock::new();
 
 pub(crate) fn instances() -> &'static Mutex<HashMap<vk::Instance, ash::Instance>> {
@@ -75,6 +77,39 @@ pub(crate) fn swapchains() -> &'static Mutex<HashMap<vk::SwapchainKHR, Arc<Mutex
 {
     SWAPCHAINS.get_or_init(|| Mutex::new(HashMap::new()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{is_retired_swapchain, retire_swapchain};
+    use ash::vk;
+    use ash::vk::Handle;
+
+    #[test]
+    fn retired_logical_tokens_are_explicitly_rejected() {
+        let token = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0055);
+
+        assert!(!is_retired_swapchain(token));
+        retire_swapchain(token);
+        assert!(is_retired_swapchain(token));
+    }
+}
+
+pub(crate) fn retire_swapchain(swapchain: vk::SwapchainKHR) {
+    RETIRED_SWAPCHAINS
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(swapchain);
+}
+
+pub(crate) fn is_retired_swapchain(swapchain: vk::SwapchainKHR) -> bool {
+    RETIRED_SWAPCHAINS
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(&swapchain)
+}
+
 pub(crate) fn surfaces() -> &'static Mutex<HashMap<vk::SurfaceKHR, X11Surface>> {
     SURFACES.get_or_init(|| Mutex::new(HashMap::new()))
 }

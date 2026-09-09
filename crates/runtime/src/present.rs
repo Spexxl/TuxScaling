@@ -42,8 +42,23 @@ impl SwapchainImages {
     }
 
     fn is_valid(&self) -> bool {
-        !self.game_images.is_empty() && self.game_images.len() == self.output_images.len()
+        !self.game_images.is_empty() && !self.output_images.is_empty()
     }
+}
+
+fn select_frame_images(
+    game_images: &[vk::Image],
+    output_images: &[vk::Image],
+    logical_index: u32,
+    physical_index: u32,
+) -> Result<(vk::Image, vk::Image), vk::Result> {
+    let game_image = *game_images
+        .get(logical_index as usize)
+        .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
+    let output_image = *output_images
+        .get(physical_index as usize)
+        .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
+    Ok((game_image, output_image))
 }
 
 pub struct SwapchainRuntimeCreateInfo {
@@ -812,10 +827,12 @@ impl SwapchainRuntime {
         if let Some(guidance) = &mut self.temporal.guidance {
             guidance.clear_provider_failure();
         }
-        let game_image = *self
-            .game_images
-            .get(logical_index as usize)
-            .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
+        let (game_image, _) = select_frame_images(
+            &self.game_images,
+            &self.output_images,
+            logical_index,
+            physical_index,
+        )?;
         let index = physical_index as usize;
         let slot = self
             .slots
@@ -1421,10 +1438,12 @@ impl SwapchainRuntime {
         }
         unsafe { self.initialize(queue, family) }?;
         unsafe { self.apply_pending_guidance_scale() }?;
-        let game_image = *self
-            .game_images
-            .get(logical_index as usize)
-            .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
+        let (game_image, _) = select_frame_images(
+            &self.game_images,
+            &self.output_images,
+            logical_index,
+            physical_index,
+        )?;
         let index = physical_index as usize;
         let output_layout = if self.output_presented[index] {
             vk::ImageLayout::PRESENT_SRC_KHR
@@ -1631,9 +1650,44 @@ impl Drop for SwapchainRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        GPU_PHASES, GpuTimingWindow, backend_debug_view, debug_mode_id,
+        GPU_PHASES, GpuTimingWindow, SwapchainImages, backend_debug_view, debug_mode_id,
         record_secondary_transaction,
     };
+    use ash::vk;
+    use ash::vk::Handle;
+
+    #[test]
+    fn accepts_independent_logical_and_physical_image_counts() {
+        let swapchain = SwapchainImages {
+            game_images: vec![vk::Image::from_raw(1), vk::Image::from_raw(2)],
+            game_extent: vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            output_images: vec![
+                vk::Image::from_raw(3),
+                vk::Image::from_raw(4),
+                vk::Image::from_raw(5),
+            ],
+        };
+
+        assert!(swapchain.is_valid());
+    }
+
+    #[test]
+    fn selects_source_by_logical_index_and_output_by_physical_index() {
+        let game_images = [vk::Image::from_raw(11), vk::Image::from_raw(12)];
+        let output_images = [
+            vk::Image::from_raw(21),
+            vk::Image::from_raw(22),
+            vk::Image::from_raw(23),
+        ];
+
+        assert_eq!(
+            super::select_frame_images(&game_images, &output_images, 1, 2),
+            Ok((vk::Image::from_raw(12), vk::Image::from_raw(23)))
+        );
+    }
 
     #[test]
     fn assigns_stable_debug_mode_ids_for_guidance_views() {

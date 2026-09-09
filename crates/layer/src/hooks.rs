@@ -15,7 +15,7 @@ use super::{
     },
     state::{
         DeviceState, QueueState, SwapchainState, X11Surface, devices, instance_api_versions,
-        instances, queues, surfaces, swapchains,
+        instances, is_retired_swapchain, queues, retire_swapchain, surfaces, swapchains,
     },
 };
 

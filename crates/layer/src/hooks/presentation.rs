@@ -31,6 +31,9 @@ unsafe fn translate_present(
     for (logical_handle, logical_index) in swapchain_handles.iter().zip(image_indices) {
         let state = states.get(logical_handle).cloned();
         let Some(state) = state else {
+            if is_retired_swapchain(*logical_handle) {
+                return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
+            }
             translated.swapchains.push(*logical_handle);
             translated.image_indices.push(*logical_index);
             continue;
@@ -428,4 +431,28 @@ pub(super) unsafe extern "system" fn queue_present_khr(
         queue_present_inner(queue, present_info)
     }))
     .unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::translate_present;
+    use crate::state::retire_swapchain;
+    use ash::vk;
+    use ash::vk::Handle;
+
+    #[test]
+    fn present_hook_rejects_a_retired_logical_token_without_translation_fallback() {
+        let token = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0077);
+        retire_swapchain(token);
+        let swapchains = [token];
+        let indices = [0];
+        let info = vk::PresentInfoKHR::default()
+            .swapchains(&swapchains)
+            .image_indices(&indices);
+
+        assert!(matches!(
+            unsafe { translate_present(&info) },
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+        ));
+    }
 }

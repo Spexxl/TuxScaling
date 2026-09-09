@@ -2,10 +2,13 @@ use super::*;
 use crate::mapping::{LogicalSwapchainHandle, Mapping, OldSwapchain};
 use ash::vk::Handle;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+use tuxscaling_display::{Extent, PresentationNegotiation, SurfaceExtent};
 
 #[derive(Clone, Copy)]
 struct ResizedWindow {
     lease: tuxscaling_display::BorderlessLease,
+    negotiation: PresentationNegotiation,
 }
 
 fn virtual_swapchain_supported(info: &vk::SwapchainCreateInfoKHR<'_>) -> bool {
@@ -27,6 +30,11 @@ fn virtual_swapchain_supported(info: &vk::SwapchainCreateInfoKHR<'_>) -> bool {
     true
 }
 
+fn logical_image_count(requested: u32, physical: usize) -> usize {
+    let requested = requested as usize;
+    if requested != 0 { requested } else { physical }
+}
+
 fn clear_surface_virtualization(surface: vk::SurfaceKHR) {
     if let Some(state) = surfaces()
         .lock()
@@ -39,9 +47,9 @@ fn clear_surface_virtualization(surface: vk::SurfaceKHR) {
     }
 }
 
-fn translate_old_swapchain(logical: vk::SwapchainKHR) -> vk::SwapchainKHR {
+fn translate_old_swapchain(logical: vk::SwapchainKHR) -> Result<vk::SwapchainKHR, vk::Result> {
     if logical == vk::SwapchainKHR::null() {
-        return logical;
+        return Ok(logical);
     }
     let handles = swapchains()
         .lock()
@@ -53,12 +61,15 @@ fn translate_old_swapchain(logical: vk::SwapchainKHR) -> vk::SwapchainKHR {
                 .ok()
                 .map(|state| (state.logical_handle, state.physical_handle))
         });
-    handles
+    if handles.is_none() && is_retired_swapchain(logical) {
+        return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
+    }
+    Ok(handles
         .and_then(|(logical, physical)| {
             OldSwapchain::translate(Some(logical.as_raw()), logical.as_raw(), physical.as_raw())
         })
         .map(vk::SwapchainKHR::from_raw)
-        .unwrap_or(logical)
+        .unwrap_or(logical))
 }
 
 fn allocate_logical_swapchain(physical: vk::SwapchainKHR) -> Option<vk::SwapchainKHR> {
@@ -97,6 +108,25 @@ impl ResizedWindow {
         if let Ok(display) = tuxscaling_display::X11Display::connect() {
             let _ = display.restore(self.lease);
         }
+    }
+
+    unsafe fn output_recreated(&mut self, state: &DeviceState, surface: vk::SurfaceKHR) -> bool {
+        let Some(capabilities) = (unsafe { downstream_surface_capabilities(state, surface) })
+        else {
+            return false;
+        };
+        let Ok(display) = tuxscaling_display::X11Display::connect() else {
+            return false;
+        };
+        let Ok(observed) = display.describe_window(self.lease.window) else {
+            return false;
+        };
+        self.negotiation.output_recreated(
+            observed.rect,
+            observed.fullscreen,
+            surface_extent(capabilities),
+            Instant::now(),
+        )
     }
 }
 
@@ -141,9 +171,47 @@ impl DirectSwapchain<'_> {
     }
 }
 
-fn virtual_output_extent(
+unsafe fn downstream_surface_capabilities(
+    state: &DeviceState,
+    surface: vk::SurfaceKHR,
+) -> Option<vk::SurfaceCapabilitiesKHR> {
+    let proc = unsafe {
+        downstream(
+            state.instance.handle(),
+            c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+        )
+    }?;
+    let get: vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR =
+        unsafe { std::mem::transmute(proc) };
+    let mut capabilities = vk::SurfaceCapabilitiesKHR::default();
+    (unsafe { get(state.physical_device, surface, &mut capabilities) } == vk::Result::SUCCESS)
+        .then_some(capabilities)
+}
+
+fn surface_extent(capabilities: vk::SurfaceCapabilitiesKHR) -> SurfaceExtent {
+    if capabilities.current_extent.width != u32::MAX {
+        SurfaceExtent::fixed(Extent::new(
+            capabilities.current_extent.width,
+            capabilities.current_extent.height,
+        ))
+    } else {
+        SurfaceExtent::Range {
+            minimum: Extent::new(
+                capabilities.min_image_extent.width,
+                capabilities.min_image_extent.height,
+            ),
+            maximum: Extent::new(
+                capabilities.max_image_extent.width,
+                capabilities.max_image_extent.height,
+            ),
+        }
+    }
+}
+
+unsafe fn virtual_output_extent(
     surface: vk::SurfaceKHR,
     game_extent: vk::Extent2D,
+    device_state: Option<&DeviceState>,
 ) -> Option<(vk::Extent2D, ResizedWindow)> {
     let debug_test = cfg!(debug_assertions)
         && std::env::var("TUXSCALING_TEST_FORCE_VIRTUAL")
@@ -217,12 +285,47 @@ fn virtual_output_extent(
         eprintln!("TuxScaling: injected fullscreen resize failure; using direct presentation");
         return None;
     }
+    let now = Instant::now();
+    let mut negotiation = PresentationNegotiation::direct();
+    if !negotiation.request_borderless(target_info.monitor.rect, now) {
+        return None;
+    }
     let lease = if let Some(lease) = existing_lease {
         lease
     } else {
         display.promote_borderless(surface_state.window).ok()?
     };
-    Some((target, ResizedWindow { lease }))
+    let resized = ResizedWindow { lease, negotiation };
+    let Some(device_state) = device_state else {
+        resized.restore();
+        return None;
+    };
+    let Some(capabilities) = (unsafe { downstream_surface_capabilities(device_state, surface) })
+    else {
+        resized.restore();
+        return None;
+    };
+    let Ok(observed) = display.describe_window(surface_state.window) else {
+        resized.restore();
+        return None;
+    };
+    let mut resized = resized;
+    if !negotiation.borderless_requested(Instant::now())
+        || !negotiation.observe(
+            observed.rect,
+            observed.fullscreen,
+            surface_extent(capabilities),
+            Instant::now(),
+        )
+    {
+        if debug_test {
+            eprintln!("TuxScaling virtual output skipped: exact native confirmation unavailable");
+        }
+        resized.restore();
+        return None;
+    }
+    resized.negotiation = negotiation;
+    Some((target, resized))
 }
 
 unsafe fn has_present_fences(mut next: *const c_void) -> bool {
@@ -692,8 +795,12 @@ unsafe fn create_swapchain_inner(
         .get(&device)
         .cloned();
     let original = unsafe { &*create_info };
+    let old_swapchain = match translate_old_swapchain(original.old_swapchain) {
+        Ok(swapchain) => swapchain,
+        Err(error) => return error,
+    };
     let mut driver_original = *original;
-    driver_original.old_swapchain = translate_old_swapchain(original.old_swapchain);
+    driver_original.old_swapchain = old_swapchain;
     let mut modified = driver_original;
     let logical_capabilities = state.as_ref().and_then(|state| unsafe {
         let get: vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR =
@@ -705,7 +812,8 @@ unsafe fn create_swapchain_inner(
         (get(state.physical_device, original.surface, &mut caps) == vk::Result::SUCCESS)
             .then_some(caps)
     });
-    let mut resized = virtual_output_extent(original.surface, original.image_extent);
+    let mut resized =
+        unsafe { virtual_output_extent(original.surface, original.image_extent, state.as_ref()) };
     if let Some((extent, _)) = resized {
         modified.image_extent = extent;
         eprintln!(
@@ -748,7 +856,7 @@ unsafe fn create_swapchain_inner(
                     || extent.height > caps.max_image_extent.height)
             {
                 resized.take().unwrap().1.restore();
-                modified = *original;
+                modified = driver_original;
                 eprintln!("TuxScaling: physical output extent rejected; using direct presentation");
             }
             let features = unsafe {
@@ -768,21 +876,21 @@ unsafe fn create_swapchain_inner(
     }
     if resized.is_some() && !capture_enabled {
         resized.take().unwrap().1.restore();
-        modified = *original;
+        modified = driver_original;
     }
     let mut result =
         unsafe { create_swapchain(device, &modified, allocation_callbacks, swapchain) };
     if result != vk::Result::SUCCESS {
         if let Some((_, resized_window)) = resized.take() {
             resized_window.restore();
-            modified = *original;
+            modified = driver_original;
             capture_enabled = false;
             result = unsafe {
                 create_swapchain(device, &driver_original, allocation_callbacks, swapchain)
             };
         } else if capture_enabled && modified.image_usage != original.image_usage {
             capture_enabled = false;
-            modified = *original;
+            modified = driver_original;
             result = unsafe {
                 create_swapchain(device, &driver_original, allocation_callbacks, swapchain)
             };
@@ -853,6 +961,24 @@ unsafe fn create_swapchain_inner(
             }
             Err(_) => return result,
         };
+        if resized_window.as_mut().is_some_and(|window| unsafe {
+            !window.output_recreated(&device_state, original.surface)
+        }) {
+            eprintln!("TuxScaling: native output confirmation failed; using direct presentation");
+            match unsafe { direct().recreate(resized_window.take()) } {
+                Ok(images) => {
+                    handle = unsafe { *swapchain };
+                    output_images = images;
+                    capture_enabled = false;
+                    info = SwapchainInfo {
+                        format: original.image_format,
+                        color_space: original.image_color_space,
+                        extent: original.image_extent,
+                    };
+                }
+                Err(error) => return error,
+            }
+        }
         let mut virtual_images = None;
         let mut virtual_window = None;
         let mut logical_handle = handle;
@@ -865,8 +991,7 @@ unsafe fn create_swapchain_inner(
                         .get_physical_device_memory_properties(device_state.physical_device)
                 };
                 let usage = original.image_usage | needed | vk::ImageUsageFlags::SAMPLED;
-                output_images
-                    .iter()
+                (0..logical_image_count(original.min_image_count, output_images.len()))
                     .map(|_| unsafe {
                         tuxscaling_vulkan::Image::with_sharing(
                             &device_state.device,
@@ -1037,8 +1162,14 @@ pub(super) unsafe extern "system" fn create_swapchain_khr(
 
 #[cfg(test)]
 mod tests {
-    use super::virtual_swapchain_supported;
+    use super::{logical_image_count, translate_old_swapchain, virtual_swapchain_supported};
+    use crate::state::retire_swapchain;
     use ash::vk;
+    use ash::vk::Handle;
+    use std::time::{Duration, Instant};
+    use tuxscaling_display::{
+        Extent, PresentationNegotiation, PresentationState, Rect, SurfaceExtent,
+    };
 
     #[test]
     fn rejects_mutable_format_virtual_swapchains() {
@@ -1071,5 +1202,60 @@ mod tests {
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         assert!(virtual_swapchain_supported(&info));
+    }
+
+    #[test]
+    fn layer_gate_requires_exact_observed_native_output_before_recreation() {
+        let target = Rect::new(-1920, 0, 1920, 1080);
+        let now = Instant::now();
+        let mut negotiation = PresentationNegotiation::direct();
+
+        assert!(negotiation.request_borderless(target, now));
+        assert!(negotiation.borderless_requested(now));
+        assert!(!negotiation.observe(
+            Rect::new(-1920, 0, 1920, 1040),
+            true,
+            SurfaceExtent::fixed(Extent::new(1920, 1040)),
+            now,
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+        assert!(!negotiation.observe(
+            target,
+            false,
+            SurfaceExtent::fixed(Extent::new(1920, 1080)),
+            now + Duration::from_millis(1),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+        assert!(negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::fixed(Extent::new(1920, 1080)),
+            now + Duration::from_millis(2),
+        ));
+        assert!(negotiation.output_recreated(
+            target,
+            true,
+            SurfaceExtent::fixed(Extent::new(1920, 1080)),
+            now + Duration::from_millis(3),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Virtualized);
+    }
+
+    #[test]
+    fn retired_old_swapchain_is_rejected_instead_of_forwarded() {
+        let token = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0088);
+        retire_swapchain(token);
+
+        assert_eq!(
+            translate_old_swapchain(token),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+        );
+    }
+
+    #[test]
+    fn creation_keeps_logical_image_count_independent_from_physical_count() {
+        assert_eq!(logical_image_count(2, 3), 2);
+        assert_eq!(logical_image_count(4, 2), 4);
+        assert_eq!(logical_image_count(0, 3), 3);
     }
 }

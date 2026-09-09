@@ -1,4 +1,13 @@
 use super::*;
+use crate::mapping::Mapping;
+
+fn reject_retired_swapchain(swapchain: vk::SwapchainKHR) -> Result<(), vk::Result> {
+    if is_retired_swapchain(swapchain) {
+        Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+    } else {
+        Ok(())
+    }
+}
 
 fn virtual_physical_swapchain(
     logical: vk::SwapchainKHR,
@@ -26,15 +35,28 @@ fn map_acquired_image(
     let Some(mapping) = state.mapping.as_mut() else {
         return Ok(());
     };
-    let logical = mapping
-        .acquire(unsafe { *image_index })
-        .map_err(|_| vk::Result::ERROR_OUT_OF_DATE_KHR)?;
+    let logical = map_acquire_result(mapping, vk::Result::SUCCESS, unsafe { *image_index })?
+        .expect("successful acquire must produce a logical slot");
     unsafe { *image_index = logical };
     Ok(())
 }
 
 fn acquired(result: vk::Result) -> bool {
     matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR)
+}
+
+fn map_acquire_result(
+    mapping: &mut Mapping,
+    result: vk::Result,
+    physical_index: u32,
+) -> Result<Option<u32>, vk::Result> {
+    if !acquired(result) {
+        return Err(result);
+    }
+    mapping
+        .acquire(physical_index)
+        .map(Some)
+        .map_err(|_| vk::Result::ERROR_OUT_OF_DATE_KHR)
 }
 
 unsafe fn copy_virtual_images(
@@ -65,6 +87,9 @@ unsafe fn get_swapchain_images_inner(
     image_count: *mut u32,
     images: *mut vk::Image,
 ) -> vk::Result {
+    if let Err(error) = reject_retired_swapchain(swapchain) {
+        return error;
+    }
     if image_count.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
@@ -110,6 +135,9 @@ unsafe fn acquire_next_image_inner(
     fence: vk::Fence,
     image_index: *mut u32,
 ) -> vk::Result {
+    if let Err(error) = reject_retired_swapchain(swapchain) {
+        return error;
+    }
     let virtual_swapchain = virtual_physical_swapchain(swapchain);
     let physical_swapchain = virtual_swapchain
         .as_ref()
@@ -160,6 +188,9 @@ unsafe fn acquire_next_image2_inner(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
     let logical_swapchain = unsafe { (*info).swapchain };
+    if let Err(error) = reject_retired_swapchain(logical_swapchain) {
+        return error;
+    }
     let virtual_swapchain = virtual_physical_swapchain(logical_swapchain);
     let mut modified = unsafe { *info };
     if let Some((_, physical)) = &virtual_swapchain {
@@ -192,7 +223,8 @@ pub(super) unsafe extern "system" fn acquire_next_image2_khr(
 
 #[cfg(test)]
 mod tests {
-    use super::copy_virtual_images;
+    use super::{copy_virtual_images, map_acquire_result, reject_retired_swapchain};
+    use crate::state::retire_swapchain;
     use ash::vk;
     use ash::vk::Handle;
 
@@ -239,5 +271,36 @@ mod tests {
         assert_eq!(result, vk::Result::INCOMPLETE);
         assert_eq!(count, 1);
         assert_eq!(destination[0], source[0]);
+    }
+
+    #[test]
+    fn retired_logical_tokens_return_a_safe_error_without_driver_fallback() {
+        use ash::vk::Handle;
+
+        let token = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0066);
+        retire_swapchain(token);
+
+        assert_eq!(
+            reject_retired_swapchain(token),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+        );
+    }
+
+    #[test]
+    fn hook_acquire_present_round_trip_supports_distinct_indices_and_statuses() {
+        use crate::mapping::Mapping;
+
+        let mut mapping = Mapping::new(12, 2);
+        let logical = map_acquire_result(&mut mapping, vk::Result::SUBOPTIMAL_KHR, 4)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(logical, 0);
+        assert_eq!(mapping.resolve(logical), Some(4));
+        assert_eq!(mapping.present(logical), Ok(4));
+        assert_eq!(
+            map_acquire_result(&mut mapping, vk::Result::ERROR_OUT_OF_DATE_KHR, 1),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+        );
     }
 }
