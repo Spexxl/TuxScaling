@@ -120,9 +120,9 @@ pub enum NegotiationFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NegotiationStage {
     Direct,
-    RequestingBorderless { target: Rect },
+    RequestingBorderless { target: Rect, deadline: Instant },
     WaitingForNativeExtent { target: Rect, deadline: Instant },
-    RecreatingOutput { target: Rect },
+    RecreatingOutput { target: Rect, deadline: Instant },
     Active { target: Rect },
     Failed { reason: NegotiationFailure },
 }
@@ -139,39 +139,61 @@ impl PresentationNegotiation {
         }
     }
 
-    pub fn request_borderless(&mut self, target: Rect) -> bool {
+    pub fn request_borderless(&mut self, target: Rect, now: Instant) -> bool {
         if !target.is_valid() || !matches!(self.stage, NegotiationStage::Direct) {
             return false;
         }
-        self.stage = NegotiationStage::RequestingBorderless { target };
-        true
-    }
-
-    pub fn borderless_requested(&mut self, now: Instant) -> bool {
-        let NegotiationStage::RequestingBorderless { target } = self.stage else {
-            return false;
-        };
-        self.stage = NegotiationStage::WaitingForNativeExtent {
+        self.stage = NegotiationStage::RequestingBorderless {
             target,
             deadline: now + NEGOTIATION_TIMEOUT,
         };
         true
     }
 
-    pub fn observe(&mut self, window: Rect, surface: SurfaceExtent, now: Instant) -> bool {
+    pub fn borderless_requested(&mut self, now: Instant) -> bool {
+        let NegotiationStage::RequestingBorderless { target, deadline } = self.stage else {
+            return false;
+        };
+        if now >= deadline {
+            self.fail(NegotiationFailure::DeadlineExpired);
+            return false;
+        }
+        self.stage = NegotiationStage::WaitingForNativeExtent { target, deadline };
+        true
+    }
+
+    pub fn observe(
+        &mut self,
+        window: Rect,
+        fullscreen: bool,
+        surface: SurfaceExtent,
+        now: Instant,
+    ) -> bool {
         match self.stage {
+            NegotiationStage::RequestingBorderless { deadline, .. } => {
+                if now >= deadline {
+                    self.fail(NegotiationFailure::DeadlineExpired);
+                }
+            }
             NegotiationStage::WaitingForNativeExtent { target, deadline } => {
                 if now >= deadline {
                     self.fail(NegotiationFailure::DeadlineExpired);
                     return false;
                 }
-                if window == target && surface.accepts(target.extent()) {
-                    self.stage = NegotiationStage::RecreatingOutput { target };
+                if is_native(target, window, fullscreen, surface) {
+                    self.stage = NegotiationStage::RecreatingOutput { target, deadline };
                     return true;
                 }
             }
+            NegotiationStage::RecreatingOutput { target, deadline } => {
+                if now >= deadline {
+                    self.fail(NegotiationFailure::DeadlineExpired);
+                } else if !is_native(target, window, fullscreen, surface) {
+                    self.stage = NegotiationStage::WaitingForNativeExtent { target, deadline };
+                }
+            }
             NegotiationStage::Active { target }
-                if window != target || !surface.accepts(target.extent()) =>
+                if !is_native(target, window, fullscreen, surface) =>
             {
                 self.stage = NegotiationStage::WaitingForNativeExtent {
                     target,
@@ -183,10 +205,24 @@ impl PresentationNegotiation {
         false
     }
 
-    pub fn output_recreated(&mut self) -> bool {
-        let NegotiationStage::RecreatingOutput { target } = self.stage else {
+    pub fn output_recreated(
+        &mut self,
+        window: Rect,
+        fullscreen: bool,
+        surface: SurfaceExtent,
+        now: Instant,
+    ) -> bool {
+        let NegotiationStage::RecreatingOutput { target, deadline } = self.stage else {
             return false;
         };
+        if now >= deadline {
+            self.fail(NegotiationFailure::DeadlineExpired);
+            return false;
+        }
+        if !is_native(target, window, fullscreen, surface) {
+            self.stage = NegotiationStage::WaitingForNativeExtent { target, deadline };
+            return false;
+        }
         self.stage = NegotiationStage::Active { target };
         true
     }
@@ -214,6 +250,10 @@ impl PresentationNegotiation {
             _ => None,
         }
     }
+}
+
+fn is_native(target: Rect, window: Rect, fullscreen: bool, surface: SurfaceExtent) -> bool {
+    window == target && fullscreen && surface.accepts(target.extent())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -641,11 +681,12 @@ mod tests {
         let mut negotiation = PresentationNegotiation::direct();
         let started = Instant::now();
 
-        negotiation.request_borderless(target);
+        negotiation.request_borderless(target, started);
         negotiation.borderless_requested(started);
         assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
         assert!(!negotiation.observe(
             Rect::new(0, 0, 1920, 1040),
+            true,
             SurfaceExtent::fixed(Extent::new(1920, 1040)),
             started + Duration::from_secs(1),
         ));
@@ -653,12 +694,18 @@ mod tests {
 
         assert!(negotiation.observe(
             target,
+            true,
             SurfaceExtent::fixed(target.extent()),
             started + Duration::from_secs(2),
         ));
         assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
 
-        negotiation.output_recreated();
+        assert!(negotiation.output_recreated(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(2),
+        ));
         assert_eq!(negotiation.public_state(), PresentationState::Virtualized);
     }
 
@@ -668,11 +715,201 @@ mod tests {
         let mut negotiation = PresentationNegotiation::direct();
         let started = Instant::now();
 
-        negotiation.request_borderless(target);
+        negotiation.request_borderless(target, started);
         negotiation.borderless_requested(started);
         assert!(!negotiation.observe(
             Rect::new(0, 0, 1920, 1040),
+            true,
             SurfaceExtent::fixed(Extent::new(1920, 1040)),
+            started + Duration::from_secs(5),
+        ));
+
+        assert_eq!(negotiation.public_state(), PresentationState::Failed);
+        assert_eq!(
+            negotiation.failure(),
+            Some(NegotiationFailure::DeadlineExpired)
+        );
+    }
+
+    #[test]
+    fn negotiation_times_out_while_borderless_request_is_unacknowledged() {
+        let target = Rect::new(0, 0, 1920, 1080);
+        let mut negotiation = PresentationNegotiation::direct();
+        let started = Instant::now();
+
+        negotiation.request_borderless(target, started);
+        assert!(!negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(5),
+        ));
+
+        assert_eq!(negotiation.public_state(), PresentationState::Failed);
+        assert_eq!(
+            negotiation.failure(),
+            Some(NegotiationFailure::DeadlineExpired)
+        );
+    }
+
+    #[test]
+    fn negotiation_rejects_exact_geometry_with_rejected_surface_extent() {
+        let target = Rect::new(0, 0, 1920, 1080);
+        let mut negotiation = PresentationNegotiation::direct();
+        let started = Instant::now();
+
+        negotiation.request_borderless(target, started);
+        negotiation.borderless_requested(started);
+
+        assert!(!negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::fixed(Extent::new(1920, 1040)),
+            started + Duration::from_secs(1),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+    }
+
+    #[test]
+    fn negotiation_accepts_a_surface_extent_range_containing_the_target() {
+        let target = Rect::new(0, 0, 1920, 1080);
+        let mut negotiation = PresentationNegotiation::direct();
+        let started = Instant::now();
+
+        negotiation.request_borderless(target, started);
+        negotiation.borderless_requested(started);
+
+        assert!(negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::Range {
+                minimum: Extent::new(1280, 720),
+                maximum: Extent::new(3840, 2160),
+            },
+            started + Duration::from_secs(1),
+        ));
+        assert!(negotiation.output_recreated(
+            target,
+            true,
+            SurfaceExtent::Range {
+                minimum: Extent::new(1280, 720),
+                maximum: Extent::new(3840, 2160),
+            },
+            started + Duration::from_secs(1),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Virtualized);
+    }
+
+    #[test]
+    fn negotiation_requires_ewmh_fullscreen_before_recreation() {
+        let target = Rect::new(0, 0, 1920, 1080);
+        let mut negotiation = PresentationNegotiation::direct();
+        let started = Instant::now();
+
+        negotiation.request_borderless(target, started);
+        negotiation.borderless_requested(started);
+        assert!(!negotiation.observe(
+            target,
+            false,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(1),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+
+        assert!(negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(2),
+        ));
+    }
+
+    #[test]
+    fn negotiation_revalidates_geometry_fullscreen_and_extent_during_recreation() {
+        let target = Rect::new(-1920, 0, 1920, 1080);
+        let mut negotiation = PresentationNegotiation::direct();
+        let started = Instant::now();
+
+        negotiation.request_borderless(target, started);
+        negotiation.borderless_requested(started);
+        assert!(negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(1),
+        ));
+
+        assert!(!negotiation.observe(
+            target,
+            false,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(2),
+        ));
+        assert!(!negotiation.output_recreated(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(2),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+
+        assert!(negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(3),
+        ));
+        assert!(negotiation.output_recreated(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(3),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Virtualized);
+    }
+
+    #[test]
+    fn output_recreation_does_not_activate_with_a_stale_surface_extent() {
+        let target = Rect::new(0, 0, 1920, 1080);
+        let mut negotiation = PresentationNegotiation::direct();
+        let started = Instant::now();
+
+        negotiation.request_borderless(target, started);
+        negotiation.borderless_requested(started);
+        assert!(negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(1),
+        ));
+
+        assert!(!negotiation.output_recreated(
+            target,
+            true,
+            SurfaceExtent::fixed(Extent::new(1920, 1040)),
+            started + Duration::from_secs(2),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+    }
+
+    #[test]
+    fn negotiation_times_out_during_output_recreation() {
+        let target = Rect::new(0, 0, 1920, 1080);
+        let mut negotiation = PresentationNegotiation::direct();
+        let started = Instant::now();
+
+        negotiation.request_borderless(target, started);
+        negotiation.borderless_requested(started);
+        assert!(negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(1),
+        ));
+        assert!(!negotiation.output_recreated(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
             started + Duration::from_secs(5),
         ));
 
@@ -689,17 +926,24 @@ mod tests {
         let mut negotiation = PresentationNegotiation::direct();
         let started = Instant::now();
 
-        negotiation.request_borderless(target);
+        negotiation.request_borderless(target, started);
         negotiation.borderless_requested(started);
         assert!(negotiation.observe(
             target,
+            true,
             SurfaceExtent::fixed(target.extent()),
             started + Duration::from_secs(1),
         ));
-        negotiation.output_recreated();
+        assert!(negotiation.output_recreated(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(1),
+        ));
 
         assert!(!negotiation.observe(
             Rect::new(-1920, 0, 1920, 1040),
+            true,
             SurfaceExtent::fixed(Extent::new(1920, 1040)),
             started + Duration::from_secs(2),
         ));
@@ -726,7 +970,7 @@ mod tests {
         let mut negotiation = PresentationNegotiation::direct();
 
         assert_eq!(negotiation.public_state(), PresentationState::Direct);
-        negotiation.request_borderless(target);
+        negotiation.request_borderless(target, Instant::now());
         assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
         negotiation.fail(NegotiationFailure::BorderlessRequest);
         assert_eq!(negotiation.public_state(), PresentationState::Failed);
