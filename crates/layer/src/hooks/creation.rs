@@ -131,6 +131,92 @@ fn translate_old_swapchain(logical: vk::SwapchainKHR) -> Result<vk::SwapchainKHR
         .unwrap_or(logical))
 }
 
+#[derive(Clone)]
+struct ActiveLogicalSwapchain {
+    surface: vk::SurfaceKHR,
+    contract: LogicalSwapchainContract,
+    negotiation: PresentationNegotiation,
+}
+
+fn active_logical_swapchain(logical: vk::SwapchainKHR) -> Option<ActiveLogicalSwapchain> {
+    if logical == vk::SwapchainKHR::null() {
+        return None;
+    }
+    swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&logical)
+        .and_then(|state| state.lock().ok())
+        .and_then(|state| {
+            state
+                .contract
+                .clone()
+                .map(|contract| ActiveLogicalSwapchain {
+                    surface: state.surface,
+                    contract,
+                    negotiation: state.negotiation,
+                })
+        })
+}
+
+struct SurfaceRecreationGuard(vk::SurfaceKHR);
+
+impl SurfaceRecreationGuard {
+    fn try_new(surface: vk::SurfaceKHR) -> Option<Self> {
+        crate::state::begin_surface_recreation(surface).then_some(Self(surface))
+    }
+}
+
+impl Drop for SurfaceRecreationGuard {
+    fn drop(&mut self) {
+        crate::state::end_surface_recreation(self.0);
+    }
+}
+
+fn translate_recreation_create_info<'a>(
+    template: &'a crate::state::SwapchainTemplate,
+    logical_info: &vk::SwapchainCreateInfoKHR<'_>,
+    old_contract: &LogicalSwapchainContract,
+    surface: vk::SurfaceKHR,
+    downstream_extent: SurfaceExtent,
+) -> Result<vk::SwapchainCreateInfoKHR<'a>, vk::Result> {
+    if logical_info.old_swapchain != old_contract.handle()
+        || logical_info.image_extent != old_contract.game_extent()
+    {
+        return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
+    }
+    let physical_extent = match downstream_extent {
+        SurfaceExtent::Fixed(extent) => vk::Extent2D {
+            width: extent.width,
+            height: extent.height,
+        },
+        SurfaceExtent::Range { minimum, maximum } => {
+            let current = old_contract.generation().extent();
+            if surface_extent_accepts(downstream_extent, current) {
+                current
+            } else {
+                vk::Extent2D {
+                    width: logical_info
+                        .image_extent
+                        .width
+                        .clamp(minimum.width, maximum.width),
+                    height: logical_info
+                        .image_extent
+                        .height
+                        .clamp(minimum.height, maximum.height),
+                }
+            }
+        }
+    };
+    if physical_extent.width == 0
+        || physical_extent.height == 0
+        || !surface_extent_accepts(downstream_extent, physical_extent)
+    {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
+    Ok(template.create_info(surface, physical_extent, old_contract.generation().handle()))
+}
+
 fn allocate_logical_swapchain(physical: vk::SwapchainKHR) -> Option<vk::SwapchainKHR> {
     static NEXT_LOGICAL_SWAPCHAIN: AtomicU64 = AtomicU64::new(1);
 
@@ -503,6 +589,18 @@ fn surface_extent_accepts(surface: SurfaceExtent, target: vk::Extent2D) -> bool 
                 && target.height <= maximum.height
         }
     }
+}
+
+fn logical_capabilities_for_extent(
+    existing: Option<vk::SurfaceCapabilitiesKHR>,
+    fallback: Option<vk::SurfaceCapabilitiesKHR>,
+    logical_extent: vk::Extent2D,
+) -> Option<vk::SurfaceCapabilitiesKHR> {
+    let mut capabilities = existing.or(fallback)?;
+    capabilities.current_extent = logical_extent;
+    capabilities.min_image_extent = logical_extent;
+    capabilities.max_image_extent = logical_extent;
+    Some(capabilities)
 }
 
 unsafe fn has_present_fences(mut next: *const c_void) -> bool {
@@ -975,6 +1073,24 @@ unsafe fn create_swapchain_inner(
         .get(&device)
         .cloned();
     let original = unsafe { &*create_info };
+    if is_retired_swapchain(original.old_swapchain) {
+        return vk::Result::ERROR_OUT_OF_DATE_KHR;
+    }
+    let old_logical = active_logical_swapchain(original.old_swapchain);
+    if old_logical
+        .as_ref()
+        .is_some_and(|old| old.surface != original.surface)
+    {
+        return vk::Result::ERROR_OUT_OF_DATE_KHR;
+    }
+    let _recreation_guard = if old_logical.is_some() {
+        let Some(guard) = SurfaceRecreationGuard::try_new(original.surface) else {
+            return vk::Result::ERROR_OUT_OF_DATE_KHR;
+        };
+        Some(guard)
+    } else {
+        None
+    };
     let old_swapchain = match translate_old_swapchain(original.old_swapchain) {
         Ok(swapchain) => swapchain,
         Err(error) => return error,
@@ -1051,11 +1167,18 @@ unsafe fn create_swapchain_inner(
     // Probe X11 only.  The physical swapchain is intentionally created at
     // the extent accepted by the surface now; promotion happens only after
     // the logical token and images have been installed below.
-    let initial_target = initial_output_target(
-        original.surface,
-        original.image_extent,
-        virtual_preflight_eligible,
-    );
+    if old_logical.is_some() && !virtual_preflight_eligible {
+        return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+    }
+    let initial_target = if old_logical.is_some() {
+        None
+    } else {
+        initial_output_target(
+            original.surface,
+            original.image_extent,
+            virtual_preflight_eligible,
+        )
+    };
     let mut capture_enabled = false;
     if let Some(state) = &state
         && state.overlay_supported
@@ -1094,6 +1217,32 @@ unsafe fn create_swapchain_inner(
                 capture_enabled = true;
             }
         }
+    }
+    let recreation_template = old_logical
+        .as_ref()
+        .map(|_| crate::state::SwapchainTemplate::from_create_info(&modified));
+    if let Some(old) = old_logical.as_ref() {
+        let Some(device_state) = state.as_ref() else {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        };
+        let Some(capabilities) =
+            (unsafe { downstream_surface_capabilities(device_state, original.surface) })
+        else {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        };
+        let Some(template) = recreation_template.as_ref() else {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        };
+        modified = match translate_recreation_create_info(
+            template,
+            original,
+            &old.contract,
+            original.surface,
+            surface_extent(capabilities),
+        ) {
+            Ok(info) => info,
+            Err(error) => return error,
+        };
     }
     let mut result =
         unsafe { create_swapchain(device, &modified, allocation_callbacks, swapchain) };
@@ -1146,7 +1295,7 @@ unsafe fn create_swapchain_inner(
             Ok(images) => images,
             Err(_) => return result,
         };
-        let mut virtual_eligible = initial_target.is_some()
+        let mut virtual_eligible = (old_logical.is_some() || initial_target.is_some())
             && virtual_preflight_eligible
             && virtual_swapchain_supported(original)
             && preallocated_virtual_images.is_some();
@@ -1227,7 +1376,9 @@ unsafe fn create_swapchain_inner(
         };
         let template =
             virtual_eligible.then(|| crate::state::SwapchainTemplate::from_create_info(&modified));
-        let mut negotiation = if virtual_eligible {
+        let mut negotiation = if let Some(old) = old_logical.as_ref() {
+            old.negotiation
+        } else if virtual_eligible {
             initial_target.map_or_else(PresentationNegotiation::direct, |_| {
                 let mut negotiation = PresentationNegotiation::direct();
                 let _ = negotiation
@@ -1236,6 +1387,20 @@ unsafe fn create_swapchain_inner(
             })
         } else {
             persisted_negotiation.unwrap_or_else(PresentationNegotiation::direct)
+        };
+        let prior_logical_capabilities = surfaces()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&original.surface)
+            .and_then(|surface| surface.logical_capabilities);
+        let advertised_logical_capabilities = if virtual_eligible {
+            logical_capabilities_for_extent(
+                prior_logical_capabilities,
+                logical_capabilities,
+                original.image_extent,
+            )
+        } else {
+            logical_capabilities
         };
         let contract = virtual_images.as_ref().and_then(|images| {
             LogicalSwapchainContract::new(
@@ -1267,6 +1432,12 @@ unsafe fn create_swapchain_inner(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(logical_handle, state);
+        if old_logical.is_some() {
+            // The old application token remains in the table until the
+            // application's destroy call can retire its physical resources,
+            // but it is no longer a valid input to any translated command.
+            retire_swapchain(original.old_swapchain);
+        }
         eprintln!(
             "TuxScaling evidence event=logical_swapchain_created logical_handle=0x{:x} physical_handle=0x{:x} logical={}x{} physical={}x{} virtual={} negotiation={}",
             logical_handle.as_raw(),
@@ -1283,73 +1454,93 @@ unsafe fn create_swapchain_inner(
             },
         );
         if virtual_eligible {
-            let target = initial_target.expect("virtual target checked above");
-            let display = match tuxscaling_display::X11Display::connect() {
-                Ok(display) => display,
-                Err(_) => {
-                    if let Some(state) = swapchains()
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .remove(&logical_handle)
-                        && let Ok(state) = Arc::try_unwrap(state)
-                    {
-                        let overlay = state
-                            .into_inner()
+            if let Some(target) = initial_target {
+                let display = match tuxscaling_display::X11Display::connect() {
+                    Ok(display) => display,
+                    Err(_) => {
+                        if let Some(state) = swapchains()
+                            .lock()
                             .unwrap_or_else(|error| error.into_inner())
-                            .overlay;
-                        unsafe { overlay.destroy(&device_state.device) };
+                            .remove(&logical_handle)
+                            && let Ok(state) = Arc::try_unwrap(state)
+                        {
+                            let overlay = state
+                                .into_inner()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .overlay;
+                            unsafe { overlay.destroy(&device_state.device) };
+                        }
+                        return result;
                     }
-                    return result;
-                }
-            };
-            let lease = match display.promote_borderless(target.window) {
-                Ok(lease) => lease,
-                Err(_) => {
-                    if let Some(state) = swapchains()
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .remove(&logical_handle)
-                        && let Ok(state) = Arc::try_unwrap(state)
-                    {
-                        let overlay = state
-                            .into_inner()
+                };
+                let lease = match display.promote_borderless(target.window) {
+                    Ok(lease) => lease,
+                    Err(_) => {
+                        if let Some(state) = swapchains()
+                            .lock()
                             .unwrap_or_else(|error| error.into_inner())
-                            .overlay;
-                        unsafe { overlay.destroy(&device_state.device) };
+                            .remove(&logical_handle)
+                            && let Ok(state) = Arc::try_unwrap(state)
+                        {
+                            let overlay = state
+                                .into_inner()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .overlay;
+                            unsafe { overlay.destroy(&device_state.device) };
+                        }
+                        return result;
                     }
-                    return result;
+                };
+                let state = swapchains()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(&logical_handle)
+                    .cloned()
+                    .expect("initial virtual state is installed before promotion");
+                negotiation = {
+                    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+                    let _ = state.negotiation.borderless_requested(Instant::now());
+                    state.negotiation
+                };
+                {
+                    let mut surfaces = surfaces().lock().unwrap_or_else(|error| error.into_inner());
+                    if let Some(surface) = surfaces.get_mut(&original.surface) {
+                        surface.logical_extent = Some(original.image_extent);
+                        surface.logical_capabilities = advertised_logical_capabilities;
+                        surface.negotiation = negotiation;
+                        surface.borderless_lease = Some(lease);
+                    }
                 }
-            };
-            let state = swapchains()
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .get(&logical_handle)
-                .cloned()
-                .expect("initial virtual state is installed before promotion");
-            negotiation = {
-                let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-                let _ = state.negotiation.borderless_requested(Instant::now());
-                state.negotiation
-            };
-            {
-                let mut surfaces = surfaces().lock().unwrap_or_else(|error| error.into_inner());
-                if let Some(surface) = surfaces.get_mut(&original.surface) {
-                    surface.logical_extent = Some(original.image_extent);
-                    surface.logical_capabilities = logical_capabilities;
-                    surface.negotiation = negotiation;
-                    surface.borderless_lease = Some(lease);
+                unsafe { *swapchain = logical_handle };
+                publish_negotiation(original.surface, negotiation);
+                eprintln!(
+                    "TuxScaling evidence event=virtual_swapchain_negotiating logical_handle=0x{:x} logical={}x{} physical={}x{}",
+                    logical_handle.as_raw(),
+                    original.image_extent.width,
+                    original.image_extent.height,
+                    info.extent.width,
+                    info.extent.height,
+                );
+            } else {
+                {
+                    let mut surfaces = surfaces().lock().unwrap_or_else(|error| error.into_inner());
+                    if let Some(surface) = surfaces.get_mut(&original.surface) {
+                        surface.logical_extent = Some(original.image_extent);
+                        surface.logical_capabilities = advertised_logical_capabilities;
+                        surface.negotiation = negotiation;
+                    }
                 }
+                unsafe { *swapchain = logical_handle };
+                publish_negotiation(original.surface, negotiation);
+                eprintln!(
+                    "TuxScaling evidence event=logical_swapchain_recreated logical_handle=0x{:x} logical={}x{} physical={}x{}",
+                    logical_handle.as_raw(),
+                    original.image_extent.width,
+                    original.image_extent.height,
+                    info.extent.width,
+                    info.extent.height,
+                );
             }
-            unsafe { *swapchain = logical_handle };
-            publish_negotiation(original.surface, negotiation);
-            eprintln!(
-                "TuxScaling evidence event=virtual_swapchain_negotiating logical_handle=0x{:x} logical={}x{} physical={}x{}",
-                logical_handle.as_raw(),
-                original.image_extent.width,
-                original.image_extent.height,
-                info.extent.width,
-                info.extent.height,
-            );
         }
         result
     }));
@@ -1373,7 +1564,12 @@ pub(super) unsafe extern "system" fn create_swapchain_khr(
 
 #[cfg(test)]
 mod tests {
-    use super::{logical_image_count, translate_old_swapchain, virtual_swapchain_supported};
+    use super::{
+        logical_image_count, translate_old_swapchain, translate_recreation_create_info,
+        virtual_swapchain_supported,
+    };
+    use crate::recovery::{LogicalSwapchainContract, PhysicalGeneration};
+    use crate::state::SwapchainTemplate;
     use crate::state::retire_swapchain;
     use ash::vk;
     use ash::vk::Handle;
@@ -1468,5 +1664,77 @@ mod tests {
         assert_eq!(logical_image_count(2, 3), 2);
         assert_eq!(logical_image_count(4, 2), 4);
         assert_eq!(logical_image_count(0, 3), 3);
+    }
+
+    #[test]
+    fn recreation_hook_translates_physical_extent_and_preserves_new_logical_contract() {
+        let surface = vk::SurfaceKHR::from_raw(0x9001);
+        let old_logical = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0101);
+        let new_logical = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0102);
+        let logical_images = vec![vk::Image::from_raw(0x101), vk::Image::from_raw(0x102)];
+        let new_logical_images = vec![vk::Image::from_raw(0x201), vk::Image::from_raw(0x202)];
+        let old_physical = vk::SwapchainKHR::from_raw(0x301);
+        let new_physical = vk::SwapchainKHR::from_raw(0x302);
+        let logical_extent = vk::Extent2D {
+            width: 1280,
+            height: 720,
+        };
+        let native_extent = tuxscaling_display::Extent::new(3440, 1440);
+        let info = vk::SwapchainCreateInfoKHR::default()
+            .surface(surface)
+            .min_image_count(2)
+            .image_format(vk::Format::B8G8R8A8_UNORM)
+            .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
+            .image_extent(logical_extent)
+            .image_array_layers(1)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .present_mode(vk::PresentModeKHR::FIFO)
+            .clipped(true)
+            .old_swapchain(old_logical);
+        let old_contract = LogicalSwapchainContract::new(
+            old_logical,
+            logical_images,
+            logical_extent,
+            PhysicalGeneration::new(0, old_physical, logical_extent, 2),
+            PresentationState::Virtualized,
+        )
+        .unwrap();
+        let template = SwapchainTemplate::from_create_info(&info);
+
+        let physical_info = translate_recreation_create_info(
+            &template,
+            &info,
+            &old_contract,
+            surface,
+            SurfaceExtent::fixed(native_extent),
+        )
+        .unwrap();
+
+        let mut downstream_recorder = Vec::new();
+        downstream_recorder.push((physical_info.image_extent, physical_info.old_swapchain));
+        let (recorded_extent, recorded_old_swapchain) = downstream_recorder[0];
+        let new_contract = LogicalSwapchainContract::new(
+            new_logical,
+            new_logical_images.clone(),
+            logical_extent,
+            PhysicalGeneration::new(1, new_physical, recorded_extent, 3),
+            PresentationState::Virtualized,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recorded_extent,
+            vk::Extent2D {
+                width: 3440,
+                height: 1440,
+            }
+        );
+        assert_eq!(recorded_old_swapchain, old_physical);
+        assert_eq!(new_contract.handle(), new_logical);
+        assert_eq!(new_contract.logical_images(), new_logical_images.as_slice());
+        assert_eq!(new_contract.game_extent(), logical_extent);
     }
 }

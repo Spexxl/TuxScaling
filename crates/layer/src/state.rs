@@ -138,6 +138,8 @@ static SWAPCHAINS: OnceLock<Mutex<HashMap<vk::SwapchainKHR, Arc<Mutex<SwapchainS
 static RETIRED_SWAPCHAINS: OnceLock<Mutex<std::collections::HashSet<vk::SwapchainKHR>>> =
     OnceLock::new();
 static SURFACES: OnceLock<Mutex<HashMap<vk::SurfaceKHR, X11Surface>>> = OnceLock::new();
+static RECREATING_SURFACES: OnceLock<Mutex<std::collections::HashSet<vk::SurfaceKHR>>> =
+    OnceLock::new();
 
 pub(crate) fn instances() -> &'static Mutex<HashMap<vk::Instance, ash::Instance>> {
     INSTANCES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -203,6 +205,23 @@ pub(crate) fn is_unknown_logical_swapchain(swapchain: vk::SwapchainKHR) -> bool 
 pub(crate) fn surfaces() -> &'static Mutex<HashMap<vk::SurfaceKHR, X11Surface>> {
     SURFACES.get_or_init(|| Mutex::new(HashMap::new()))
 }
+
+pub(crate) fn begin_surface_recreation(surface: vk::SurfaceKHR) -> bool {
+    RECREATING_SURFACES
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(surface)
+}
+
+pub(crate) fn end_surface_recreation(surface: vk::SurfaceKHR) {
+    RECREATING_SURFACES
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&surface);
+}
+
 pub(crate) fn instance_dispatch()
 -> &'static Mutex<HashMap<vk::Instance, vk::PFN_vkGetInstanceProcAddr>> {
     static DISPATCH: OnceLock<Mutex<HashMap<vk::Instance, vk::PFN_vkGetInstanceProcAddr>>> =

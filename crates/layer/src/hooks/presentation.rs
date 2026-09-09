@@ -33,6 +33,9 @@ unsafe fn translate_present(
     };
     let mut changed = false;
     for (logical_handle, logical_index) in swapchain_handles.iter().zip(image_indices) {
+        if is_retired_swapchain(*logical_handle) {
+            return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
+        }
         let state = states.get(logical_handle).cloned();
         let Some(state) = state else {
             if is_retired_swapchain(*logical_handle)
