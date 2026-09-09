@@ -317,3 +317,41 @@ $ git diff --check
 ```
 
 Live X11/XWayland WSI and ICD-driver behavior were not run in this cycle.
+
+## Task 2 review cycle 5: final planned review fixes
+
+- Full-screen-exclusive acquire/release entry points are intercepted. Known
+  swapchain/presentation extension entry points remain layer wrappers: direct
+  and ineligible untagged swapchains are forwarded to the downstream function,
+  while active virtual and unknown/retired tagged handles are rejected before
+  driver dispatch. `VK_EXT_full_screen_exclusive`, present-wait, GOOGLE timing,
+  display-control, HDR metadata, shared-presentable-image, and swapchain
+  maintenance extensions make device virtualization ineligible because their
+  complete virtual translation is not implemented.
+- `virtual_output_extent` now restores and clears an existing lease and
+  negotiation whenever preflight is false. Logical image resources are
+  allocated before the borderless request; the allocation count must be known
+  and every allocation must succeed before promotion is attempted. Any later
+  physical creation or overlay failure still uses the existing direct
+  recreation/lease rollback path.
+- Acquire reserves the logical slot before calling downstream. Exhausted
+  logical mappings return before the driver, failed downstream results cancel
+  the reservation, and a post-acquire bind failure attempts
+  `vkReleaseSwapchainImagesEXT` when the downstream WSI exposes that safe
+  release operation. The mapping test covers unequal counts and proves the
+  exhausted path makes no downstream acquire attempt.
+
+### Cycle 5 verification
+
+```text
+$ cargo fmt --all
+$ cargo test -p tuxscaling-layer --lib
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Focused dispatch tests cover both full-screen-exclusive entry points rejecting
+an unknown tagged token, all known extension names resolving to safe layer
+dispatch, and enabled full-screen-exclusive support disabling virtualization
+pre-promotion. The lease cleanup and preflight behavior are covered by the
+existing deterministic fail-open cleanup test. No live X11/XWayland or ICD
+driver run was available.

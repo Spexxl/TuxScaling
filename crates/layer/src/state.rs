@@ -40,6 +40,9 @@ pub(crate) struct QueueState {
 #[derive(Clone)]
 pub(crate) struct DeviceState {
     pub(crate) overlay_supported: bool,
+    /// Virtualization is disabled when an enabled swapchain extension has no
+    /// complete logical-to-physical translation in this Task 2 layer.
+    pub(crate) virtualization_extension_safe: bool,
     pub(crate) vulkan_api_version: u32,
     pub(crate) queue_families: Vec<vk::QueueFamilyProperties>,
     pub(crate) set_loader_data: Option<SetLoaderData>,

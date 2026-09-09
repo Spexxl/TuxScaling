@@ -64,6 +64,22 @@ fn cancel_reserved_image(state: &Arc<Mutex<SwapchainState>>, logical_index: Opti
     }
 }
 
+unsafe fn release_acquired_physical_image(
+    device: vk::Device,
+    physical_swapchain: vk::SwapchainKHR,
+    physical_index: u32,
+) -> bool {
+    let Some(proc) = (unsafe { device_downstream(device, c"vkReleaseSwapchainImagesEXT") }) else {
+        return false;
+    };
+    let release: vk::PFN_vkReleaseSwapchainImagesEXT = unsafe { std::mem::transmute(proc) };
+    let indices = [physical_index];
+    let info = vk::ReleaseSwapchainImagesInfoEXT::default()
+        .swapchain(physical_swapchain)
+        .image_indices(&indices);
+    unsafe { release(device, &info) == vk::Result::SUCCESS }
+}
+
 fn acquired(result: vk::Result) -> bool {
     matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR)
 }
@@ -199,6 +215,14 @@ unsafe fn acquire_next_image_inner(
                 && let Err(error) = map_acquired_image(&state, logical_index, image_index)
             {
                 cancel_reserved_image(&state, Some(logical_index));
+                let physical_index = unsafe { *image_index };
+                if !unsafe {
+                    release_acquired_physical_image(device, physical_swapchain, physical_index)
+                } {
+                    eprintln!(
+                        "TuxScaling: failed to bind acquired physical image; downstream WSI did not expose a safe release path"
+                    );
+                }
                 return error;
             }
         } else {
@@ -264,6 +288,14 @@ unsafe fn acquire_next_image2_inner(
                 && let Err(error) = map_acquired_image(&state, logical_index, image_index)
             {
                 cancel_reserved_image(&state, Some(logical_index));
+                let physical_index = unsafe { *image_index };
+                if !unsafe {
+                    release_acquired_physical_image(device, modified.swapchain, physical_index)
+                } {
+                    eprintln!(
+                        "TuxScaling: failed to bind acquired physical image; downstream WSI did not expose a safe release path"
+                    );
+                }
                 return error;
             }
         } else {

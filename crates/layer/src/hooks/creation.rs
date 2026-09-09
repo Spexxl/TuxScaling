@@ -35,6 +35,51 @@ fn logical_image_count(requested: u32, physical: usize) -> usize {
     if requested != 0 { requested } else { physical }
 }
 
+fn preflight_logical_image_count(requested: u32) -> Option<usize> {
+    let count = requested as usize;
+    (count != 0).then_some(count)
+}
+
+unsafe fn allocate_logical_images(
+    state: &DeviceState,
+    info: &vk::SwapchainCreateInfoKHR<'_>,
+    count: usize,
+) -> Result<Vec<tuxscaling_vulkan::Image>, vk::Result> {
+    let memory = unsafe {
+        state
+            .instance
+            .get_physical_device_memory_properties(state.physical_device)
+    };
+    let usage = info.image_usage
+        | vk::ImageUsageFlags::TRANSFER_SRC
+        | vk::ImageUsageFlags::TRANSFER_DST
+        | vk::ImageUsageFlags::COLOR_ATTACHMENT
+        | vk::ImageUsageFlags::STORAGE
+        | vk::ImageUsageFlags::SAMPLED;
+    let queue_families = if info.image_sharing_mode == vk::SharingMode::CONCURRENT {
+        unsafe {
+            std::slice::from_raw_parts(
+                info.p_queue_family_indices,
+                info.queue_family_index_count as usize,
+            )
+        }
+    } else {
+        &[]
+    };
+    (0..count)
+        .map(|_| unsafe {
+            tuxscaling_vulkan::Image::with_sharing(
+                &state.device,
+                &memory,
+                info.image_extent,
+                info.image_format,
+                usage,
+                queue_families,
+            )
+        })
+        .collect()
+}
+
 fn clear_surface_virtualization(surface: vk::SurfaceKHR) {
     if let Some(state) = surfaces()
         .lock()
@@ -251,6 +296,7 @@ unsafe fn virtual_output_extent(
         );
     }
     if !preflight_eligible {
+        super::lifetime::restore_surface_window(surface);
         return None;
     }
     let config = if let Ok(path) = std::env::var("TUXSCALING_CONFIG") {
@@ -740,6 +786,9 @@ unsafe fn create_device_inner(
             unsafe { *device },
             DeviceState {
                 overlay_supported: !unsafe { has_present_fences((*create_info).p_next) },
+                virtualization_extension_safe: super::virtualization_extension_safe(unsafe {
+                    &*create_info
+                }),
                 vulkan_api_version,
                 queue_families: unsafe {
                     instance.get_physical_device_queue_family_properties(physical_device)
@@ -904,8 +953,9 @@ unsafe fn create_swapchain_inner(
         | vk::ImageUsageFlags::TRANSFER_DST
         | vk::ImageUsageFlags::COLOR_ATTACHMENT
         | vk::ImageUsageFlags::STORAGE;
-    let virtual_preflight_eligible = state.as_ref().is_some_and(|state| {
+    let mut virtual_preflight_eligible = state.as_ref().is_some_and(|state| {
         state.overlay_supported
+            && state.virtualization_extension_safe
             && virtual_swapchain_supported(original)
             && tuxscaling_capture::supported_format(
                 original.image_format,
@@ -932,6 +982,29 @@ unsafe fn create_swapchain_inner(
                     )
             })
     });
+    let mut preallocated_virtual_images = None;
+    if virtual_preflight_eligible {
+        if let Some(count) = preflight_logical_image_count(original.min_image_count) {
+            match unsafe {
+                allocate_logical_images(
+                    state.as_ref().expect("eligible state must exist"),
+                    original,
+                    count,
+                )
+            } {
+                Ok(images) => preallocated_virtual_images = Some(images),
+                Err(error) => {
+                    eprintln!("TuxScaling: logical image preflight failed: {error:?}");
+                    virtual_preflight_eligible = false;
+                }
+            }
+        } else {
+            virtual_preflight_eligible = false;
+        }
+    }
+    if !virtual_preflight_eligible {
+        super::lifetime::restore_surface_window(original.surface);
+    }
     let mut resized = unsafe {
         virtual_output_extent(
             original.surface,
@@ -1106,33 +1179,13 @@ unsafe fn create_swapchain_inner(
         let mut virtual_window = None;
         let mut logical_handle = handle;
         if let Some(resized_window) = resized_window.take() {
-            let virtual_eligible = virtual_swapchain_supported(original);
+            let virtual_eligible = virtual_preflight_eligible
+                && virtual_swapchain_supported(original)
+                && preallocated_virtual_images.is_some();
             let virtual_result = if virtual_eligible {
-                let memory = unsafe {
-                    device_state
-                        .instance
-                        .get_physical_device_memory_properties(device_state.physical_device)
-                };
-                let usage = original.image_usage | needed | vk::ImageUsageFlags::SAMPLED;
-                (0..logical_image_count(original.min_image_count, output_images.len()))
-                    .map(|_| unsafe {
-                        tuxscaling_vulkan::Image::with_sharing(
-                            &device_state.device,
-                            &memory,
-                            original.image_extent,
-                            original.image_format,
-                            usage,
-                            if original.image_sharing_mode == vk::SharingMode::CONCURRENT {
-                                std::slice::from_raw_parts(
-                                    original.p_queue_family_indices,
-                                    original.queue_family_index_count as usize,
-                                )
-                            } else {
-                                &[]
-                            },
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()
+                preallocated_virtual_images
+                    .take()
+                    .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)
                     .and_then(|images| {
                         allocate_logical_swapchain(handle)
                             .map(|logical| (logical, images))
