@@ -1,0 +1,260 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcquireError {
+    PhysicalBusy,
+    NoLogicalSlot,
+}
+
+/// Application-visible swapchain keys live in a tagged namespace.  Vulkan
+/// never dereferences non-dispatchable handles; the layer resolves this token
+/// before every downstream call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LogicalSwapchainHandle(u64);
+
+impl LogicalSwapchainHandle {
+    const TAG: u64 = 1 << 63;
+    const PAYLOAD: u64 = !Self::TAG;
+
+    pub(crate) const fn from_counter(counter: u64) -> Self {
+        Self(Self::TAG | (counter & Self::PAYLOAD))
+    }
+
+    pub(crate) const fn from_raw(raw: u64) -> Option<Self> {
+        if (raw & Self::TAG != 0) && raw != Self::TAG {
+            Some(Self(raw))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) const fn is_reserved(raw: u64) -> bool {
+        Self::from_raw(raw).is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresentError {
+    UnknownLogicalSlot,
+    LogicalSlotIdle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PhysicalImage {
+    generation: u64,
+    index: u32,
+}
+
+/// Maps application-visible image slots to the images acquired from the
+/// current downstream swapchain generation.  It deliberately contains no
+/// Vulkan handles, so the ownership policy is deterministic and testable.
+#[derive(Debug, Clone)]
+pub(crate) struct Mapping {
+    generation: u64,
+    logical_slots: Vec<Option<PhysicalImage>>,
+}
+
+impl Mapping {
+    pub(crate) fn new(generation: u64, logical_image_count: usize) -> Self {
+        Self {
+            generation,
+            logical_slots: vec![None; logical_image_count],
+        }
+    }
+
+    #[allow(dead_code)] // Consumed when Task 3 publishes a replacement generation.
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn acquire(&mut self, physical_index: u32) -> Result<u32, AcquireError> {
+        if self
+            .logical_slots
+            .iter()
+            .flatten()
+            .any(|mapped| mapped.generation == self.generation && mapped.index == physical_index)
+        {
+            return Err(AcquireError::PhysicalBusy);
+        }
+        let Some((logical_index, slot)) = self
+            .logical_slots
+            .iter_mut()
+            .enumerate()
+            .find(|(_, slot)| slot.is_none())
+        else {
+            return Err(AcquireError::NoLogicalSlot);
+        };
+        *slot = Some(PhysicalImage {
+            generation: self.generation,
+            index: physical_index,
+        });
+        Ok(logical_index as u32)
+    }
+
+    pub(crate) fn present(&mut self, logical_index: u32) -> Result<u32, PresentError> {
+        let Some(slot) = self.logical_slots.get_mut(logical_index as usize) else {
+            return Err(PresentError::UnknownLogicalSlot);
+        };
+        let Some(mapped) = slot.take() else {
+            return Err(PresentError::LogicalSlotIdle);
+        };
+        if mapped.generation != self.generation {
+            return Err(PresentError::LogicalSlotIdle);
+        }
+        Ok(mapped.index)
+    }
+
+    pub(crate) fn resolve(&self, logical_index: u32) -> Option<u32> {
+        self.logical_slots
+            .get(logical_index as usize)
+            .and_then(|slot| *slot)
+            .filter(|mapped| mapped.generation == self.generation)
+            .map(|mapped| mapped.index)
+    }
+
+    #[allow(dead_code)] // Kept here so publication cannot retain old mappings.
+    pub(crate) fn replace_generation(&mut self, generation: u64) -> bool {
+        if self.logical_slots.iter().any(Option::is_some) {
+            return false;
+        }
+        self.generation = generation;
+        true
+    }
+
+    #[allow(dead_code)] // Used by the preflight path and directly covered here.
+    pub(crate) fn direct_fallback(preflight_succeeded: bool, virtualized: bool) -> bool {
+        !preflight_succeeded || !virtualized
+    }
+}
+
+pub(crate) struct OldSwapchain;
+
+impl OldSwapchain {
+    pub(crate) const fn translate(
+        requested: Option<u64>,
+        logical: u64,
+        current_physical: u64,
+    ) -> Option<u64> {
+        match requested {
+            Some(handle) if handle == logical => Some(current_physical),
+            other => other,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AcquireError, LogicalSwapchainHandle, Mapping, OldSwapchain};
+
+    #[test]
+    fn assigns_and_releases_logical_slots_for_physical_images() {
+        let mut mapping = Mapping::new(7, 3);
+
+        assert_eq!(mapping.acquire(2), Ok(0));
+        assert_eq!(mapping.acquire(0), Ok(1));
+        assert_eq!(mapping.present(0), Ok(2));
+        assert_eq!(mapping.acquire(1), Ok(0));
+        assert_eq!(mapping.present(1), Ok(0));
+    }
+
+    #[test]
+    fn rejects_a_second_mapping_for_an_acquired_physical_image() {
+        let mut mapping = Mapping::new(1, 2);
+
+        assert_eq!(mapping.acquire(3), Ok(0));
+        assert_eq!(mapping.acquire(3), Err(AcquireError::PhysicalBusy));
+    }
+
+    #[test]
+    fn invalidates_mappings_only_when_the_generation_is_idle() {
+        let mut mapping = Mapping::new(4, 2);
+        assert_eq!(mapping.acquire(0), Ok(0));
+
+        assert!(!mapping.replace_generation(5));
+        assert_eq!(mapping.present(0), Ok(0));
+        assert!(mapping.replace_generation(5));
+        assert_eq!(mapping.generation(), 5);
+        assert_eq!(mapping.resolve(0), None);
+    }
+
+    #[test]
+    fn maps_different_logical_and_physical_image_counts() {
+        let mut mapping = Mapping::new(9, 3);
+
+        assert_eq!(mapping.acquire(5), Ok(0));
+        assert_eq!(mapping.acquire(1), Ok(1));
+        assert_eq!(mapping.acquire(3), Ok(2));
+        assert_eq!(mapping.present(1), Ok(1));
+        assert_eq!(mapping.acquire(0), Ok(1));
+    }
+
+    #[test]
+    fn exact_native_confirmation_requires_recreation_before_virtualization() {
+        use std::time::{Duration, Instant};
+        use tuxscaling_display::{
+            Extent, PresentationNegotiation, PresentationState, Rect, SurfaceExtent,
+        };
+
+        let target = Rect::new(-1920, 0, 1920, 1080);
+        let now = Instant::now();
+        let mut negotiation = PresentationNegotiation::direct();
+        assert!(negotiation.request_borderless(target, now));
+        assert!(negotiation.borderless_requested(now));
+
+        assert!(!negotiation.observe(
+            Rect::new(-1920, 0, 1920, 1040),
+            true,
+            SurfaceExtent::fixed(Extent::new(1920, 1040)),
+            now + Duration::from_millis(1),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+        assert!(negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::fixed(Extent::new(1920, 1080)),
+            now + Duration::from_millis(2),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+        assert!(negotiation.output_recreated(
+            target,
+            true,
+            SurfaceExtent::fixed(Extent::new(1920, 1080)),
+            now + Duration::from_millis(3),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Virtualized);
+    }
+
+    #[test]
+    fn translates_a_logical_old_swapchain_to_its_current_physical_handle() {
+        let current_physical = 91;
+
+        assert_eq!(
+            OldSwapchain::translate(Some(42), 42, current_physical),
+            Some(current_physical)
+        );
+        assert_eq!(
+            OldSwapchain::translate(Some(77), 42, current_physical),
+            Some(77)
+        );
+        assert_eq!(OldSwapchain::translate(None, 42, current_physical), None);
+    }
+
+    #[test]
+    fn direct_fallback_does_not_install_a_mapping() {
+        assert!(Mapping::direct_fallback(true, false));
+        assert!(Mapping::direct_fallback(false, true));
+        assert!(!Mapping::direct_fallback(true, true));
+    }
+
+    #[test]
+    fn logical_handle_uses_the_reserved_namespace_and_never_equals_a_physical_handle() {
+        let physical = 0x1234;
+        let logical = LogicalSwapchainHandle::from_counter(1);
+
+        assert_ne!(logical.raw(), physical);
+        assert!(LogicalSwapchainHandle::from_raw(logical.raw()).is_some());
+        assert!(LogicalSwapchainHandle::from_raw(physical).is_none());
+    }
+}

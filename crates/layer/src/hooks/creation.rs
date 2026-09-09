@@ -1,4 +1,7 @@
 use super::*;
+use crate::mapping::{LogicalSwapchainHandle, Mapping, OldSwapchain};
+use ash::vk::Handle;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy)]
 struct ResizedWindow {
@@ -34,6 +37,59 @@ fn clear_surface_virtualization(surface: vk::SurfaceKHR) {
         state.logical_capabilities = None;
         state.borderless_lease = None;
     }
+}
+
+fn translate_old_swapchain(logical: vk::SwapchainKHR) -> vk::SwapchainKHR {
+    if logical == vk::SwapchainKHR::null() {
+        return logical;
+    }
+    let handles = swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&logical)
+        .and_then(|state| {
+            state
+                .lock()
+                .ok()
+                .map(|state| (state.logical_handle, state.physical_handle))
+        });
+    handles
+        .and_then(|(logical, physical)| {
+            OldSwapchain::translate(Some(logical.as_raw()), logical.as_raw(), physical.as_raw())
+        })
+        .map(vk::SwapchainKHR::from_raw)
+        .unwrap_or(logical)
+}
+
+fn allocate_logical_swapchain(physical: vk::SwapchainKHR) -> Option<vk::SwapchainKHR> {
+    static NEXT_LOGICAL_SWAPCHAIN: AtomicU64 = AtomicU64::new(1);
+
+    // A tagged token is safe only while the downstream ICD has not produced a
+    // handle in that namespace.  Refuse virtualization on an observed clash
+    // rather than ever exposing a physical handle as a logical identity.
+    if LogicalSwapchainHandle::is_reserved(physical.as_raw()) {
+        return None;
+    }
+    for _ in 0..1024 {
+        let counter = NEXT_LOGICAL_SWAPCHAIN.fetch_add(1, Ordering::Relaxed);
+        let candidate =
+            vk::SwapchainKHR::from_raw(LogicalSwapchainHandle::from_counter(counter).raw());
+        let collision = swapchains()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .any(|(logical, state)| {
+                *logical == candidate
+                    || state
+                        .lock()
+                        .ok()
+                        .is_some_and(|state| state.physical_handle == candidate)
+            });
+        if !collision {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 impl ResizedWindow {
@@ -636,7 +692,9 @@ unsafe fn create_swapchain_inner(
         .get(&device)
         .cloned();
     let original = unsafe { &*create_info };
-    let mut modified = *original;
+    let mut driver_original = *original;
+    driver_original.old_swapchain = translate_old_swapchain(original.old_swapchain);
+    let mut modified = driver_original;
     let logical_capabilities = state.as_ref().and_then(|state| unsafe {
         let get: vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR =
             std::mem::transmute(downstream(
@@ -719,13 +777,15 @@ unsafe fn create_swapchain_inner(
             resized_window.restore();
             modified = *original;
             capture_enabled = false;
-            result =
-                unsafe { create_swapchain(device, create_info, allocation_callbacks, swapchain) };
+            result = unsafe {
+                create_swapchain(device, &driver_original, allocation_callbacks, swapchain)
+            };
         } else if capture_enabled && modified.image_usage != original.image_usage {
             capture_enabled = false;
             modified = *original;
-            result =
-                unsafe { create_swapchain(device, create_info, allocation_callbacks, swapchain) };
+            result = unsafe {
+                create_swapchain(device, &driver_original, allocation_callbacks, swapchain)
+            };
         }
     }
     if result != vk::Result::SUCCESS {
@@ -768,7 +828,7 @@ unsafe fn create_swapchain_inner(
             create_swapchain,
             loader: &loader,
             device,
-            create_info,
+            create_info: &driver_original,
             allocation_callbacks,
             swapchain,
             surface: original.surface,
@@ -795,6 +855,7 @@ unsafe fn create_swapchain_inner(
         };
         let mut virtual_images = None;
         let mut virtual_window = None;
+        let mut logical_handle = handle;
         if let Some(resized_window) = resized_window.take() {
             let virtual_eligible = virtual_swapchain_supported(original);
             let virtual_result = if virtual_eligible {
@@ -824,11 +885,16 @@ unsafe fn create_swapchain_inner(
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()
+                    .and_then(|images| {
+                        allocate_logical_swapchain(handle)
+                            .map(|logical| (logical, images))
+                            .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)
+                    })
             } else {
                 Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
             };
             match virtual_result {
-                Ok(images) => {
+                Ok((logical, images)) => {
                     surfaces()
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
@@ -840,6 +906,7 @@ unsafe fn create_swapchain_inner(
                                 surface.borderless_lease = Some(resized_window.lease);
                             }
                         });
+                    logical_handle = logical;
                     virtual_images = Some(images);
                     virtual_window = Some(resized_window);
                 }
@@ -915,14 +982,22 @@ unsafe fn create_swapchain_inner(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(
-                        handle,
+                        logical_handle,
                         Arc::new(Mutex::new(SwapchainState {
                             device,
                             surface: original.surface,
+                            logical_handle,
+                            physical_handle: handle,
+                            mapping: virtual_images
+                                .as_ref()
+                                .map(|images| Mapping::new(0, images.len())),
                             overlay,
                             virtual_images,
                         })),
                     );
+                if was_virtual {
+                    unsafe { *swapchain = logical_handle };
+                }
             }
             Err(error) if was_virtual => {
                 eprintln!(

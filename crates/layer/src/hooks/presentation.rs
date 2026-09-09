@@ -1,5 +1,67 @@
 use super::*;
 
+struct PresentTranslation {
+    swapchains: Vec<vk::SwapchainKHR>,
+    image_indices: Vec<u32>,
+    releases: Vec<(Arc<Mutex<SwapchainState>>, u32)>,
+}
+
+unsafe fn translate_present(
+    info: &vk::PresentInfoKHR<'_>,
+) -> Result<Option<PresentTranslation>, vk::Result> {
+    if info.swapchain_count == 0 {
+        return Ok(None);
+    }
+    if info.p_swapchains.is_null() || info.p_image_indices.is_null() {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
+    let swapchain_handles =
+        unsafe { std::slice::from_raw_parts(info.p_swapchains, info.swapchain_count as usize) };
+    let image_indices =
+        unsafe { std::slice::from_raw_parts(info.p_image_indices, info.swapchain_count as usize) };
+    let states = swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut translated = PresentTranslation {
+        swapchains: Vec::with_capacity(swapchain_handles.len()),
+        image_indices: Vec::with_capacity(image_indices.len()),
+        releases: Vec::new(),
+    };
+    let mut changed = false;
+    for (logical_handle, logical_index) in swapchain_handles.iter().zip(image_indices) {
+        let state = states.get(logical_handle).cloned();
+        let Some(state) = state else {
+            translated.swapchains.push(*logical_handle);
+            translated.image_indices.push(*logical_index);
+            continue;
+        };
+        let state_guard = state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(mapping) = state_guard.mapping.as_ref() else {
+            translated.swapchains.push(*logical_handle);
+            translated.image_indices.push(*logical_index);
+            continue;
+        };
+        let Some(physical_index) = mapping.resolve(*logical_index) else {
+            return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
+        };
+        translated.swapchains.push(state_guard.physical_handle);
+        translated.image_indices.push(physical_index);
+        translated.releases.push((state.clone(), *logical_index));
+        changed = true;
+    }
+    Ok(changed.then_some(translated))
+}
+
+fn release_presented_images(translation: &PresentTranslation) {
+    for (state, logical_index) in &translation.releases {
+        if let Ok(mut state) = state.lock()
+            && let Some(mapping) = state.mapping.as_mut()
+        {
+            let _ = mapping.present(*logical_index);
+        }
+    }
+}
+
 unsafe fn uses_virtual_output(info: &vk::PresentInfoKHR<'_>) -> bool {
     if info.swapchain_count == 0 || info.p_swapchains.is_null() {
         return false;
@@ -78,15 +140,23 @@ unsafe fn submit_overlay(
         .iter()
         .zip(image_indices)
         .filter_map(|(swapchain, image_index)| {
-            states
-                .get(swapchain)
-                .cloned()
-                .map(|state| (state, *image_index))
+            let state = states.get(swapchain).cloned()?;
+            let physical_index = state
+                .lock()
+                .ok()
+                .and_then(|state| {
+                    state
+                        .mapping
+                        .as_ref()
+                        .and_then(|mapping| mapping.resolve(*image_index))
+                })
+                .unwrap_or(*image_index);
+            Some((state, *image_index, physical_index))
         })
         .collect::<Vec<_>>();
     drop(states);
     let mut prepared = Vec::with_capacity(tracked.len());
-    for (state, image_index) in tracked {
+    for (state, logical_index, physical_index) in tracked {
         let mut swapchain_state = state.lock().unwrap_or_else(|e| e.into_inner());
         if swapchain_state.device != queue_state.device {
             continue;
@@ -96,7 +166,8 @@ unsafe fn submit_overlay(
                 &device_state.device,
                 queue,
                 queue_state.family_index,
-                image_index,
+                logical_index,
+                physical_index,
             )
         } {
             Ok(frame) => prepared.push((state.clone(), frame)),
@@ -104,7 +175,8 @@ unsafe fn submit_overlay(
                 swapchain_state.overlay.prepare_spatial_fallback(
                     queue,
                     queue_state.family_index,
-                    image_index,
+                    logical_index,
+                    physical_index,
                     error,
                 )
             } {
@@ -192,13 +264,24 @@ unsafe fn queue_present_inner(
         return unsafe { present(queue, present_info) };
     }
     let info = unsafe { &*present_info };
+    let translation = unsafe { translate_present(info) };
+    let translation = match translation {
+        Ok(translation) => translation,
+        Err(error) => return error,
+    };
     let overlay_complete = crate::handoff::handoff(|handoff| unsafe {
         let _ = submit_overlay(queue, queue_state, info, handoff);
     });
-    if let Some(render_complete) = overlay_complete {
+    if overlay_complete.is_some() || translation.is_some() {
         let mut modified = *info;
-        modified.wait_semaphore_count = 1;
-        modified.p_wait_semaphores = &render_complete;
+        if let Some(render_complete) = overlay_complete {
+            modified.wait_semaphore_count = 1;
+            modified.p_wait_semaphores = &render_complete;
+        }
+        if let Some(translation) = &translation {
+            modified.p_swapchains = translation.swapchains.as_ptr();
+            modified.p_image_indices = translation.image_indices.as_ptr();
+        }
         let mut mapped_rectangles = Vec::<Vec<vk::RectLayerKHR>>::new();
         let mapped_regions: Vec<vk::PresentRegionKHR<'_>>;
         let mut mapped_present_regions = vk::PresentRegionsKHR::default();
@@ -314,6 +397,9 @@ unsafe fn queue_present_inner(
             }
         }
         let result = unsafe { present(queue, &modified) };
+        if let Some(translation) = &translation {
+            release_presented_images(translation);
+        }
         if result != vk::Result::SUCCESS && !info.p_swapchains.is_null() {
             let presented = unsafe {
                 std::slice::from_raw_parts(info.p_swapchains, info.swapchain_count as usize)

@@ -6,6 +6,8 @@ use std::{
 use tuxscaling_runtime::{SetLoaderData, SwapchainRuntime as OverlaySwapchain};
 use tuxscaling_vulkan::Image;
 
+use crate::mapping::Mapping;
+
 #[derive(Clone, Copy)]
 pub(crate) struct X11Surface {
     pub(crate) window: u64,
@@ -17,6 +19,11 @@ pub(crate) struct X11Surface {
 pub(crate) struct SwapchainState {
     pub(crate) device: vk::Device,
     pub(crate) surface: vk::SurfaceKHR,
+    /// The application-visible key remains stable even if a later task
+    /// replaces the downstream WSI generation.
+    pub(crate) logical_handle: vk::SwapchainKHR,
+    pub(crate) physical_handle: vk::SwapchainKHR,
+    pub(crate) mapping: Option<Mapping>,
     pub(crate) overlay: OverlaySwapchain,
     pub(crate) virtual_images: Option<Vec<Image>>,
 }

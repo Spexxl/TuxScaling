@@ -1,5 +1,42 @@
 use super::*;
 
+fn virtual_physical_swapchain(
+    logical: vk::SwapchainKHR,
+) -> Option<(Arc<Mutex<SwapchainState>>, vk::SwapchainKHR)> {
+    let state = swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&logical)
+        .cloned()?;
+    let physical = state
+        .lock()
+        .ok()
+        .and_then(|state| state.mapping.as_ref().map(|_| state.physical_handle))?;
+    Some((state, physical))
+}
+
+fn map_acquired_image(
+    state: &Arc<Mutex<SwapchainState>>,
+    image_index: *mut u32,
+) -> Result<(), vk::Result> {
+    if image_index.is_null() {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(mapping) = state.mapping.as_mut() else {
+        return Ok(());
+    };
+    let logical = mapping
+        .acquire(unsafe { *image_index })
+        .map_err(|_| vk::Result::ERROR_OUT_OF_DATE_KHR)?;
+    unsafe { *image_index = logical };
+    Ok(())
+}
+
+fn acquired(result: vk::Result) -> bool {
+    matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR)
+}
+
 unsafe fn copy_virtual_images(
     virtual_images: &[vk::Image],
     image_count: *mut u32,
@@ -73,11 +110,31 @@ unsafe fn acquire_next_image_inner(
     fence: vk::Fence,
     image_index: *mut u32,
 ) -> vk::Result {
+    let virtual_swapchain = virtual_physical_swapchain(swapchain);
+    let physical_swapchain = virtual_swapchain
+        .as_ref()
+        .map_or(swapchain, |(_, physical)| *physical);
     let Some(proc) = (unsafe { device_downstream(device, c"vkAcquireNextImageKHR") }) else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
     let acquire: vk::PFN_vkAcquireNextImageKHR = unsafe { std::mem::transmute(proc) };
-    unsafe { acquire(device, swapchain, timeout, semaphore, fence, image_index) }
+    let result = unsafe {
+        acquire(
+            device,
+            physical_swapchain,
+            timeout,
+            semaphore,
+            fence,
+            image_index,
+        )
+    };
+    if acquired(result)
+        && let Some((state, _)) = virtual_swapchain
+        && let Err(error) = map_acquired_image(&state, image_index)
+    {
+        return error;
+    }
+    result
 }
 
 pub(super) unsafe extern "system" fn acquire_next_image_khr(
@@ -99,11 +156,27 @@ unsafe fn acquire_next_image2_inner(
     info: *const vk::AcquireNextImageInfoKHR<'_>,
     image_index: *mut u32,
 ) -> vk::Result {
+    if info.is_null() {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    let logical_swapchain = unsafe { (*info).swapchain };
+    let virtual_swapchain = virtual_physical_swapchain(logical_swapchain);
+    let mut modified = unsafe { *info };
+    if let Some((_, physical)) = &virtual_swapchain {
+        modified.swapchain = *physical;
+    }
     let Some(proc) = (unsafe { device_downstream(device, c"vkAcquireNextImage2KHR") }) else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
     let acquire: vk::PFN_vkAcquireNextImage2KHR = unsafe { std::mem::transmute(proc) };
-    unsafe { acquire(device, info, image_index) }
+    let result = unsafe { acquire(device, &modified, image_index) };
+    if acquired(result)
+        && let Some((state, _)) = virtual_swapchain
+        && let Err(error) = map_acquired_image(&state, image_index)
+    {
+        return error;
+    }
+    result
 }
 
 pub(super) unsafe extern "system" fn acquire_next_image2_khr(

@@ -11,14 +11,18 @@ unsafe fn destroy_swapchain_inner(
     allocation_callbacks: *const vk::AllocationCallbacks<'_>,
 ) {
     let destroy = unsafe { device_downstream(device, c"vkDestroySwapchainKHR") };
+    let state = swapchains()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&swapchain);
+    let physical_swapchain = state
+        .as_ref()
+        .and_then(|state| state.lock().ok().map(|state| state.physical_handle))
+        .unwrap_or(swapchain);
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        let state = swapchains()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&swapchain);
         let restore_surface = state.as_ref().and_then(|state| {
             let state = state.lock().unwrap_or_else(|e| e.into_inner());
-            state.virtual_images.as_ref().map(|_| state.surface)
+            state.mapping.as_ref().map(|_| state.surface)
         });
         let device_state = devices()
             .lock()
@@ -41,7 +45,7 @@ unsafe fn destroy_swapchain_inner(
                 .values()
                 .any(|state| {
                     let state = state.lock().unwrap_or_else(|e| e.into_inner());
-                    state.surface == surface && state.virtual_images.is_some()
+                    state.surface == surface && state.mapping.is_some()
                 });
             if !another_virtual_swapchain {
                 restore_surface_window(surface);
@@ -50,7 +54,7 @@ unsafe fn destroy_swapchain_inner(
     }));
     if let Some(proc) = destroy {
         let destroy_swapchain: vk::PFN_vkDestroySwapchainKHR = unsafe { std::mem::transmute(proc) };
-        unsafe { destroy_swapchain(device, swapchain, allocation_callbacks) };
+        unsafe { destroy_swapchain(device, physical_swapchain, allocation_callbacks) };
     }
 }
 
@@ -117,8 +121,7 @@ unsafe fn destroy_device_inner(
                 for state in overlays {
                     if let Ok(state) = Arc::try_unwrap(state) {
                         let state = state.into_inner().unwrap_or_else(|e| e.into_inner());
-                        let restore_surface =
-                            state.virtual_images.is_some().then_some(state.surface);
+                        let restore_surface = state.mapping.is_some().then_some(state.surface);
                         state.overlay.destroy(&device_state.device);
                         if let Some(surface) = restore_surface {
                             restore_surface_window(surface);

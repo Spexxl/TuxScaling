@@ -793,7 +793,8 @@ impl SwapchainRuntime {
         _device: &ash::Device,
         queue: vk::Queue,
         family: u32,
-        index: u32,
+        logical_index: u32,
+        physical_index: u32,
     ) -> Result<FrameSubmission, vk::Result> {
         if !self.enabled {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
@@ -811,7 +812,11 @@ impl SwapchainRuntime {
         if let Some(guidance) = &mut self.temporal.guidance {
             guidance.clear_provider_failure();
         }
-        let index = index as usize;
+        let game_image = *self
+            .game_images
+            .get(logical_index as usize)
+            .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
+        let index = physical_index as usize;
         let slot = self
             .slots
             .get(index)
@@ -1036,10 +1041,10 @@ impl SwapchainRuntime {
                 capture.record_scaled_from_with_jitter(
                     &self.device,
                     slot.command,
-                    self.game_images[index],
+                    game_image,
                     self.temporal.resolution.game_extent,
                     vk::ImageLayout::PRESENT_SRC_KHR,
-                    if self.game_images[index] == self.output_images[index] {
+                    if game_image == self.output_images[index] {
                         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
                     } else {
                         vk::ImageLayout::PRESENT_SRC_KHR
@@ -1146,7 +1151,7 @@ impl SwapchainRuntime {
                     index as u32 * GPU_TIMESTAMPS as u32 + 15,
                 );
             }
-            if self.game_images[index] != self.output_images[index] {
+            if game_image != self.output_images[index] {
                 image_barrier(
                     &self.device,
                     slot.command,
@@ -1264,7 +1269,7 @@ impl SwapchainRuntime {
                 if let Err(error) = result {
                     eprintln!("TuxScaling: backend record failed: {error}");
                 }
-            } else if self.game_images[index] != self.output_images[index]
+            } else if game_image != self.output_images[index]
                 && let Some(capture) = &self.temporal.capture
             {
                 record_spatial_fallback(
@@ -1284,7 +1289,7 @@ impl SwapchainRuntime {
                     self.temporal.pending_upscaler = Some(Upscaler::Reference);
                 }
                 self.diagnostics.state = "Backend failure; spatial fallback".into();
-                if self.game_images[index] != self.output_images[index]
+                if game_image != self.output_images[index]
                     && let Some(capture) = &self.temporal.capture
                 {
                     record_spatial_fallback(
@@ -1392,7 +1397,7 @@ impl SwapchainRuntime {
             }
             self.device.end_command_buffer(slot.command)?;
         }
-        if self.game_images[index] != self.output_images[index] {
+        if game_image != self.output_images[index] {
             self.pending_output = Some(index);
         }
         self.temporal.query_ready[index] = true;
@@ -1407,7 +1412,8 @@ impl SwapchainRuntime {
         &mut self,
         queue: vk::Queue,
         family: u32,
-        index: u32,
+        logical_index: u32,
+        physical_index: u32,
         reason: vk::Result,
     ) -> Result<FrameSubmission, vk::Result> {
         if !self.enabled {
@@ -1415,7 +1421,11 @@ impl SwapchainRuntime {
         }
         unsafe { self.initialize(queue, family) }?;
         unsafe { self.apply_pending_guidance_scale() }?;
-        let index = index as usize;
+        let game_image = *self
+            .game_images
+            .get(logical_index as usize)
+            .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
+        let index = physical_index as usize;
         let output_layout = if self.output_presented[index] {
             vk::ImageLayout::PRESENT_SRC_KHR
         } else {
@@ -1456,10 +1466,10 @@ impl SwapchainRuntime {
                 capture.record_scaled_from_with_jitter(
                     &self.device,
                     slot.command,
-                    self.game_images[index],
+                    game_image,
                     self.temporal.resolution.game_extent,
                     vk::ImageLayout::PRESENT_SRC_KHR,
-                    if self.game_images[index] == self.output_images[index] {
+                    if game_image == self.output_images[index] {
                         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
                     } else {
                         vk::ImageLayout::PRESENT_SRC_KHR
@@ -1484,11 +1494,11 @@ impl SwapchainRuntime {
                 guidance.record_provider_failure_for_slot(slot.command, index);
                 compute_memory_barrier(&self.device, slot.command);
             }
-            if self.game_images[index] != self.output_images[index] {
+            if game_image != self.output_images[index] {
                 record_spatial_blit(
                     &self.device,
                     slot.command,
-                    self.game_images[index],
+                    game_image,
                     self.temporal.resolution.game_extent,
                     vk::ImageLayout::PRESENT_SRC_KHR,
                     self.output_images[index],
@@ -1517,7 +1527,7 @@ impl SwapchainRuntime {
             );
             self.device.end_command_buffer(slot.command)?;
         }
-        if self.game_images[index] != self.output_images[index] {
+        if game_image != self.output_images[index] {
             self.pending_output = Some(index);
         }
         self.temporal.query_ready[index] = false;
