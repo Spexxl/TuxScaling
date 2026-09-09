@@ -59,6 +59,16 @@ unsafe fn device_downstream(device: vk::Device, name: &CStr) -> vk::PFN_vkVoidFu
     unsafe { get_device_proc_addr(device, name.as_ptr()) }
 }
 
+fn is_swapchain_related_proc(name: &CStr) -> bool {
+    let bytes = name.to_bytes();
+    bytes
+        .windows(b"Swapchain".len())
+        .any(|window| window == b"Swapchain")
+        || bytes
+            .windows(b"Present".len())
+            .any(|window| window == b"Present")
+}
+
 unsafe fn instance_for_physical_device(
     physical_device: vk::PhysicalDevice,
 ) -> Option<ash::Instance> {
@@ -184,6 +194,11 @@ pub(crate) unsafe fn get_instance_proc_addr_inner(
         | b"vkAcquireNextImage2KHR"
         | b"vkReleaseSwapchainImagesEXT"
         | b"vkGetSwapchainStatusKHR"
+        | b"vkWaitForPresentKHR"
+        | b"vkGetPastPresentationTimingGOOGLE"
+        | b"vkGetRefreshCycleDurationGOOGLE"
+        | b"vkGetSwapchainCounterEXT"
+        | b"vkSetHdrMetadataEXT"
         | b"vkDestroyDevice"
         | b"vkQueuePresentKHR" => unsafe {
             get_device_proc_addr_inner(vk::Device::null(), name.as_ptr())
@@ -277,6 +292,27 @@ pub(crate) unsafe fn get_device_proc_addr_inner(
                 reject_get_swapchain_status_khr as vk::PFN_vkGetSwapchainStatusKHR,
             )
         },
+        b"vkWaitForPresentKHR" => unsafe {
+            std::mem::transmute::<vk::PFN_vkWaitForPresentKHR, vk::PFN_vkVoidFunction>(
+                reject_wait_for_present_khr as vk::PFN_vkWaitForPresentKHR,
+            )
+        },
+        b"vkGetPastPresentationTimingGOOGLE" => unsafe {
+            std::mem::transmute::<vk::PFN_vkGetPastPresentationTimingGOOGLE, vk::PFN_vkVoidFunction>(
+                reject_past_presentation_timing_google as vk::PFN_vkGetPastPresentationTimingGOOGLE,
+            )
+        },
+        b"vkGetRefreshCycleDurationGOOGLE" => unsafe {
+            std::mem::transmute::<vk::PFN_vkGetRefreshCycleDurationGOOGLE, vk::PFN_vkVoidFunction>(
+                reject_refresh_cycle_duration_google as vk::PFN_vkGetRefreshCycleDurationGOOGLE,
+            )
+        },
+        b"vkGetSwapchainCounterEXT" => unsafe {
+            std::mem::transmute::<vk::PFN_vkGetSwapchainCounterEXT, vk::PFN_vkVoidFunction>(
+                reject_swapchain_counter_ext as vk::PFN_vkGetSwapchainCounterEXT,
+            )
+        },
+        b"vkSetHdrMetadataEXT" => None,
         b"vkDestroyDevice" => unsafe {
             std::mem::transmute::<vk::PFN_vkDestroyDevice, vk::PFN_vkVoidFunction>(
                 destroy_device as vk::PFN_vkDestroyDevice,
@@ -287,6 +323,7 @@ pub(crate) unsafe fn get_device_proc_addr_inner(
                 queue_present_khr as vk::PFN_vkQueuePresentKHR,
             )
         },
+        _ if is_swapchain_related_proc(name) => None,
         _ => unsafe { device_downstream(device, name) },
     }
 }
@@ -303,4 +340,80 @@ unsafe extern "system" fn reject_get_swapchain_status_khr(
     _swapchain: vk::SwapchainKHR,
 ) -> vk::Result {
     vk::Result::ERROR_EXTENSION_NOT_PRESENT
+}
+
+unsafe extern "system" fn reject_wait_for_present_khr(
+    _device: vk::Device,
+    _swapchain: vk::SwapchainKHR,
+    _present_id: u64,
+    _timeout: u64,
+) -> vk::Result {
+    vk::Result::ERROR_EXTENSION_NOT_PRESENT
+}
+
+unsafe extern "system" fn reject_past_presentation_timing_google(
+    _device: vk::Device,
+    _swapchain: vk::SwapchainKHR,
+    _count: *mut u32,
+    _timings: *mut vk::PastPresentationTimingGOOGLE,
+) -> vk::Result {
+    vk::Result::ERROR_EXTENSION_NOT_PRESENT
+}
+
+unsafe extern "system" fn reject_refresh_cycle_duration_google(
+    _device: vk::Device,
+    _swapchain: vk::SwapchainKHR,
+    _properties: *mut vk::RefreshCycleDurationGOOGLE,
+) -> vk::Result {
+    vk::Result::ERROR_EXTENSION_NOT_PRESENT
+}
+
+unsafe extern "system" fn reject_swapchain_counter_ext(
+    _device: vk::Device,
+    _swapchain: vk::SwapchainKHR,
+    _counter: vk::SurfaceCounterFlagsEXT,
+    _value: *mut u64,
+) -> vk::Result {
+    vk::Result::ERROR_EXTENSION_NOT_PRESENT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{get_device_proc_addr_inner, is_swapchain_related_proc};
+    use std::ffi::CStr;
+
+    #[test]
+    fn unknown_swapchain_proc_names_are_not_forwarded_to_downstream() {
+        let name = CStr::from_bytes_with_nul(b"vkFutureSwapchainCommandKHR\0").unwrap();
+
+        assert!(is_swapchain_related_proc(name));
+        assert!(
+            unsafe { get_device_proc_addr_inner(ash::vk::Device::null(), name.as_ptr()) }.is_none()
+        );
+    }
+
+    #[test]
+    fn known_swapchain_extension_proc_names_have_safe_layer_dispatch() {
+        let names = [
+            c"vkWaitForPresentKHR",
+            c"vkGetPastPresentationTimingGOOGLE",
+            c"vkGetRefreshCycleDurationGOOGLE",
+            c"vkGetSwapchainCounterEXT",
+            c"vkGetSwapchainStatusKHR",
+            c"vkReleaseSwapchainImagesEXT",
+        ];
+
+        for name in names {
+            assert!(
+                unsafe { get_device_proc_addr_inner(ash::vk::Device::null(), name.as_ptr()) }
+                    .is_some()
+            );
+        }
+        assert!(
+            unsafe {
+                get_device_proc_addr_inner(ash::vk::Device::null(), c"vkSetHdrMetadataEXT".as_ptr())
+            }
+            .is_none()
+        );
+    }
 }

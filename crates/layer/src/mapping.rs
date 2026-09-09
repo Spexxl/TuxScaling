@@ -288,6 +288,28 @@ mod tests {
     }
 
     #[test]
+    fn recreated_authoritative_state_stays_virtualized_on_first_present() {
+        use std::time::{Duration, Instant};
+        use tuxscaling_display::{
+            Extent, PresentationNegotiation, PresentationState, Rect, SurfaceExtent,
+        };
+
+        let now = Instant::now();
+        let target = Rect::new(0, 0, 1920, 1080);
+        let native = SurfaceExtent::fixed(Extent::new(1920, 1080));
+        let mut surface = PresentationNegotiation::direct();
+        assert!(surface.request_borderless(target, now));
+        assert!(surface.borderless_requested(now));
+        assert!(surface.observe(target, true, native, now + Duration::from_secs(1)));
+        assert!(surface.output_recreated(target, true, native, now + Duration::from_secs(2)));
+
+        let mut swapchain = surface;
+        assert_eq!(swapchain.public_state(), PresentationState::Virtualized);
+        assert!(!swapchain.observe(target, true, native, now + Duration::from_secs(3)));
+        assert_eq!(swapchain.public_state(), PresentationState::Virtualized);
+    }
+
+    #[test]
     fn translates_a_logical_old_swapchain_to_its_current_physical_handle() {
         let current_physical = 91;
 

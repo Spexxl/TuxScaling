@@ -247,3 +247,38 @@ Deterministic evidence now covers the first mismatch, later exact observation,
 recreation revalidation, the ready predicate, and deadline expiry to
 `Failed/Direct` behavior. The extension rejection handlers remain present for
 `vkReleaseSwapchainImagesEXT` and `vkGetSwapchainStatusKHR`.
+
+## Task 2 review cycle 3
+
+- Successful physical recreation now publishes the `Active` negotiation to
+  both the authoritative surface record and all swapchain records for that
+  surface before the logical handle is exposed. The first present observes
+  the active native state without reverting it to `RecreatingOutput`.
+- Deadline expiry and recreation-boundary mismatch use the fail-open cleanup
+  path, which takes the owned borderless lease, clears logical capabilities,
+  and resets negotiation to `Direct`. Cleanup is also used on physical-create
+  and overlay-initialization failures. A normal first-frame mismatch remains
+  `Negotiating` by design and does not prematurely abandon the five-second
+  negotiation window.
+- `vkDestroySwapchainKHR` now suppresses unknown reserved tagged handles in
+  addition to retired handles. No raw tagged token is passed to the driver.
+- Device proc dispatch explicitly covers wait-for-present, GOOGLE display
+  timing, swapchain counter, status, release, and HDR metadata paths. Unsafe
+  commands return an extension-not-present stub or no proc; unknown names
+  containing `Swapchain` or `Present` are not forwarded downstream.
+- All virtualization eligibility checks now run before borderless promotion.
+  Every later failure path restores the lease or performs the direct cleanup.
+- Tests are explicit about their boundary: the controlled downstream test is
+  helper-level array translation, while dispatch tests prove unknown and
+  known swapchain-related proc names cannot fall through to downstream.
+
+### Cycle 3 verification
+
+```text
+$ cargo fmt --all
+$ cargo test -p tuxscaling-layer --lib
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured
+```
+
+Live X11/XWayland WSI validation was not available; no claim is made for
+compositor or ICD behavior beyond these deterministic hook/state checks.

@@ -48,6 +48,29 @@ fn clear_surface_virtualization(surface: vk::SurfaceKHR) {
     }
 }
 
+fn publish_negotiation(
+    surface_handle: vk::SurfaceKHR,
+    negotiation: tuxscaling_display::PresentationNegotiation,
+) {
+    if let Some(surface) = surfaces()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get_mut(&surface_handle)
+    {
+        surface.negotiation = negotiation;
+    }
+    let states = swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for swapchain in states.values() {
+        if let Ok(mut swapchain) = swapchain.lock()
+            && swapchain.surface == surface_handle
+        {
+            swapchain.negotiation = negotiation;
+        }
+    }
+}
+
 fn translate_old_swapchain(logical: vk::SwapchainKHR) -> Result<vk::SwapchainKHR, vk::Result> {
     if logical == vk::SwapchainKHR::null() {
         return Ok(logical);
@@ -214,6 +237,7 @@ unsafe fn virtual_output_extent(
     surface: vk::SurfaceKHR,
     game_extent: vk::Extent2D,
     device_state: Option<&DeviceState>,
+    preflight_eligible: bool,
 ) -> Option<(vk::Extent2D, ResizedWindow)> {
     let debug_test = cfg!(debug_assertions)
         && std::env::var("TUXSCALING_TEST_FORCE_VIRTUAL")
@@ -225,6 +249,9 @@ unsafe fn virtual_output_extent(
             "TuxScaling virtual output probe: game={}x{}",
             game_extent.width, game_extent.height
         );
+    }
+    if !preflight_eligible {
+        return None;
     }
     let config = if let Ok(path) = std::env::var("TUXSCALING_CONFIG") {
         let source = std::fs::read_to_string(path).ok()?;
@@ -320,13 +347,16 @@ unsafe fn virtual_output_extent(
         return None;
     };
     let Some(device_state) = device_state else {
+        super::lifetime::restore_surface_window(surface);
         return None;
     };
     let Some(capabilities) = (unsafe { downstream_surface_capabilities(device_state, surface) })
     else {
+        super::lifetime::restore_surface_window(surface);
         return None;
     };
     let Ok(observed) = display.describe_window(surface_state.window) else {
+        super::lifetime::restore_surface_window(surface);
         return None;
     };
     let observed_surface = surface_extent(capabilities);
@@ -340,6 +370,7 @@ unsafe fn virtual_output_extent(
         if debug_test {
             eprintln!("TuxScaling virtual output skipped: exact native confirmation unavailable");
         }
+        super::lifetime::restore_surface_window(surface);
         return None;
     }
     Some((target, ResizedWindow { lease, negotiation }))
@@ -375,24 +406,13 @@ pub(super) unsafe fn observe_surface_negotiation(
         surface_extent(capabilities),
         now,
     );
-    let state = negotiation.public_state();
-    if let Some(surface) = surfaces()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get_mut(&surface)
-    {
-        surface.negotiation = negotiation;
+    let mut state = negotiation.public_state();
+    if negotiation.failure().is_some() {
+        super::lifetime::restore_surface_window(surface);
+        negotiation = tuxscaling_display::PresentationNegotiation::direct();
+        state = tuxscaling_display::PresentationState::Direct;
     }
-    let states = swapchains()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    for swapchain in states.values() {
-        if let Ok(mut swapchain) = swapchain.lock()
-            && swapchain.surface == surface
-        {
-            swapchain.negotiation = negotiation;
-        }
-    }
+    publish_negotiation(surface, negotiation);
     state
 }
 
@@ -880,8 +900,46 @@ unsafe fn create_swapchain_inner(
         (get(state.physical_device, original.surface, &mut caps) == vk::Result::SUCCESS)
             .then_some(caps)
     });
-    let mut resized =
-        unsafe { virtual_output_extent(original.surface, original.image_extent, state.as_ref()) };
+    let needed = vk::ImageUsageFlags::TRANSFER_SRC
+        | vk::ImageUsageFlags::TRANSFER_DST
+        | vk::ImageUsageFlags::COLOR_ATTACHMENT
+        | vk::ImageUsageFlags::STORAGE;
+    let virtual_preflight_eligible = state.as_ref().is_some_and(|state| {
+        state.overlay_supported
+            && virtual_swapchain_supported(original)
+            && tuxscaling_capture::supported_format(
+                original.image_format,
+                original.image_color_space,
+            )
+            && original.image_array_layers == 1
+            && original.flags.is_empty()
+            && !matches!(
+                original.present_mode,
+                vk::PresentModeKHR::SHARED_DEMAND_REFRESH
+                    | vk::PresentModeKHR::SHARED_CONTINUOUS_REFRESH
+            )
+            && logical_capabilities.is_some_and(|caps| {
+                caps.supported_usage_flags.contains(needed)
+                    && unsafe {
+                        state.instance.get_physical_device_format_properties(
+                            state.physical_device,
+                            original.image_format,
+                        )
+                    }
+                    .optimal_tiling_features
+                    .contains(
+                        vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::BLIT_DST,
+                    )
+            })
+    });
+    let mut resized = unsafe {
+        virtual_output_extent(
+            original.surface,
+            original.image_extent,
+            state.as_ref(),
+            virtual_preflight_eligible,
+        )
+    };
     if let Some((extent, _)) = resized {
         modified.image_extent = extent;
         eprintln!(
@@ -889,10 +947,6 @@ unsafe fn create_swapchain_inner(
             original.image_extent.width, original.image_extent.height, extent.width, extent.height
         );
     }
-    let needed = vk::ImageUsageFlags::TRANSFER_SRC
-        | vk::ImageUsageFlags::TRANSFER_DST
-        | vk::ImageUsageFlags::COLOR_ATTACHMENT
-        | vk::ImageUsageFlags::STORAGE;
     let mut capture_enabled = false;
     if let Some(state) = &state
         && state.overlay_supported
@@ -965,6 +1019,7 @@ unsafe fn create_swapchain_inner(
         }
     }
     if result != vk::Result::SUCCESS {
+        super::lifetime::restore_surface_window(original.surface);
         return result;
     }
     let recovery_window = resized.map(|(_, window)| window);
@@ -1095,10 +1150,12 @@ unsafe fn create_swapchain_inner(
                         .and_modify(|surface| {
                             surface.logical_extent = Some(original.image_extent);
                             surface.logical_capabilities = logical_capabilities;
+                            surface.negotiation = resized_window.negotiation;
                             if surface.borderless_lease.is_none() {
                                 surface.borderless_lease = Some(resized_window.lease);
                             }
                         });
+                    publish_negotiation(original.surface, resized_window.negotiation);
                     logical_handle = logical;
                     virtual_images = Some(images);
                     virtual_window = Some(resized_window);
@@ -1217,10 +1274,8 @@ unsafe fn create_swapchain_inner(
         result
     }));
     if post_result.is_err() {
-        if let Some(window) = recovery_window {
-            window.restore();
-            clear_surface_virtualization(original.surface);
-        }
+        let _ = recovery_window;
+        super::lifetime::restore_surface_window(original.surface);
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
     post_result.unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED)
