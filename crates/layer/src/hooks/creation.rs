@@ -1,6 +1,6 @@
 use super::*;
 use crate::mapping::{LogicalSwapchainHandle, Mapping, OldSwapchain};
-use crate::recovery::{LogicalSwapchainContract, PhysicalGeneration};
+use crate::recovery::{LogicalSwapchainContract, PhysicalGeneration, ReconfigurationTicket};
 use ash::vk::Handle;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -387,9 +387,155 @@ pub(super) unsafe fn observe_surface_negotiation(
     state
 }
 
+struct NativeGenerationSnapshot {
+    state: Arc<Mutex<SwapchainState>>,
+    ticket: ReconfigurationTicket,
+    old_physical: vk::SwapchainKHR,
+    old_images: Vec<vk::Image>,
+    old_info: SwapchainInfo,
+    template: crate::state::SwapchainTemplate,
+    contract: LogicalSwapchainContract,
+    negotiation: PresentationNegotiation,
+}
+
+fn begin_native_generation(
+    state: Arc<Mutex<SwapchainState>>,
+    surface: vk::SurfaceKHR,
+    observed: tuxscaling_display::X11Window,
+    surface_extent: SurfaceExtent,
+) -> Option<(NativeGenerationSnapshot, OverlaySwapchain)> {
+    let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
+    if guard.surface != surface
+        || !guard
+            .mapping
+            .as_ref()
+            .is_some_and(crate::mapping::Mapping::is_idle)
+        || guard.lifecycle.blocks_frame_operations()
+        || !guard.negotiation.native_observation_is_current(
+            observed.rect,
+            observed.fullscreen,
+            surface_extent,
+            Instant::now(),
+        )
+        || guard
+            .contract
+            .as_ref()
+            .is_none_or(|contract| contract.generation().id() != guard.generation)
+    {
+        return None;
+    }
+    let template = guard.template.clone()?;
+    let contract = guard.contract.clone()?;
+    let ticket = ReconfigurationTicket::new(guard.logical_handle, surface, guard.generation);
+    if !guard.lifecycle.begin(ticket) {
+        return None;
+    }
+    let Some(runtime) = guard.overlay.take() else {
+        let _ = guard.lifecycle.abort(ticket);
+        return None;
+    };
+    let old_physical = guard.physical_handle;
+    let old_info = SwapchainInfo {
+        format: template.image_format,
+        color_space: template.image_color_space,
+        extent: contract.generation().extent(),
+    };
+    let old_images = guard.physical_images.clone();
+    let negotiation = guard.negotiation;
+    drop(guard);
+    let snapshot = NativeGenerationSnapshot {
+        state,
+        ticket,
+        old_physical,
+        old_images,
+        old_info,
+        template,
+        contract,
+        negotiation,
+    };
+    Some((snapshot, runtime))
+}
+
+unsafe fn destroy_abandoned_generation(
+    device_state: &DeviceState,
+    snapshot: &NativeGenerationSnapshot,
+    runtime: OverlaySwapchain,
+    new_physical: vk::SwapchainKHR,
+    loader: &ash::khr::swapchain::Device,
+) {
+    let removed = swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&snapshot.ticket.logical_handle());
+    if removed.is_none() {
+        return;
+    }
+    retire_swapchain(snapshot.ticket.logical_handle());
+    let _ = unsafe { device_state.device.device_wait_idle() };
+    unsafe { runtime.destroy(&device_state.device) };
+    if new_physical != vk::SwapchainKHR::null() {
+        unsafe { loader.destroy_swapchain(new_physical, None) };
+    }
+    unsafe { loader.destroy_swapchain(snapshot.old_physical, None) };
+    let another_virtual_swapchain = swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .values()
+        .any(|state| {
+            let state = state.lock().unwrap_or_else(|error| error.into_inner());
+            state.surface == snapshot.ticket.surface() && state.mapping.is_some()
+        });
+    if !another_virtual_swapchain {
+        super::lifetime::restore_surface_window(snapshot.ticket.surface());
+    }
+}
+
+unsafe fn finish_native_generation_failure(
+    device_state: &DeviceState,
+    snapshot: NativeGenerationSnapshot,
+    runtime: OverlaySwapchain,
+    new_physical: vk::SwapchainKHR,
+    loader: &ash::khr::swapchain::Device,
+) {
+    if new_physical != vk::SwapchainKHR::null() {
+        unsafe { loader.destroy_swapchain(new_physical, None) };
+    }
+    let mut runtime = Some(runtime);
+    let destroy_requested = {
+        let mut guard = snapshot
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let destroy_requested = guard.lifecycle.destroy_requested();
+        if destroy_requested {
+            let _ = guard.lifecycle.take_destroy_request(snapshot.ticket);
+        } else {
+            let _ = guard.lifecycle.abort(snapshot.ticket);
+        }
+        if !destroy_requested && guard.overlay.is_none() {
+            guard.overlay = runtime.take();
+        }
+        destroy_requested
+    };
+    if destroy_requested {
+        unsafe {
+            destroy_abandoned_generation(
+                device_state,
+                &snapshot,
+                runtime
+                    .take()
+                    .expect("destroyed transaction owns the runtime"),
+                vk::SwapchainKHR::null(),
+                loader,
+            )
+        };
+    }
+}
+
 /// Replaces only the downstream WSI generation after exact X11 and Vulkan
-/// confirmation.  The logical handle, images, extent, and mapping stay in
-/// the state entry throughout this operation.
+/// confirmation.  The state marker and moved runtime form a two-phase
+/// transaction: no external call observes a held swapchain mutex, and no
+/// frame operation can use a partially replaced generation.
 pub(super) unsafe fn publish_native_generation(
     device_state: &DeviceState,
     surface: vk::SurfaceKHR,
@@ -417,10 +563,7 @@ pub(super) unsafe fn publish_native_generation(
     };
     let display = match tuxscaling_display::X11Display::connect() {
         Ok(display) => display,
-        Err(_) => {
-            super::lifetime::restore_surface_window(surface);
-            return false;
-        }
+        Err(_) => return false,
     };
     let window = match surfaces()
         .lock()
@@ -433,81 +576,60 @@ pub(super) unsafe fn publish_native_generation(
     };
     let observed = match display.describe_window(window) {
         Ok(observed) => observed,
-        Err(_) => {
-            super::lifetime::restore_surface_window(surface);
-            return false;
-        }
+        Err(_) => return false,
     };
     let capabilities = match unsafe { downstream_surface_capabilities(device_state, surface) } {
         Some(capabilities) => capabilities,
-        None => {
-            super::lifetime::restore_surface_window(surface);
-            return false;
-        }
+        None => return false,
     };
     let surface_extent = surface_extent(capabilities);
-    let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
-    if !guard.negotiation.native_observation_is_current(
-        observed.rect,
-        observed.fullscreen,
-        surface_extent,
-        Instant::now(),
-    ) {
-        eprintln!("TuxScaling evidence event=native_publication_skipped reason=stale_observation");
-        drop(guard);
-        super::lifetime::restore_surface_window(surface);
-        return false;
-    }
-    if !guard
-        .mapping
-        .as_ref()
-        .is_some_and(crate::mapping::Mapping::is_idle)
-    {
-        eprintln!("TuxScaling evidence event=native_publication_skipped reason=mapping_busy");
-        return false;
-    }
-    let Some(template) = guard.template.as_ref() else {
-        drop(guard);
-        super::lifetime::restore_surface_window(surface);
+    let Some((snapshot, mut runtime)) =
+        begin_native_generation(state, surface, observed, surface_extent)
+    else {
+        eprintln!("TuxScaling evidence event=native_publication_skipped reason=stale_or_busy");
         return false;
     };
     let target_extent = vk::Extent2D {
         width: observed.rect.width,
         height: observed.rect.height,
     };
-    if !surface_extent_accepts(surface_extent, target_extent) {
-        drop(guard);
-        super::lifetime::restore_surface_window(surface);
-        return false;
-    }
-    let Some(proc) =
-        (unsafe { device_downstream(device_state.device.handle(), c"vkCreateSwapchainKHR") })
-    else {
-        drop(guard);
-        super::lifetime::restore_surface_window(surface);
-        return false;
-    };
-    let create: vk::PFN_vkCreateSwapchainKHR = unsafe { std::mem::transmute(proc) };
-    let old_physical = guard.physical_handle;
-    let contract_generation = guard.contract.as_ref().map(|contract| {
-        debug_assert!(contract.game_extent().width > 0 && contract.game_extent().height > 0);
-        contract.generation()
-    });
-    let next_generation = contract_generation
-        .map_or(guard.generation, |generation| generation.id())
-        .saturating_add(1);
-    let mut published_negotiation = guard.negotiation;
+    let mut published_negotiation = snapshot.negotiation;
     if !published_negotiation.output_recreated(
         observed.rect,
         observed.fullscreen,
         surface_extent,
         Instant::now(),
-    ) {
-        drop(guard);
-        super::lifetime::restore_surface_window(surface);
+    ) || !surface_extent_accepts(surface_extent, target_extent)
+    {
+        unsafe {
+            finish_native_generation_failure(
+                device_state,
+                snapshot,
+                runtime,
+                vk::SwapchainKHR::null(),
+                &ash::khr::swapchain::Device::new(&device_state.instance, &device_state.device),
+            )
+        };
         return false;
     }
-    let create_info = template.create_info(surface, target_extent, old_physical);
+    let Some(proc) =
+        (unsafe { device_downstream(device_state.device.handle(), c"vkCreateSwapchainKHR") })
+    else {
+        unsafe {
+            finish_native_generation_failure(
+                device_state,
+                snapshot,
+                runtime,
+                vk::SwapchainKHR::null(),
+                &ash::khr::swapchain::Device::new(&device_state.instance, &device_state.device),
+            )
+        };
+        return false;
+    };
+    let create: vk::PFN_vkCreateSwapchainKHR = unsafe { std::mem::transmute(proc) };
+    let create_info = snapshot
+        .template
+        .create_info(surface, target_extent, snapshot.old_physical);
     let mut new_physical = vk::SwapchainKHR::null();
     let result = unsafe {
         create(
@@ -517,47 +639,92 @@ pub(super) unsafe fn publish_native_generation(
             &mut new_physical,
         )
     };
+    let loader = ash::khr::swapchain::Device::new(&device_state.instance, &device_state.device);
     if result != vk::Result::SUCCESS || new_physical == vk::SwapchainKHR::null() {
-        drop(guard);
-        super::lifetime::restore_surface_window(surface);
+        unsafe {
+            finish_native_generation_failure(device_state, snapshot, runtime, new_physical, &loader)
+        };
         return false;
     }
-    let loader = ash::khr::swapchain::Device::new(&device_state.instance, &device_state.device);
     let new_images = match unsafe { loader.get_swapchain_images(new_physical) } {
         Ok(images) => images,
         Err(_) => {
-            unsafe { loader.destroy_swapchain(new_physical, None) };
-            drop(guard);
-            super::lifetime::restore_surface_window(surface);
+            unsafe {
+                finish_native_generation_failure(
+                    device_state,
+                    snapshot,
+                    runtime,
+                    new_physical,
+                    &loader,
+                )
+            };
             return false;
         }
     };
     let info = SwapchainInfo {
-        format: template.image_format,
-        color_space: template.image_color_space,
+        format: snapshot.template.image_format,
+        color_space: snapshot.template.image_color_space,
         extent: target_extent,
     };
-    if unsafe { guard.overlay.reconfigure_output(info, new_images.clone()) }.is_err() {
-        unsafe { loader.destroy_swapchain(new_physical, None) };
-        drop(guard);
-        super::lifetime::restore_surface_window(surface);
+    if unsafe { runtime.reconfigure_output(info, new_images.clone()) }.is_err() {
+        unsafe {
+            finish_native_generation_failure(device_state, snapshot, runtime, new_physical, &loader)
+        };
         return false;
     }
-    let Some(mapping) = guard.mapping.as_mut() else {
-        unsafe { loader.destroy_swapchain(new_physical, None) };
-        drop(guard);
-        super::lifetime::restore_surface_window(surface);
-        return false;
-    };
-    if !mapping.replace_generation(next_generation) {
-        unsafe { loader.destroy_swapchain(new_physical, None) };
-        drop(guard);
-        super::lifetime::restore_surface_window(surface);
-        return false;
-    }
-    if let Some(contract) = guard.contract.as_mut()
-        && contract
-            .replace_generation(
+
+    let mut runtime = Some(runtime);
+    let published = {
+        let mut guard = snapshot
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let prepared = match (guard.mapping.clone(), guard.contract.clone()) {
+            (Some(mut mapping), Some(mut contract)) => {
+                let next_generation = snapshot.ticket.generation().saturating_add(1);
+                let valid = guard.lifecycle.can_publish(
+                    snapshot.ticket,
+                    guard.logical_handle,
+                    guard.surface,
+                    guard.generation,
+                    is_retired_swapchain(guard.logical_handle),
+                );
+                valid
+                    && mapping.replace_generation(next_generation)
+                    && contract
+                        .replace_generation(
+                            PhysicalGeneration::new(
+                                next_generation,
+                                new_physical,
+                                target_extent,
+                                new_images.len(),
+                            ),
+                            published_negotiation.public_state(),
+                        )
+                        .is_ok()
+            }
+            _ => false,
+        };
+        let next_generation = snapshot.ticket.generation().saturating_add(1);
+        let logical_handle = guard.logical_handle;
+        let current_surface = guard.surface;
+        let current_generation = guard.generation;
+        let retired = is_retired_swapchain(logical_handle);
+        let published = prepared
+            && guard.lifecycle.publish(
+                snapshot.ticket,
+                logical_handle,
+                current_surface,
+                current_generation,
+                retired,
+            );
+        if !published {
+            false
+        } else {
+            let mut mapping = guard.mapping.take().expect("mapping was prepared");
+            let mut contract = guard.contract.take().expect("contract was prepared");
+            let _ = mapping.replace_generation(next_generation);
+            let _ = contract.replace_generation(
                 PhysicalGeneration::new(
                     next_generation,
                     new_physical,
@@ -565,38 +732,42 @@ pub(super) unsafe fn publish_native_generation(
                     new_images.len(),
                 ),
                 published_negotiation.public_state(),
-            )
-            .is_err()
-    {
-        unsafe { loader.destroy_swapchain(new_physical, None) };
-        drop(guard);
-        super::lifetime::restore_surface_window(surface);
+            );
+            contract.set_state(published_negotiation.public_state());
+            guard.mapping = Some(mapping);
+            guard.contract = Some(contract);
+            guard.negotiation = published_negotiation;
+            guard.physical_handle = new_physical;
+            guard.physical_images = new_images.clone();
+            guard.generation = next_generation;
+            guard.overlay = runtime.take();
+            true
+        }
+    };
+    if !published {
+        let mut runtime = runtime.expect("failed publication retains the runtime");
+        let rollback =
+            unsafe { runtime.restore_output(snapshot.old_info, snapshot.old_images.clone()) };
+        if rollback.is_err() {
+            runtime.disable();
+        }
+        unsafe {
+            finish_native_generation_failure(device_state, snapshot, runtime, new_physical, &loader)
+        };
         return false;
     }
-    guard.negotiation = published_negotiation;
-    if let Some(contract) = guard.contract.as_mut() {
-        contract.set_state(published_negotiation.public_state());
-    }
-    let logical_handle = guard.logical_handle;
-    let logical_extent = guard
-        .contract
-        .as_ref()
-        .map_or(vk::Extent2D::default(), |contract| contract.game_extent());
-    guard.physical_handle = new_physical;
-    guard.physical_images = new_images;
-    guard.generation = next_generation;
-    drop(guard);
+    let logical_extent = snapshot.contract.game_extent();
     publish_negotiation(surface, published_negotiation);
     eprintln!(
         "TuxScaling evidence event=virtual_swapchain_active logical_handle=0x{:x} logical={}x{} physical={}x{} generation={}",
-        logical_handle.as_raw(),
+        snapshot.ticket.logical_handle().as_raw(),
         logical_extent.width,
         logical_extent.height,
         target_extent.width,
         target_extent.height,
-        next_generation,
+        snapshot.ticket.generation().saturating_add(1),
     );
-    unsafe { loader.destroy_swapchain(old_physical, None) };
+    unsafe { loader.destroy_swapchain(snapshot.old_physical, None) };
     true
 }
 
@@ -1120,6 +1291,9 @@ unsafe fn create_swapchain_inner(
     if is_retired_swapchain(original.old_swapchain) {
         return vk::Result::ERROR_OUT_OF_DATE_KHR;
     }
+    if is_reconfiguring_swapchain(original.old_swapchain) {
+        return vk::Result::ERROR_OUT_OF_DATE_KHR;
+    }
     let old_logical = active_logical_swapchain(original.old_swapchain);
     if old_logical
         .as_ref()
@@ -1473,12 +1647,13 @@ unsafe fn create_swapchain_inner(
                 .as_ref()
                 .map(|images| Mapping::new(0, images.len())),
             negotiation,
-            overlay,
+            overlay: Some(overlay),
             virtual_images,
             physical_images: output_images.clone(),
             generation: 0,
             template,
             contract,
+            lifecycle: crate::recovery::ReconfigurationLifecycle::new(),
         }));
         swapchains()
             .lock()
@@ -1520,7 +1695,9 @@ unsafe fn create_swapchain_inner(
                                 .into_inner()
                                 .unwrap_or_else(|error| error.into_inner())
                                 .overlay;
-                            unsafe { overlay.destroy(&device_state.device) };
+                            if let Some(overlay) = overlay {
+                                unsafe { overlay.destroy(&device_state.device) };
+                            }
                         }
                         return result;
                     }
@@ -1538,7 +1715,9 @@ unsafe fn create_swapchain_inner(
                                 .into_inner()
                                 .unwrap_or_else(|error| error.into_inner())
                                 .overlay;
-                            unsafe { overlay.destroy(&device_state.device) };
+                            if let Some(overlay) = overlay {
+                                unsafe { overlay.destroy(&device_state.device) };
+                            }
                         }
                         return result;
                     }
@@ -1620,7 +1799,10 @@ mod tests {
         logical_image_count, physical_swapchain_info, temporal_enabled_for_logical_creation,
         translate_old_swapchain, translate_recreation_create_info, virtual_swapchain_supported,
     };
-    use crate::recovery::{LogicalSwapchainContract, PhysicalGeneration};
+    use crate::recovery::{
+        LogicalSwapchainContract, PhysicalGeneration, ReconfigurationLifecycle,
+        ReconfigurationTicket,
+    };
     use crate::state::SwapchainTemplate;
     use crate::state::retire_swapchain;
     use ash::vk;
@@ -1807,5 +1989,21 @@ mod tests {
             Some(PresentationState::Virtualized)
         ));
         assert!(temporal_enabled_for_logical_creation(false, None));
+    }
+
+    #[test]
+    fn native_generation_hook_reentrant_downstream_callback_can_query_layer_registry() {
+        let logical = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0201);
+        let surface = vk::SurfaceKHR::from_raw(0x9201);
+        let ticket = ReconfigurationTicket::new(logical, surface, 1);
+        let registry = std::sync::Arc::new(std::sync::Mutex::new(ReconfigurationLifecycle::new()));
+        assert!(registry.lock().unwrap().begin(ticket));
+
+        let callback_registry = registry.clone();
+        let downstream_callback =
+            std::thread::spawn(move || callback_registry.lock().unwrap().blocks_frame_operations());
+
+        assert!(downstream_callback.join().unwrap());
+        assert!(registry.lock().unwrap().abort(ticket));
     }
 }

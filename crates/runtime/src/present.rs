@@ -701,6 +701,25 @@ impl SwapchainRuntime {
         info: SwapchainInfo,
         output_images: Vec<vk::Image>,
     ) -> Result<(), vk::Result> {
+        unsafe { self.reconfigure_output_with_temporal(info, output_images, true) }
+    }
+
+    /// Restores the previous physical output mode after a publication race.
+    /// Unlike a native publication, this keeps the runtime in spatial bypass.
+    pub unsafe fn restore_output(
+        &mut self,
+        info: SwapchainInfo,
+        output_images: Vec<vk::Image>,
+    ) -> Result<(), vk::Result> {
+        unsafe { self.reconfigure_output_with_temporal(info, output_images, false) }
+    }
+
+    unsafe fn reconfigure_output_with_temporal(
+        &mut self,
+        info: SwapchainInfo,
+        output_images: Vec<vk::Image>,
+        temporal_enabled: bool,
+    ) -> Result<(), vk::Result> {
         if output_images.is_empty() || info.extent.width == 0 || info.extent.height == 0 {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
@@ -765,7 +784,7 @@ impl SwapchainRuntime {
         self.output_images = output_images;
         self.output_presented = vec![false; self.output_images.len()];
         self.pending_output = None;
-        self.temporal_enabled = true;
+        self.temporal_enabled = temporal_enabled;
         self.temporal.reset_history(GuidanceReset::Resize);
         self.diagnostics.state = "Native generation published; temporal backend ready".into();
         self.diagnostics.reset_reason = reset_name(GuidanceReset::Resize).into();

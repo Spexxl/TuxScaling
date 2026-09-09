@@ -218,10 +218,142 @@ impl LeaseCleanup {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReconfigurationTicket {
+    logical_handle: vk::SwapchainKHR,
+    surface: vk::SurfaceKHR,
+    generation: u64,
+}
+
+impl ReconfigurationTicket {
+    pub(crate) const fn new(
+        logical_handle: vk::SwapchainKHR,
+        surface: vk::SurfaceKHR,
+        generation: u64,
+    ) -> Self {
+        Self {
+            logical_handle,
+            surface,
+            generation,
+        }
+    }
+
+    pub(crate) const fn logical_handle(self) -> vk::SwapchainKHR {
+        self.logical_handle
+    }
+
+    pub(crate) const fn surface(self) -> vk::SurfaceKHR {
+        self.surface
+    }
+
+    pub(crate) const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ReconfigurationLifecycle {
+    active: Option<ReconfigurationTicket>,
+    destroy_requested: bool,
+    generation: Option<u64>,
+}
+
+impl ReconfigurationLifecycle {
+    pub(crate) const fn new() -> Self {
+        Self {
+            active: None,
+            destroy_requested: false,
+            generation: None,
+        }
+    }
+
+    pub(crate) fn begin(&mut self, ticket: ReconfigurationTicket) -> bool {
+        if self.active.is_some() {
+            return false;
+        }
+        self.active = Some(ticket);
+        self.destroy_requested = false;
+        self.generation = Some(ticket.generation());
+        true
+    }
+
+    pub(crate) const fn blocks_frame_operations(&self) -> bool {
+        self.active.is_some()
+    }
+
+    pub(crate) fn can_publish(
+        &self,
+        ticket: ReconfigurationTicket,
+        logical_handle: vk::SwapchainKHR,
+        surface: vk::SurfaceKHR,
+        generation: u64,
+        retired: bool,
+    ) -> bool {
+        self.active == Some(ticket)
+            && !self.destroy_requested
+            && !retired
+            && ticket.logical_handle() == logical_handle
+            && ticket.surface() == surface
+            && ticket.generation() == generation
+    }
+
+    pub(crate) fn publish(
+        &mut self,
+        ticket: ReconfigurationTicket,
+        logical_handle: vk::SwapchainKHR,
+        surface: vk::SurfaceKHR,
+        generation: u64,
+        retired: bool,
+    ) -> bool {
+        if !self.can_publish(ticket, logical_handle, surface, generation, retired) {
+            return false;
+        }
+        self.active = None;
+        self.generation = Some(generation);
+        true
+    }
+
+    pub(crate) fn abort(&mut self, ticket: ReconfigurationTicket) -> bool {
+        if self.active != Some(ticket) {
+            return false;
+        }
+        self.active = None;
+        self.destroy_requested = false;
+        true
+    }
+
+    pub(crate) fn request_destroy(&mut self) -> bool {
+        if self.active.is_none() || self.destroy_requested {
+            return false;
+        }
+        self.destroy_requested = true;
+        true
+    }
+
+    pub(crate) const fn destroy_requested(&self) -> bool {
+        self.destroy_requested
+    }
+
+    pub(crate) fn take_destroy_request(&mut self, ticket: ReconfigurationTicket) -> bool {
+        if self.active != Some(ticket) || !self.destroy_requested {
+            return false;
+        }
+        self.active = None;
+        self.destroy_requested = false;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn generation(&self) -> Option<u64> {
+        self.generation
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         FrameBinding, LeaseCleanup, LogicalSwapchainContract, PhysicalGeneration, PresentationPath,
+        ReconfigurationLifecycle, ReconfigurationTicket,
     };
     use ash::{vk, vk::Handle};
     use tuxscaling_display::PresentationState;
@@ -367,5 +499,95 @@ mod tests {
         assert!(cleanup.restore_once());
         assert!(!cleanup.restore_once());
         assert_eq!(cleanup.restore_count(), 1);
+    }
+
+    #[test]
+    fn reconfiguration_blocks_acquire_and_present_until_atomic_publication() {
+        let logical = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0101);
+        let surface = vk::SurfaceKHR::from_raw(0x2201);
+        let ticket = ReconfigurationTicket::new(logical, surface, 4);
+        let mut lifecycle = ReconfigurationLifecycle::new();
+
+        assert!(lifecycle.begin(ticket));
+        assert!(lifecycle.blocks_frame_operations());
+        assert!(!lifecycle.can_publish(ticket, logical, surface, 5, false));
+
+        assert!(lifecycle.publish(ticket, logical, surface, 4, false));
+        assert!(!lifecycle.blocks_frame_operations());
+    }
+
+    #[test]
+    fn failed_physical_creation_keeps_generation_and_clears_reconfiguring() {
+        let logical = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0102);
+        let surface = vk::SurfaceKHR::from_raw(0x2202);
+        let ticket = ReconfigurationTicket::new(logical, surface, 8);
+        let mut lifecycle = ReconfigurationLifecycle::new();
+
+        assert!(lifecycle.begin(ticket));
+        assert!(lifecycle.abort(ticket));
+        assert!(!lifecycle.blocks_frame_operations());
+        assert_eq!(lifecycle.generation(), Some(8));
+    }
+
+    #[test]
+    fn stale_publication_and_duplicate_begin_are_rejected() {
+        let logical = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0103);
+        let surface = vk::SurfaceKHR::from_raw(0x2203);
+        let ticket = ReconfigurationTicket::new(logical, surface, 11);
+        let mut lifecycle = ReconfigurationLifecycle::new();
+
+        assert!(lifecycle.begin(ticket));
+        assert!(!lifecycle.begin(ticket));
+        assert!(!lifecycle.can_publish(ticket, logical, surface, 12, false));
+        assert!(!lifecycle.can_publish(ticket, logical, surface, 11, true));
+        assert!(!lifecycle.publish(ticket, logical, surface, 12, false));
+    }
+
+    #[test]
+    fn destroy_during_reconfiguration_is_deferred_and_consumed_once() {
+        let logical = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0104);
+        let surface = vk::SurfaceKHR::from_raw(0x2204);
+        let ticket = ReconfigurationTicket::new(logical, surface, 15);
+        let mut lifecycle = ReconfigurationLifecycle::new();
+
+        assert!(lifecycle.begin(ticket));
+        assert!(lifecycle.request_destroy());
+        assert!(!lifecycle.can_publish(ticket, logical, surface, 15, false));
+        assert!(lifecycle.take_destroy_request(ticket));
+        assert!(!lifecycle.take_destroy_request(ticket));
+        assert!(!lifecycle.blocks_frame_operations());
+    }
+
+    #[test]
+    fn reentrant_external_callback_can_query_marked_registry() {
+        let logical = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0105);
+        let surface = vk::SurfaceKHR::from_raw(0x2205);
+        let ticket = ReconfigurationTicket::new(logical, surface, 18);
+        let lifecycle = std::sync::Arc::new(std::sync::Mutex::new(ReconfigurationLifecycle::new()));
+
+        {
+            let mut state = lifecycle.lock().unwrap();
+            assert!(state.begin(ticket));
+        }
+
+        let callback_state = lifecycle.clone();
+        let callback =
+            std::thread::spawn(move || callback_state.lock().unwrap().blocks_frame_operations());
+
+        assert!(callback.join().unwrap());
+    }
+
+    #[test]
+    fn successful_publication_keeps_logical_contract_and_changes_only_physical_generation() {
+        let logical = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0106);
+        let surface = vk::SurfaceKHR::from_raw(0x2206);
+        let ticket = ReconfigurationTicket::new(logical, surface, 21);
+        let mut lifecycle = ReconfigurationLifecycle::new();
+
+        assert!(lifecycle.begin(ticket));
+        assert!(lifecycle.publish(ticket, logical, surface, 21, false));
+        assert_eq!(lifecycle.generation(), Some(21));
+        assert_eq!(ticket.logical_handle(), logical);
+        assert_eq!(ticket.surface(), surface);
     }
 }

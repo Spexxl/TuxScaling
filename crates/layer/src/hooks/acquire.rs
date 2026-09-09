@@ -10,22 +10,38 @@ fn reject_retired_swapchain(swapchain: vk::SwapchainKHR) -> Result<(), vk::Resul
     }
 }
 
+type VirtualSwapchain = (Arc<Mutex<SwapchainState>>, vk::SwapchainKHR);
+
 fn virtual_physical_swapchain(
     logical: vk::SwapchainKHR,
-) -> Option<(Arc<Mutex<SwapchainState>>, vk::SwapchainKHR)> {
+) -> Result<Option<VirtualSwapchain>, vk::Result> {
     let state = swapchains()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(&logical)
-        .cloned()?;
-    let physical = state.lock().ok().and_then(|state| {
-        state
-            .mapping
-            .as_ref()
-            .and_then(|_| state.contract.as_ref().map(|contract| contract.handle()))
-            .map(|_| state.physical_handle)
-    })?;
-    Some((state, physical))
+        .cloned();
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    let state_guard = state.lock().unwrap_or_else(|error| error.into_inner());
+    if state_guard.lifecycle.blocks_frame_operations() {
+        return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
+    }
+    let physical = state_guard
+        .mapping
+        .as_ref()
+        .and_then(|_| {
+            state_guard
+                .contract
+                .as_ref()
+                .map(|contract| contract.handle())
+        })
+        .map(|_| state_guard.physical_handle);
+    let Some(physical) = physical else {
+        return Ok(None);
+    };
+    drop(state_guard);
+    Ok(Some((state, physical)))
 }
 
 fn map_acquired_image(
@@ -37,6 +53,9 @@ fn map_acquired_image(
         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
     }
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    if state.lifecycle.blocks_frame_operations() {
+        return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
+    }
     let Some(mapping) = state.mapping.as_mut() else {
         return Ok(());
     };
@@ -49,6 +68,9 @@ fn map_acquired_image(
 
 fn reserve_image_slot(state: &Arc<Mutex<SwapchainState>>) -> Result<Option<u32>, vk::Result> {
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    if state.lifecycle.blocks_frame_operations() {
+        return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
+    }
     let Some(mapping) = state.mapping.as_mut() else {
         return Ok(None);
     };
@@ -137,22 +159,24 @@ unsafe fn get_swapchain_images_inner(
     if image_count.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
-    let virtual_images = swapchains()
+    let tracked_state = swapchains()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(&swapchain)
-        .and_then(|state| {
-            state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .contract
-                .as_ref()
-                .map(|contract| {
-                    let snapshot = contract.logical_snapshot();
-                    debug_assert_eq!(contract.logical_images(), snapshot.images());
-                    snapshot.images().to_vec()
-                })
-        });
+        .cloned();
+    let virtual_images = if let Some(state) = tracked_state {
+        let state = state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.lifecycle.blocks_frame_operations() {
+            return vk::Result::ERROR_OUT_OF_DATE_KHR;
+        }
+        state.contract.as_ref().map(|contract| {
+            let snapshot = contract.logical_snapshot();
+            debug_assert_eq!(contract.logical_images(), snapshot.images());
+            snapshot.images().to_vec()
+        })
+    } else {
+        None
+    };
     if let Some(virtual_images) = virtual_images {
         return unsafe { copy_virtual_images(&virtual_images, image_count, images) };
     }
@@ -186,7 +210,10 @@ unsafe fn acquire_next_image_inner(
     if let Err(error) = reject_retired_swapchain(swapchain) {
         return error;
     }
-    let virtual_swapchain = virtual_physical_swapchain(swapchain);
+    let virtual_swapchain = match virtual_physical_swapchain(swapchain) {
+        Ok(virtual_swapchain) => virtual_swapchain,
+        Err(error) => return error,
+    };
     let physical_swapchain = virtual_swapchain
         .as_ref()
         .map_or(swapchain, |(_, physical)| *physical);
@@ -276,7 +303,10 @@ unsafe fn acquire_next_image2_inner(
     if let Err(error) = reject_retired_swapchain(logical_swapchain) {
         return error;
     }
-    let virtual_swapchain = virtual_physical_swapchain(logical_swapchain);
+    let virtual_swapchain = match virtual_physical_swapchain(logical_swapchain) {
+        Ok(virtual_swapchain) => virtual_swapchain,
+        Err(error) => return error,
+    };
     let reserved_logical = if let Some((state, _)) = virtual_swapchain.as_ref() {
         match reserve_image_slot(state) {
             Ok(reserved) => reserved,

@@ -48,6 +48,9 @@ unsafe fn translate_present(
             continue;
         };
         let state_guard = state.lock().unwrap_or_else(|error| error.into_inner());
+        if state_guard.lifecycle.blocks_frame_operations() {
+            return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
+        }
         let Some(mapping) = state_guard.mapping.as_ref() else {
             translated.swapchains.push(*logical_handle);
             translated.image_indices.push(*logical_index);
@@ -90,7 +93,11 @@ unsafe fn observe_presented_surfaces(queue_state: QueueState, info: &vk::Present
         handles
             .iter()
             .filter_map(|handle| states.get(handle))
-            .filter_map(|state| state.lock().ok().map(|state| state.surface))
+            .filter_map(|state| {
+                state.lock().ok().and_then(|state| {
+                    (!state.lifecycle.blocks_frame_operations()).then_some(state.surface)
+                })
+            })
             .collect::<Vec<_>>()
     };
     let Some(device_state) = devices()
@@ -120,7 +127,7 @@ unsafe fn uses_virtual_output(info: &vk::PresentInfoKHR<'_>) -> bool {
     presented.iter().any(|swapchain| {
         states.get(swapchain).is_some_and(|state| {
             let state = state.lock().unwrap_or_else(|error| error.into_inner());
-            state.contract.is_some()
+            !state.lifecycle.blocks_frame_operations() && state.contract.is_some()
         })
     })
 }
@@ -204,6 +211,14 @@ unsafe fn submit_overlay(
         if swapchain_state.device != queue_state.device {
             continue;
         }
+        if swapchain_state.lifecycle.blocks_frame_operations() {
+            continue;
+        }
+        let has_contract = swapchain_state.contract.is_some();
+        let temporal_allowed = swapchain_state
+            .contract
+            .as_ref()
+            .is_some_and(|contract| contract.presentation_path() == PresentationPath::Temporal);
         if let Some(contract) = swapchain_state.contract.as_ref()
             && contract
                 .bind(FrameBinding::new(logical_index, physical_index))
@@ -211,13 +226,12 @@ unsafe fn submit_overlay(
         {
             continue;
         }
-        let temporal_allowed = swapchain_state
-            .contract
-            .as_ref()
-            .is_some_and(|contract| contract.presentation_path() == PresentationPath::Temporal);
-        let prepared_frame = if swapchain_state.contract.is_some() && !temporal_allowed {
+        let Some(overlay) = swapchain_state.overlay.as_mut() else {
+            continue;
+        };
+        let prepared_frame = if has_contract && !temporal_allowed {
             unsafe {
-                swapchain_state.overlay.prepare_spatial_fallback(
+                overlay.prepare_spatial_fallback(
                     queue,
                     queue_state.family_index,
                     logical_index,
@@ -227,7 +241,7 @@ unsafe fn submit_overlay(
             }
         } else {
             unsafe {
-                swapchain_state.overlay.prepare_frame(
+                overlay.prepare_frame(
                     &device_state.device,
                     queue,
                     queue_state.family_index,
@@ -239,7 +253,7 @@ unsafe fn submit_overlay(
         match prepared_frame {
             Ok(frame) => prepared.push((state.clone(), frame)),
             Err(error) => match unsafe {
-                swapchain_state.overlay.prepare_spatial_fallback(
+                overlay.prepare_spatial_fallback(
                     queue,
                     queue_state.family_index,
                     logical_index,
@@ -252,7 +266,7 @@ unsafe fn submit_overlay(
                     eprintln!(
                         "TuxScaling: spatial fallback failed ({fallback_error:?}); bypassing overlay"
                     );
-                    swapchain_state.overlay.disable();
+                    overlay.disable();
                 }
             },
         }
@@ -292,18 +306,18 @@ unsafe fn submit_overlay(
             }
             .is_err()
         {
-            state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .overlay
-                .disable();
+            if let Ok(mut state) = state.lock()
+                && let Some(overlay) = state.overlay.as_mut()
+            {
+                overlay.disable();
+            }
             break;
         }
-        state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .overlay
-            .submitted();
+        if let Ok(mut state) = state.lock()
+            && let Some(overlay) = state.overlay.as_mut()
+        {
+            overlay.submitted();
+        }
         previous = Some(frame.render_complete);
     }
     *handoff = previous;
@@ -412,16 +426,17 @@ unsafe fn queue_present_inner(
                                     state.as_ref().and_then(|state| state.lock().ok()).map_or(
                                         *rectangle,
                                         |state| {
-                                            let mapped =
-                                                state.overlay.map_damage_rect(vk::Rect2D {
+                                            state.overlay.as_ref().map_or(*rectangle, |overlay| {
+                                                let mapped = overlay.map_damage_rect(vk::Rect2D {
                                                     offset: rectangle.offset,
                                                     extent: rectangle.extent,
                                                 });
-                                            vk::RectLayerKHR {
-                                                offset: mapped.offset,
-                                                extent: mapped.extent,
-                                                layer: rectangle.layer,
-                                            }
+                                                vk::RectLayerKHR {
+                                                    offset: mapped.offset,
+                                                    extent: mapped.extent,
+                                                    layer: rectangle.layer,
+                                                }
+                                            })
                                         },
                                     )
                                 } else {
@@ -487,12 +502,11 @@ unsafe fn queue_present_inner(
             };
             let states = swapchains().lock().unwrap_or_else(|e| e.into_inner());
             for swapchain in presented {
-                if let Some(state) = states.get(swapchain).cloned() {
-                    state
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .overlay
-                        .presentation_failed();
+                if let Some(state) = states.get(swapchain).cloned()
+                    && let Ok(mut state) = state.lock()
+                    && let Some(overlay) = state.overlay.as_mut()
+                {
+                    overlay.presentation_failed();
                 }
             }
         }

@@ -20,6 +20,18 @@ unsafe fn destroy_swapchain_inner(
         swapchain.as_raw(),
     );
     let destroy = unsafe { device_downstream(device, c"vkDestroySwapchainKHR") };
+    let tracked_state = swapchains()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&swapchain)
+        .cloned();
+    if let Some(state) = &tracked_state {
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.lifecycle.blocks_frame_operations() {
+            let _ = state.lifecycle.request_destroy();
+            return;
+        }
+    }
     let state = swapchains()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -54,9 +66,10 @@ unsafe fn destroy_swapchain_inner(
             .and_then(|s| Arc::try_unwrap(s).ok())
             .map(|s| s.into_inner().unwrap_or_else(|e| e.into_inner()))
             && let Some(device_state) = device_state
+            && let Some(overlay) = state.overlay
         {
             let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
-                destroy_overlay(&device_state, state.overlay)
+                destroy_overlay(&device_state, overlay)
             }));
         }
         if let Some(surface) = restore_surface {
@@ -228,7 +241,9 @@ unsafe fn destroy_device_inner(
                     if let Ok(state) = Arc::try_unwrap(state) {
                         let state = state.into_inner().unwrap_or_else(|e| e.into_inner());
                         let restore_surface = state.mapping.is_some().then_some(state.surface);
-                        state.overlay.destroy(&device_state.device);
+                        if let Some(overlay) = state.overlay {
+                            overlay.destroy(&device_state.device);
+                        }
                         if let Some(surface) = restore_surface {
                             restore_surface_window(surface);
                         }

@@ -7,7 +7,7 @@ use tuxscaling_runtime::{SetLoaderData, SwapchainRuntime as OverlaySwapchain};
 use tuxscaling_vulkan::Image;
 
 use crate::mapping::{LogicalSwapchainHandle, Mapping};
-use crate::recovery::LogicalSwapchainContract;
+use crate::recovery::{LogicalSwapchainContract, ReconfigurationLifecycle};
 
 #[derive(Clone)]
 pub(crate) struct SwapchainTemplate {
@@ -99,12 +99,13 @@ pub(crate) struct SwapchainState {
     pub(crate) physical_handle: vk::SwapchainKHR,
     pub(crate) mapping: Option<Mapping>,
     pub(crate) negotiation: tuxscaling_display::PresentationNegotiation,
-    pub(crate) overlay: OverlaySwapchain,
+    pub(crate) overlay: Option<OverlaySwapchain>,
     pub(crate) virtual_images: Option<Vec<Image>>,
     pub(crate) physical_images: Vec<vk::Image>,
     pub(crate) generation: u64,
     pub(crate) template: Option<SwapchainTemplate>,
     pub(crate) contract: Option<LogicalSwapchainContract>,
+    pub(crate) lifecycle: ReconfigurationLifecycle,
 }
 
 #[derive(Clone, Copy)]
@@ -160,6 +161,15 @@ pub(crate) fn queues() -> &'static Mutex<HashMap<vk::Queue, QueueState>> {
 pub(crate) fn swapchains() -> &'static Mutex<HashMap<vk::SwapchainKHR, Arc<Mutex<SwapchainState>>>>
 {
     SWAPCHAINS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn is_reconfiguring_swapchain(swapchain: vk::SwapchainKHR) -> bool {
+    swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&swapchain)
+        .and_then(|state| state.lock().ok())
+        .is_some_and(|state| state.lifecycle.blocks_frame_operations())
 }
 
 #[cfg(test)]

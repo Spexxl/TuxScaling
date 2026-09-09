@@ -16,8 +16,8 @@ use super::{
     },
     state::{
         DeviceState, QueueState, SwapchainState, X11Surface, devices, instance_api_versions,
-        instances, is_retired_swapchain, is_unknown_logical_swapchain, queues, retire_swapchain,
-        surfaces, swapchains,
+        instances, is_reconfiguring_swapchain, is_retired_swapchain, is_unknown_logical_swapchain,
+        queues, retire_swapchain, surfaces, swapchains,
     },
 };
 use crate::mapping::LogicalSwapchainHandle;
