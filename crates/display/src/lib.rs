@@ -1,4 +1,7 @@
-use std::fmt::Display as FmtDisplay;
+use std::{
+    fmt::Display as FmtDisplay,
+    time::{Duration, Instant},
+};
 
 use thiserror::Error;
 use x11rb::{
@@ -38,15 +41,178 @@ impl Rect {
         self.width != 0 && self.height != 0
     }
 
-    fn intersection_area(self, other: Self) -> u64 {
-        let left = i64::from(self.x).max(i64::from(other.x));
-        let top = i64::from(self.y).max(i64::from(other.y));
-        let right = (i64::from(self.x) + i64::from(self.width))
-            .min(i64::from(other.x) + i64::from(other.width));
-        let bottom = (i64::from(self.y) + i64::from(self.height))
-            .min(i64::from(other.y) + i64::from(other.height));
-        u64::try_from((right - left).max(0)).unwrap_or(0)
-            * u64::try_from((bottom - top).max(0)).unwrap_or(0)
+    pub const fn extent(self) -> Extent {
+        Extent::new(self.width, self.height)
+    }
+
+    fn contains_center(self, window: Self) -> bool {
+        if !self.is_valid() {
+            return false;
+        }
+        let center_x = i64::from(window.x) * 2 + i64::from(window.width);
+        let center_y = i64::from(window.y) * 2 + i64::from(window.height);
+        let left = i64::from(self.x) * 2;
+        let top = i64::from(self.y) * 2;
+        let right = (i64::from(self.x) + i64::from(self.width)) * 2;
+        let bottom = (i64::from(self.y) + i64::from(self.height)) * 2;
+
+        left <= center_x && center_x < right && top <= center_y && center_y < bottom
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extent {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Extent {
+    pub const fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+
+    pub const fn is_valid(self) -> bool {
+        self.width != 0 && self.height != 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceExtent {
+    Fixed(Extent),
+    Range { minimum: Extent, maximum: Extent },
+}
+
+impl SurfaceExtent {
+    pub const fn fixed(extent: Extent) -> Self {
+        Self::Fixed(extent)
+    }
+
+    fn accepts(self, target: Extent) -> bool {
+        match self {
+            Self::Fixed(extent) => extent == target,
+            Self::Range { minimum, maximum } => {
+                target.width >= minimum.width
+                    && target.width <= maximum.width
+                    && target.height >= minimum.height
+                    && target.height <= maximum.height
+            }
+        }
+    }
+}
+
+pub const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentationState {
+    Direct,
+    Negotiating,
+    Virtualized,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NegotiationFailure {
+    BorderlessRequest,
+    DeadlineExpired,
+    OutputRecreation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NegotiationStage {
+    Direct,
+    RequestingBorderless { target: Rect },
+    WaitingForNativeExtent { target: Rect, deadline: Instant },
+    RecreatingOutput { target: Rect },
+    Active { target: Rect },
+    Failed { reason: NegotiationFailure },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentationNegotiation {
+    stage: NegotiationStage,
+}
+
+impl PresentationNegotiation {
+    pub const fn direct() -> Self {
+        Self {
+            stage: NegotiationStage::Direct,
+        }
+    }
+
+    pub fn request_borderless(&mut self, target: Rect) -> bool {
+        if !target.is_valid() || !matches!(self.stage, NegotiationStage::Direct) {
+            return false;
+        }
+        self.stage = NegotiationStage::RequestingBorderless { target };
+        true
+    }
+
+    pub fn borderless_requested(&mut self, now: Instant) -> bool {
+        let NegotiationStage::RequestingBorderless { target } = self.stage else {
+            return false;
+        };
+        self.stage = NegotiationStage::WaitingForNativeExtent {
+            target,
+            deadline: now + NEGOTIATION_TIMEOUT,
+        };
+        true
+    }
+
+    pub fn observe(&mut self, window: Rect, surface: SurfaceExtent, now: Instant) -> bool {
+        match self.stage {
+            NegotiationStage::WaitingForNativeExtent { target, deadline } => {
+                if now >= deadline {
+                    self.fail(NegotiationFailure::DeadlineExpired);
+                    return false;
+                }
+                if window == target && surface.accepts(target.extent()) {
+                    self.stage = NegotiationStage::RecreatingOutput { target };
+                    return true;
+                }
+            }
+            NegotiationStage::Active { target }
+                if window != target || !surface.accepts(target.extent()) =>
+            {
+                self.stage = NegotiationStage::WaitingForNativeExtent {
+                    target,
+                    deadline: now + NEGOTIATION_TIMEOUT,
+                };
+            }
+            _ => {}
+        }
+        false
+    }
+
+    pub fn output_recreated(&mut self) -> bool {
+        let NegotiationStage::RecreatingOutput { target } = self.stage else {
+            return false;
+        };
+        self.stage = NegotiationStage::Active { target };
+        true
+    }
+
+    pub fn fail(&mut self, reason: NegotiationFailure) {
+        if !matches!(self.stage, NegotiationStage::Failed { .. }) {
+            self.stage = NegotiationStage::Failed { reason };
+        }
+    }
+
+    pub const fn public_state(self) -> PresentationState {
+        match self.stage {
+            NegotiationStage::Direct => PresentationState::Direct,
+            NegotiationStage::RequestingBorderless { .. }
+            | NegotiationStage::WaitingForNativeExtent { .. }
+            | NegotiationStage::RecreatingOutput { .. } => PresentationState::Negotiating,
+            NegotiationStage::Active { .. } => PresentationState::Virtualized,
+            NegotiationStage::Failed { .. } => PresentationState::Failed,
+        }
+    }
+
+    pub const fn failure(self) -> Option<NegotiationFailure> {
+        match self.stage {
+            NegotiationStage::Failed { reason } => Some(reason),
+            _ => None,
+        }
     }
 }
 
@@ -128,9 +294,7 @@ pub fn select_monitor(window: Rect, monitors: &[Monitor]) -> Option<Monitor> {
     monitors
         .iter()
         .copied()
-        .filter(|monitor| monitor.rect.is_valid())
-        .max_by_key(|monitor| window.intersection_area(monitor.rect))
-        .filter(|monitor| window.intersection_area(monitor.rect) > 0)
+        .find(|monitor| monitor.rect.contains_center(window))
 }
 
 #[derive(Debug, Error)]
@@ -432,11 +596,14 @@ impl X11Display {
 #[cfg(test)]
 mod tests {
     use super::{
-        BorderlessLease, DisplayTarget, Monitor, Rect, WindowSnapshot, X11Window, select_monitor,
+        BorderlessLease, DisplayTarget, Extent, Monitor, NegotiationFailure,
+        PresentationNegotiation, PresentationState, Rect, SurfaceExtent, WindowSnapshot, X11Window,
+        select_monitor,
     };
+    use std::time::{Duration, Instant};
 
     #[test]
-    fn selects_the_monitor_with_the_largest_window_intersection() {
+    fn selects_the_monitor_containing_the_window_center() {
         let monitors = [
             Monitor::new(Rect::new(0, 0, 1920, 1080)),
             Monitor::new(Rect::new(1920, 0, 2560, 1440)),
@@ -444,6 +611,125 @@ mod tests {
         let window = Rect::new(1800, 100, 1200, 800);
 
         assert_eq!(select_monitor(window, &monitors), Some(monitors[1]));
+    }
+
+    #[test]
+    fn selects_center_monitor_even_when_another_monitor_has_more_intersection() {
+        let monitors = [
+            Monitor::new(Rect::new(0, 0, 1920, 1080)),
+            Monitor::new(Rect::new(1920, 0, 160, 200)),
+        ];
+        let window = Rect::new(0, 0, 4000, 100);
+
+        assert_eq!(select_monitor(window, &monitors), Some(monitors[1]));
+    }
+
+    #[test]
+    fn selects_center_monitor_with_negative_origins() {
+        let monitors = [
+            Monitor::new(Rect::new(-1920, 0, 1920, 1080)),
+            Monitor::new(Rect::new(0, 0, 1920, 1080)),
+        ];
+        let window = Rect::new(-1000, 100, 800, 600);
+
+        assert_eq!(select_monitor(window, &monitors), Some(monitors[0]));
+    }
+
+    #[test]
+    fn negotiation_requires_exact_geometry_and_surface_extent_before_activation() {
+        let target = Rect::new(0, 0, 1920, 1080);
+        let mut negotiation = PresentationNegotiation::direct();
+        let started = Instant::now();
+
+        negotiation.request_borderless(target);
+        negotiation.borderless_requested(started);
+        assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+        assert!(!negotiation.observe(
+            Rect::new(0, 0, 1920, 1040),
+            SurfaceExtent::fixed(Extent::new(1920, 1040)),
+            started + Duration::from_secs(1),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+
+        assert!(negotiation.observe(
+            target,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(2),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+
+        negotiation.output_recreated();
+        assert_eq!(negotiation.public_state(), PresentationState::Virtualized);
+    }
+
+    #[test]
+    fn negotiation_times_out_after_five_monotonic_seconds() {
+        let target = Rect::new(0, 0, 1920, 1080);
+        let mut negotiation = PresentationNegotiation::direct();
+        let started = Instant::now();
+
+        negotiation.request_borderless(target);
+        negotiation.borderless_requested(started);
+        assert!(!negotiation.observe(
+            Rect::new(0, 0, 1920, 1040),
+            SurfaceExtent::fixed(Extent::new(1920, 1040)),
+            started + Duration::from_secs(5),
+        ));
+
+        assert_eq!(negotiation.public_state(), PresentationState::Failed);
+        assert_eq!(
+            negotiation.failure(),
+            Some(NegotiationFailure::DeadlineExpired)
+        );
+    }
+
+    #[test]
+    fn active_negotiation_returns_to_waiting_when_native_extent_is_lost() {
+        let target = Rect::new(-1920, 0, 1920, 1080);
+        let mut negotiation = PresentationNegotiation::direct();
+        let started = Instant::now();
+
+        negotiation.request_borderless(target);
+        negotiation.borderless_requested(started);
+        assert!(negotiation.observe(
+            target,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(1),
+        ));
+        negotiation.output_recreated();
+
+        assert!(!negotiation.observe(
+            Rect::new(-1920, 0, 1920, 1040),
+            SurfaceExtent::fixed(Extent::new(1920, 1040)),
+            started + Duration::from_secs(2),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+    }
+
+    #[test]
+    fn negotiation_keeps_the_first_failure_reason_stable() {
+        let mut negotiation = PresentationNegotiation::direct();
+
+        negotiation.fail(NegotiationFailure::BorderlessRequest);
+        negotiation.fail(NegotiationFailure::OutputRecreation);
+
+        assert_eq!(negotiation.public_state(), PresentationState::Failed);
+        assert_eq!(
+            negotiation.failure(),
+            Some(NegotiationFailure::BorderlessRequest)
+        );
+    }
+
+    #[test]
+    fn negotiation_maps_internal_stages_to_public_states() {
+        let target = Rect::new(0, 0, 1920, 1080);
+        let mut negotiation = PresentationNegotiation::direct();
+
+        assert_eq!(negotiation.public_state(), PresentationState::Direct);
+        negotiation.request_borderless(target);
+        assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+        negotiation.fail(NegotiationFailure::BorderlessRequest);
+        assert_eq!(negotiation.public_state(), PresentationState::Failed);
     }
 
     #[test]
