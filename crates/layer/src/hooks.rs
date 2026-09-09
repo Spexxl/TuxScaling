@@ -15,7 +15,8 @@ use super::{
     },
     state::{
         DeviceState, QueueState, SwapchainState, X11Surface, devices, instance_api_versions,
-        instances, is_retired_swapchain, queues, retire_swapchain, surfaces, swapchains,
+        instances, is_retired_swapchain, is_unknown_logical_swapchain, queues, retire_swapchain,
+        surfaces, swapchains,
     },
 };
 
@@ -181,6 +182,8 @@ pub(crate) unsafe fn get_instance_proc_addr_inner(
         | b"vkGetSwapchainImagesKHR"
         | b"vkAcquireNextImageKHR"
         | b"vkAcquireNextImage2KHR"
+        | b"vkReleaseSwapchainImagesEXT"
+        | b"vkGetSwapchainStatusKHR"
         | b"vkDestroyDevice"
         | b"vkQueuePresentKHR" => unsafe {
             get_device_proc_addr_inner(vk::Device::null(), name.as_ptr())
@@ -264,6 +267,16 @@ pub(crate) unsafe fn get_device_proc_addr_inner(
                 acquire_next_image2_khr as vk::PFN_vkAcquireNextImage2KHR,
             )
         },
+        b"vkReleaseSwapchainImagesEXT" => unsafe {
+            std::mem::transmute::<vk::PFN_vkReleaseSwapchainImagesEXT, vk::PFN_vkVoidFunction>(
+                reject_release_swapchain_images_ext as vk::PFN_vkReleaseSwapchainImagesEXT,
+            )
+        },
+        b"vkGetSwapchainStatusKHR" => unsafe {
+            std::mem::transmute::<vk::PFN_vkGetSwapchainStatusKHR, vk::PFN_vkVoidFunction>(
+                reject_get_swapchain_status_khr as vk::PFN_vkGetSwapchainStatusKHR,
+            )
+        },
         b"vkDestroyDevice" => unsafe {
             std::mem::transmute::<vk::PFN_vkDestroyDevice, vk::PFN_vkVoidFunction>(
                 destroy_device as vk::PFN_vkDestroyDevice,
@@ -276,4 +289,18 @@ pub(crate) unsafe fn get_device_proc_addr_inner(
         },
         _ => unsafe { device_downstream(device, name) },
     }
+}
+
+unsafe extern "system" fn reject_release_swapchain_images_ext(
+    _device: vk::Device,
+    _info: *const vk::ReleaseSwapchainImagesInfoEXT<'_>,
+) -> vk::Result {
+    vk::Result::ERROR_EXTENSION_NOT_PRESENT
+}
+
+unsafe extern "system" fn reject_get_swapchain_status_khr(
+    _device: vk::Device,
+    _swapchain: vk::SwapchainKHR,
+) -> vk::Result {
+    vk::Result::ERROR_EXTENSION_NOT_PRESENT
 }

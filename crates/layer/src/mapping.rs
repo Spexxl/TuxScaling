@@ -129,6 +129,17 @@ impl Mapping {
     }
 }
 
+pub(crate) fn rewrite_present_array(
+    mapping: &Mapping,
+    physical_swapchain: vk::SwapchainKHR,
+    logical_index: u32,
+) -> Result<(vk::SwapchainKHR, u32), vk::Result> {
+    mapping
+        .resolve(logical_index)
+        .map(|physical_index| (physical_swapchain, physical_index))
+        .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)
+}
+
 pub(crate) struct OldSwapchain;
 
 impl OldSwapchain {
@@ -146,7 +157,11 @@ impl OldSwapchain {
 
 #[cfg(test)]
 mod tests {
-    use super::{AcquireError, LogicalSwapchainHandle, Mapping, OldSwapchain};
+    use super::{
+        AcquireError, LogicalSwapchainHandle, Mapping, OldSwapchain, rewrite_present_array,
+    };
+    use ash::vk;
+    use ash::vk::Handle;
 
     #[test]
     fn assigns_and_releases_logical_slots_for_physical_images() {
@@ -188,6 +203,18 @@ mod tests {
         assert_eq!(mapping.acquire(3), Ok(2));
         assert_eq!(mapping.present(1), Ok(1));
         assert_eq!(mapping.acquire(0), Ok(1));
+    }
+
+    #[test]
+    fn controlled_downstream_double_receives_rewritten_present_array() {
+        let mut mapping = Mapping::new(9, 2);
+        let logical_index = mapping.acquire(4).unwrap();
+        let physical_swapchain = vk::SwapchainKHR::from_raw(33);
+
+        let rewritten = rewrite_present_array(&mapping, physical_swapchain, logical_index);
+
+        assert_eq!(rewritten, Ok((physical_swapchain, 4)));
+        assert_eq!(mapping.present(logical_index), Ok(4));
     }
 
     #[test]
@@ -258,3 +285,4 @@ mod tests {
         assert!(LogicalSwapchainHandle::from_raw(physical).is_none());
     }
 }
+use ash::vk;

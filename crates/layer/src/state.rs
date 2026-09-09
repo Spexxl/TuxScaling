@@ -1,4 +1,4 @@
-use ash::vk;
+use ash::{vk, vk::Handle};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
@@ -6,7 +6,7 @@ use std::{
 use tuxscaling_runtime::{SetLoaderData, SwapchainRuntime as OverlaySwapchain};
 use tuxscaling_vulkan::Image;
 
-use crate::mapping::Mapping;
+use crate::mapping::{LogicalSwapchainHandle, Mapping};
 
 #[derive(Clone, Copy)]
 pub(crate) struct X11Surface {
@@ -14,6 +14,7 @@ pub(crate) struct X11Surface {
     pub(crate) logical_extent: Option<vk::Extent2D>,
     pub(crate) logical_capabilities: Option<vk::SurfaceCapabilitiesKHR>,
     pub(crate) borderless_lease: Option<tuxscaling_display::BorderlessLease>,
+    pub(crate) negotiation: tuxscaling_display::PresentationNegotiation,
 }
 
 pub(crate) struct SwapchainState {
@@ -24,6 +25,7 @@ pub(crate) struct SwapchainState {
     pub(crate) logical_handle: vk::SwapchainKHR,
     pub(crate) physical_handle: vk::SwapchainKHR,
     pub(crate) mapping: Option<Mapping>,
+    pub(crate) negotiation: tuxscaling_display::PresentationNegotiation,
     pub(crate) overlay: OverlaySwapchain,
     pub(crate) virtual_images: Option<Vec<Image>>,
 }
@@ -108,6 +110,14 @@ pub(crate) fn is_retired_swapchain(swapchain: vk::SwapchainKHR) -> bool {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .contains(&swapchain)
+}
+
+pub(crate) fn is_unknown_logical_swapchain(swapchain: vk::SwapchainKHR) -> bool {
+    LogicalSwapchainHandle::is_reserved(swapchain.as_raw())
+        && !swapchains()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&swapchain)
 }
 
 pub(crate) fn surfaces() -> &'static Mutex<HashMap<vk::SurfaceKHR, X11Surface>> {

@@ -22,6 +22,7 @@ unsafe fn create_xlib_surface_inner(
                     logical_extent: None,
                     logical_capabilities: None,
                     borderless_lease: None,
+                    negotiation: tuxscaling_display::PresentationNegotiation::direct(),
                 },
             );
     }
@@ -62,6 +63,7 @@ unsafe fn create_xcb_surface_inner(
                     logical_extent: None,
                     logical_capabilities: None,
                     borderless_lease: None,
+                    negotiation: tuxscaling_display::PresentationNegotiation::direct(),
                 },
             );
     }

@@ -61,7 +61,8 @@ fn translate_old_swapchain(logical: vk::SwapchainKHR) -> Result<vk::SwapchainKHR
                 .ok()
                 .map(|state| (state.logical_handle, state.physical_handle))
         });
-    if handles.is_none() && is_retired_swapchain(logical) {
+    if handles.is_none() && (is_retired_swapchain(logical) || is_unknown_logical_swapchain(logical))
+    {
         return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
     }
     Ok(handles
@@ -286,8 +287,17 @@ unsafe fn virtual_output_extent(
         return None;
     }
     let now = Instant::now();
-    let mut negotiation = PresentationNegotiation::direct();
-    if !negotiation.request_borderless(target_info.monitor.rect, now) {
+    let mut negotiation = surface_state.negotiation;
+    let requested_now =
+        if negotiation.public_state() == tuxscaling_display::PresentationState::Direct {
+            if !negotiation.request_borderless(target_info.monitor.rect, now) {
+                return None;
+            }
+            true
+        } else {
+            false
+        };
+    if requested_now && !negotiation.borderless_requested(Instant::now()) {
         return None;
     }
     let lease = if let Some(lease) = existing_lease {
@@ -310,19 +320,24 @@ unsafe fn virtual_output_extent(
         return None;
     };
     let mut resized = resized;
-    if !negotiation.borderless_requested(Instant::now())
-        || !negotiation.observe(
-            observed.rect,
-            observed.fullscreen,
-            surface_extent(capabilities),
-            Instant::now(),
-        )
-    {
+    if !negotiation.observe(
+        observed.rect,
+        observed.fullscreen,
+        surface_extent(capabilities),
+        Instant::now(),
+    ) {
         if debug_test {
             eprintln!("TuxScaling virtual output skipped: exact native confirmation unavailable");
         }
         resized.restore();
         return None;
+    }
+    if let Some(surface) = surfaces()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get_mut(&surface)
+    {
+        surface.negotiation = negotiation;
     }
     resized.negotiation = negotiation;
     Some((target, resized))
@@ -1069,7 +1084,8 @@ unsafe fn create_swapchain_inner(
             .get(&original.surface)
             .map(|surface| surface.window);
         let was_virtual = virtual_window.is_some();
-        let monitor = virtual_window.map(|window| {
+        let active_negotiation = virtual_window.as_ref().map(|window| window.negotiation);
+        let monitor = virtual_window.as_ref().map(|window| {
             let rect = window.lease.monitor.rect;
             [rect.x, rect.y, rect.width as i32, rect.height as i32]
         });
@@ -1116,6 +1132,8 @@ unsafe fn create_swapchain_inner(
                             mapping: virtual_images
                                 .as_ref()
                                 .map(|images| Mapping::new(0, images.len())),
+                            negotiation: active_negotiation
+                                .unwrap_or_else(PresentationNegotiation::direct),
                             overlay,
                             virtual_images,
                         })),

@@ -1,4 +1,6 @@
 use super::*;
+use crate::mapping::{LogicalSwapchainHandle, rewrite_present_array};
+use ash::vk::Handle;
 
 struct PresentTranslation {
     swapchains: Vec<vk::SwapchainKHR>,
@@ -31,7 +33,9 @@ unsafe fn translate_present(
     for (logical_handle, logical_index) in swapchain_handles.iter().zip(image_indices) {
         let state = states.get(logical_handle).cloned();
         let Some(state) = state else {
-            if is_retired_swapchain(*logical_handle) {
+            if is_retired_swapchain(*logical_handle)
+                || LogicalSwapchainHandle::is_reserved(logical_handle.as_raw())
+            {
                 return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
             }
             translated.swapchains.push(*logical_handle);
@@ -44,10 +48,9 @@ unsafe fn translate_present(
             translated.image_indices.push(*logical_index);
             continue;
         };
-        let Some(physical_index) = mapping.resolve(*logical_index) else {
-            return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
-        };
-        translated.swapchains.push(state_guard.physical_handle);
+        let (physical_swapchain, physical_index) =
+            rewrite_present_array(mapping, state_guard.physical_handle, *logical_index)?;
+        translated.swapchains.push(physical_swapchain);
         translated.image_indices.push(physical_index);
         translated.releases.push((state.clone(), *logical_index));
         changed = true;
@@ -76,11 +79,10 @@ unsafe fn uses_virtual_output(info: &vk::PresentInfoKHR<'_>) -> bool {
         .unwrap_or_else(|error| error.into_inner());
     presented.iter().any(|swapchain| {
         states.get(swapchain).is_some_and(|state| {
-            state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .virtual_images
-                .is_some()
+            let state = state.lock().unwrap_or_else(|error| error.into_inner());
+            state.virtual_images.is_some()
+                && state.negotiation.public_state()
+                    == tuxscaling_display::PresentationState::Virtualized
         })
     })
 }

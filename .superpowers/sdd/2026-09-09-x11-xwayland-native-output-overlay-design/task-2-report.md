@@ -188,3 +188,39 @@ The complete focused package runs passed with 25 layer tests and 21 runtime
 tests. Formatting, workspace tests, Clippy with `-D warnings`, and
 `git diff --check` were also run before commit. A real X11/Xwayland WSI run
 remains unavailable in this environment.
+
+## Round 2 scoped review fixes
+
+This cycle keeps the Task 2 boundary and does not begin Task 3.
+
+- `PresentationNegotiation` is carried through surface and swapchain state
+  instead of being only a local policy value. The five-second monotonic
+  deadline remains owned by Task 1. Creation performs a non-blocking
+  request/observation preflight; `output_recreated` is called only after the
+  physical downstream swapchain has been created. Failed or expired
+  negotiation restores the lease and falls back directly. This report makes
+  no claim that the create-time observation is asynchronous.
+- `vkReleaseSwapchainImagesEXT` and `vkGetSwapchainStatusKHR` are enumerated
+  in both device-proc dispatch paths and return
+  `ERROR_EXTENSION_NOT_PRESENT` from safe layer stubs. Unknown tagged logical
+  handles are rejected as `ERROR_OUT_OF_DATE_KHR` in acquire, present, and
+  old-swapchain translation, so they cannot reach downstream as raw tokens.
+- `controlled_downstream_double_receives_rewritten_present_array` acquires a
+  physical index, rewrites the present pair to the physical swapchain/index,
+  and releases the logical slot. The evidence is scoped to this controlled
+  translation boundary, not a live ICD call.
+
+### Round 2 verification
+
+```text
+$ cargo fmt --all
+$ cargo test -p tuxscaling-layer --lib
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured
+$ cargo test -p tuxscaling-runtime --lib
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured
+$ git diff --check
+```
+
+No live X11/Xwayland WSI validation was run. The first commit attempt was
+blocked because `.git/index.lock` could not be created: `.git` is read-only in
+this execution context.

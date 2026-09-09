@@ -2,7 +2,7 @@ use super::*;
 use crate::mapping::Mapping;
 
 fn reject_retired_swapchain(swapchain: vk::SwapchainKHR) -> Result<(), vk::Result> {
-    if is_retired_swapchain(swapchain) {
+    if is_retired_swapchain(swapchain) || is_unknown_logical_swapchain(swapchain) {
         Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
     } else {
         Ok(())
