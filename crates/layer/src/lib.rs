@@ -2,6 +2,7 @@ mod handoff;
 mod hooks;
 mod loader;
 mod mapping;
+mod recovery;
 mod state;
 
 use ash::vk;
