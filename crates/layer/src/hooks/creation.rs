@@ -603,6 +603,14 @@ fn logical_capabilities_for_extent(
     Some(capabilities)
 }
 
+fn physical_swapchain_info(info: &vk::SwapchainCreateInfoKHR<'_>) -> SwapchainInfo {
+    SwapchainInfo {
+        format: info.image_format,
+        color_space: info.image_color_space,
+        extent: info.image_extent,
+    }
+}
+
 unsafe fn has_present_fences(mut next: *const c_void) -> bool {
     while !next.is_null() {
         let header = unsafe { &*next.cast::<vk::BaseInStructure<'_>>() };
@@ -1073,6 +1081,12 @@ unsafe fn create_swapchain_inner(
         .get(&device)
         .cloned();
     let original = unsafe { &*create_info };
+    eprintln!(
+        "TuxScaling evidence event=swapchain_create_request old_swapchain=0x{:x} extent={}x{}",
+        original.old_swapchain.as_raw(),
+        original.image_extent.width,
+        original.image_extent.height,
+    );
     if is_retired_swapchain(original.old_swapchain) {
         return vk::Result::ERROR_OUT_OF_DATE_KHR;
     }
@@ -1243,6 +1257,13 @@ unsafe fn create_swapchain_inner(
             Ok(info) => info,
             Err(error) => return error,
         };
+        eprintln!(
+            "TuxScaling evidence event=logical_recreation_translated old_logical=0x{:x} old_physical=0x{:x} downstream_extent={}x{}",
+            old.contract.handle().as_raw(),
+            old.contract.generation().handle().as_raw(),
+            modified.image_extent.width,
+            modified.image_extent.height,
+        );
     }
     let mut result =
         unsafe { create_swapchain(device, &modified, allocation_callbacks, swapchain) };
@@ -1285,11 +1306,7 @@ unsafe fn create_swapchain_inner(
             "TuxScaling swapchain: format={:?} color_space={:?} flags={:?} capture={capture_enabled} usage={:?}",
             original.image_format, original.image_color_space, original.flags, modified.image_usage
         );
-        let info = SwapchainInfo {
-            format: modified.image_format,
-            color_space: modified.image_color_space,
-            extent: original.image_extent,
-        };
+        let info = physical_swapchain_info(&modified);
         let loader = ash::khr::swapchain::Device::new(&device_state.instance, &device_state.device);
         let output_images = match unsafe { loader.get_swapchain_images(handle) } {
             Ok(images) => images,
@@ -1565,8 +1582,8 @@ pub(super) unsafe extern "system" fn create_swapchain_khr(
 #[cfg(test)]
 mod tests {
     use super::{
-        logical_image_count, translate_old_swapchain, translate_recreation_create_info,
-        virtual_swapchain_supported,
+        logical_image_count, physical_swapchain_info, translate_old_swapchain,
+        translate_recreation_create_info, virtual_swapchain_supported,
     };
     use crate::recovery::{LogicalSwapchainContract, PhysicalGeneration};
     use crate::state::SwapchainTemplate;
@@ -1727,6 +1744,13 @@ mod tests {
 
         assert_eq!(
             recorded_extent,
+            vk::Extent2D {
+                width: 3440,
+                height: 1440,
+            }
+        );
+        assert_eq!(
+            physical_swapchain_info(&physical_info).extent,
             vk::Extent2D {
                 width: 3440,
                 height: 1440,
