@@ -71,14 +71,14 @@ fn is_swapchain_related_proc(name: &CStr) -> bool {
             .any(|window| window == b"Present")
 }
 
-const UNMODELED_VIRTUALIZATION_EXTENSIONS: &[&[u8]] = &[
-    b"VK_KHR_present_wait",
-    b"VK_GOOGLE_display_timing",
-    b"VK_EXT_display_control",
-    b"VK_EXT_hdr_metadata",
-    b"VK_KHR_shared_presentable_image",
-    b"VK_EXT_swapchain_maintenance1",
-    b"VK_EXT_full_screen_exclusive",
+// Only extensions whose swapchain-facing behavior is translated by this
+// layer are allowlisted.  A conservative deny-by-default policy is important
+// here: vendor extensions frequently carry a VkSwapchainKHR without putting
+// "Swapchain" or "Present" in every command name.
+const VIRTUALIZATION_SAFE_EXTENSIONS: &[&[u8]] = &[
+    b"VK_KHR_swapchain",
+    b"VK_KHR_incremental_present",
+    b"VK_EXT_swapchain_colorspace",
 ];
 
 pub(crate) fn virtualization_extension_safe(create_info: &vk::DeviceCreateInfo<'_>) -> bool {
@@ -92,12 +92,12 @@ pub(crate) fn virtualization_extension_safe(create_info: &vk::DeviceCreateInfo<'
             create_info.enabled_extension_count as usize,
         )
     };
-    !names.iter().any(|name| {
+    names.iter().all(|name| {
         if name.is_null() {
             return false;
         }
         let name = unsafe { CStr::from_ptr(*name) }.to_bytes();
-        UNMODELED_VIRTUALIZATION_EXTENSIONS
+        VIRTUALIZATION_SAFE_EXTENSIONS
             .iter()
             .any(|extension| name == *extension)
     })
@@ -767,5 +767,14 @@ mod tests {
 
         let safe_info = vk::DeviceCreateInfo::default();
         assert!(virtualization_extension_safe(&safe_info));
+    }
+
+    #[test]
+    fn vendor_swapchain_commands_disable_virtualization_before_promotion() {
+        let extension_name = std::ffi::CString::new("VK_NV_present_barrier").unwrap();
+        let extension_names = [extension_name.as_ptr()];
+        let info = vk::DeviceCreateInfo::default().enabled_extension_names(&extension_names);
+
+        assert!(!virtualization_extension_safe(&info));
     }
 }
