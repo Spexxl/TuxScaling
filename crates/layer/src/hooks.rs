@@ -84,7 +84,9 @@ const VIRTUALIZATION_SAFE_EXTENSIONS: &[&[u8]] = &[
     b"VK_KHR_swapchain",
     b"VK_KHR_incremental_present",
     b"VK_EXT_swapchain_colorspace",
+    b"VK_EXT_surface_maintenance1",
     b"VK_EXT_swapchain_maintenance1",
+    b"VK_KHR_surface_maintenance1",
     b"VK_KHR_swapchain_maintenance1",
 ];
 
@@ -777,6 +779,17 @@ mod tests {
         let khr_names = [super::maintenance::KHR_SWAPCHAIN_MAINTENANCE1_NAME.as_ptr()];
         let khr_info = vk::DeviceCreateInfo::default().enabled_extension_names(&khr_names);
         assert!(virtualization_extension_safe(&khr_info));
+    }
+
+    #[test]
+    fn surface_maintenance_aliases_remain_safe_with_swapchain_translation() {
+        let names = [
+            c"VK_KHR_swapchain_maintenance1".as_ptr(),
+            c"VK_KHR_surface_maintenance1".as_ptr(),
+        ];
+        let info = vk::DeviceCreateInfo::default().enabled_extension_names(&names);
+
+        assert!(virtualization_extension_safe(&info));
     }
 
     #[test]

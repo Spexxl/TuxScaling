@@ -425,7 +425,7 @@ impl X11Display {
         let window_rect = self.window_rect(window)?;
         let monitors = self
             .connection
-            .randr_get_monitors(window as Window, true)
+            .randr_get_monitors(self.root, true)
             .ok()
             .and_then(|cookie| cookie.reply().ok())
             .map(|reply| {

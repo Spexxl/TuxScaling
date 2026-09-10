@@ -232,7 +232,7 @@ unsafe fn release_swapchain_images_inner(
     if result != vk::Result::SUCCESS {
         return result;
     }
-    let (committed, idle) = {
+    let (committed, idle, report) = {
         let mut state = translation
             .state
             .lock()
@@ -240,19 +240,27 @@ unsafe fn release_swapchain_images_inner(
         let Some(mapping) = state.mapping.as_mut() else {
             return vk::Result::ERROR_OUT_OF_DATE_KHR;
         };
-        let committed = mapping.commit_release(&translation.plan);
-        (committed, committed && mapping.is_idle())
+        let (committed, idle) = {
+            let committed = mapping.commit_release(&translation.plan);
+            (committed, committed && mapping.is_idle())
+        };
+        let report = committed && !state.maintenance_release_reported;
+        if report {
+            state.maintenance_release_reported = true;
+        }
+        (committed, idle, report)
     };
     if !committed {
         eprintln!("TuxScaling evidence event=maintenance1_release_rejected reason=stale_mapping");
         return vk::Result::ERROR_OUT_OF_DATE_KHR;
     }
-    eprintln!(
-        "TuxScaling evidence event=maintenance1_release logical=0x{:x} physical=0x{:x} count={} virtual=1",
-        original.swapchain.as_raw(),
-        translation.physical_swapchain.as_raw(),
-        translation.plan.physical_indices().len(),
-    );
+    if report {
+        eprintln!(
+            "TuxScaling evidence event=maintenance1_release logical_count={} physical_count={} result=SUCCESS",
+            original.image_index_count,
+            translation.plan.physical_indices().len(),
+        );
+    }
     if idle
         && let Some(device_state) = devices()
             .lock()

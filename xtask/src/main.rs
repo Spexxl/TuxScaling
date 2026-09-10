@@ -8,6 +8,83 @@ use std::{
 
 const VKCUBE_LAYER_EVIDENCE_MARKER: &str = "TuxScaling swapchain:";
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MaintenanceEvidence {
+    device_enabled: bool,
+    virtual_swapchain: bool,
+    present_fences: bool,
+    present_modes: bool,
+    released_images: bool,
+    overlay_submitted: bool,
+    reconstructed_present: bool,
+    validation_error: bool,
+}
+
+fn maintenance_evidence_text(stdout: &str, stderr: &str) -> String {
+    format!("{stdout}\n{stderr}").to_ascii_lowercase()
+}
+
+fn has_positive_field(output: &str, field: &str) -> bool {
+    output.split_whitespace().any(|token| {
+        token
+            .strip_prefix(field)
+            .and_then(|value| value.parse::<u32>().ok())
+            .is_some_and(|value| value > 0)
+    })
+}
+
+fn parse_maintenance_evidence(stdout: &str, stderr: &str) -> MaintenanceEvidence {
+    let output = maintenance_evidence_text(stdout, stderr);
+    MaintenanceEvidence {
+        device_enabled: output.contains("event=maintenance1_device enabled=1"),
+        virtual_swapchain: output.contains("event=logical_swapchain_created")
+            && output.contains("virtual=1"),
+        present_fences: output.contains("event=maintenance1_present")
+            && has_positive_field(&output, "fences="),
+        present_modes: output.contains("event=maintenance1_present")
+            && has_positive_field(&output, "modes="),
+        released_images: output.contains("event=maintenance1_release")
+            && output.contains("result=success")
+            && has_positive_field(&output, "logical_count=")
+            && has_positive_field(&output, "physical_count="),
+        overlay_submitted: output.contains("event=overlay_submitted maintenance1=1"),
+        reconstructed_present: output.contains("event=reconstructed_present"),
+        validation_error: output.contains("validation error")
+            || output.contains("vuid-")
+            || output.contains("panic"),
+    }
+}
+
+fn maintenance_evidence_complete(evidence: &MaintenanceEvidence) -> bool {
+    evidence.device_enabled
+        && evidence.virtual_swapchain
+        && evidence.present_fences
+        && evidence.present_modes
+        && evidence.released_images
+        && evidence.overlay_submitted
+        && evidence.reconstructed_present
+        && !evidence.validation_error
+}
+
+fn maintenance_output_is_valid(stdout: &str, stderr: &str, backend: BackendSelection) -> bool {
+    let output = maintenance_evidence_text(stdout, stderr);
+    let evidence = parse_maintenance_evidence(stdout, stderr);
+    let backend_complete = match backend {
+        BackendSelection::Reference => output.contains("backend=reference"),
+        BackendSelection::Fsr314 => {
+            output.contains("event=fsr_dispatch backend=fsr_3_1_4")
+                && output.contains("backend=fsr_3_1_4")
+        }
+    };
+    maintenance_evidence_complete(&evidence)
+        && backend_complete
+        && output.contains("logical=1280x720")
+        && output.contains("physical=3440x1440")
+        && output.contains("event=logical_recreation_translated")
+        && !output.contains("maintenance1_fallback")
+        && !output.contains("virtual=0")
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BackendSelection {
     #[default]
@@ -428,6 +505,7 @@ fn validation(command: &mut Command) -> &mut Command {
     command
         .env("VK_INSTANCE_LAYERS", "VK_LAYER_KHRONOS_validation")
         .env("VK_LAYER_VALIDATE_SYNC", "1")
+        .env("MANGOHUD", "0")
         .env("DISABLE_MANGOHUD", "1")
         .env("DISABLE_LSFG", "1")
 }
@@ -677,7 +755,10 @@ fn main() -> ExitCode {
                     .env("TUXSCALING_TEST_SCENARIO", scenario)
                     .env("TUXSCALING_TEST_RESIZE_INTERVAL", "0")
                     .env("TUXSCALING_TEST_FORCE_VIRTUAL", "1")
-                    .env("TUXSCALING_TEST_SECONDS", "3")
+                    .env(
+                        "TUXSCALING_TEST_SECONDS",
+                        if scenario == "maintenance1" { "8" } else { "3" },
+                    )
                     .env("TUXSCALING_TEST_FORCE_TEMPORAL_FAILURE", "0")
                     .env("TUXSCALING_TEST_FORCE_RESIZE_FAILURE", "0");
                 if force_temporal_failure {
@@ -689,7 +770,32 @@ fn main() -> ExitCode {
                 if scenario == "resize" || scenario == "promotion_failure" {
                     command.env("TUXSCALING_TEST_RESIZE_INTERVAL", "4");
                 }
-                report(command.output())
+                let output = command.output();
+                if scenario == "maintenance1" {
+                    match output {
+                        Ok(output) => {
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            print!("{stdout}");
+                            eprint!("{stderr}");
+                            let valid = output.status.success()
+                                && maintenance_output_is_valid(&stdout, &stderr, backend);
+                            if !valid {
+                                eprintln!(
+                                    "cargo xtask smoke: maintenance1 evidence gate failed for {}",
+                                    backend.config_value()
+                                );
+                            }
+                            valid
+                        }
+                        Err(error) => {
+                            eprintln!("{error}");
+                            false
+                        }
+                    }
+                } else {
+                    report(output)
+                }
             };
             run_wsi("upscale", false, false)
                 && run_wsi("windowed_promote", false, false)
@@ -701,6 +807,7 @@ fn main() -> ExitCode {
                 && run_wsi("monitor_origin", false, false)
                 && run_wsi("promotion_failure", false, true)
                 && run_wsi("temporal_failure", true, false)
+                && run_wsi("maintenance1", false, false)
         }
         "benchmark" => {
             if !run(
@@ -823,7 +930,8 @@ mod tests {
     use super::{
         BENCHMARK_SAMPLE_COUNT, BackendSelection, VkcubeExit, benchmark_cases,
         benchmark_output_is_operationally_valid, classify_vkcube_exit, classify_vkcube_output,
-        generated_config, parse_backend_args, parse_vkcube_args, quality_fixture_passes,
+        generated_config, maintenance_evidence_complete, maintenance_output_is_valid,
+        parse_backend_args, parse_maintenance_evidence, parse_vkcube_args, quality_fixture_passes,
         vkcube_launch,
     };
     use std::path::Path;
@@ -1001,5 +1109,46 @@ mod tests {
         assert!(source.contains("guidance_scale = 1"));
         assert!(!source.contains("processing_scale"));
         assert!(!source.contains("render_scale"));
+    }
+
+    #[test]
+    fn maintenance_evidence_accepts_complete_interleaved_output() {
+        let stdout = concat!(
+            "TuxScaling evidence event=maintenance1_device enabled=1 flavor=ext\n",
+            "TuxScaling evidence event=maintenance1_present fences=2 modes=2 virtual=1\n",
+            "TuxScaling evidence event=overlay_submitted maintenance1=1\n",
+            "TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4\n",
+        );
+        let stderr = concat!(
+            "TuxScaling evidence event=logical_swapchain_created logical_handle=0x1 physical_handle=0x2 logical=1280x720 physical=1280x720 virtual=1 negotiation=negotiating\n",
+            "TuxScaling evidence event=virtual_swapchain_active logical_handle=0x1 logical=1280x720 physical=3440x1440 generation=1\n",
+            "TuxScaling evidence event=logical_recreation_translated old_logical=0x1 old_physical=0x2 downstream_extent=3440x1440\n",
+            "TuxScaling evidence event=maintenance1_release logical_count=1 physical_count=1 result=SUCCESS\n",
+            "TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=1280x720 physical=3440x1440\n",
+        );
+        let evidence = parse_maintenance_evidence(stdout, stderr);
+
+        assert!(maintenance_evidence_complete(&evidence));
+        assert!(maintenance_output_is_valid(
+            stdout,
+            stderr,
+            BackendSelection::Fsr314
+        ));
+    }
+
+    #[test]
+    fn maintenance_evidence_rejects_missing_fields_and_validation_errors() {
+        let incomplete = parse_maintenance_evidence(
+            "TuxScaling evidence event=maintenance1_device enabled=1 flavor=khr\n",
+            "TuxScaling evidence event=maintenance1_present fences=1 modes=1 virtual=1\n",
+        );
+        assert!(!maintenance_evidence_complete(&incomplete));
+
+        let validation = parse_maintenance_evidence(
+            "TuxScaling evidence event=maintenance1_release logical_count=1 physical_count=1 result=SUCCESS\n",
+            "Validation Error: VUID-VkSwapchainCreateInfoKHR-pNext-07781\n",
+        );
+        assert!(validation.validation_error);
+        assert!(!maintenance_evidence_complete(&validation));
     }
 }

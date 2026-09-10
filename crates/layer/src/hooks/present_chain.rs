@@ -222,9 +222,11 @@ impl<'a> PresentChain<'a> {
 }
 
 fn validate_count(actual: u32, expected: u32) -> Result<(), PresentChainError> {
-    (actual == expected)
-        .then_some(())
-        .ok_or(PresentChainError::CountMismatch)
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(PresentChainError::CountMismatch)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
