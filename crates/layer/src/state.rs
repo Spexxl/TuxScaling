@@ -6,7 +6,10 @@ use std::{
 use tuxscaling_runtime::{SetLoaderData, SwapchainRuntime as OverlaySwapchain};
 use tuxscaling_vulkan::Image;
 
-use crate::hooks::maintenance::Maintenance1Support;
+use crate::hooks::maintenance::{
+    Maintenance1Support, MaintenanceCreateError, SwapchainMaintenanceTemplate,
+    supported_swapchain_flags,
+};
 use crate::mapping::{LogicalSwapchainHandle, Mapping};
 use crate::recovery::{LogicalSwapchainContract, ReconfigurationLifecycle};
 
@@ -24,10 +27,17 @@ pub(crate) struct SwapchainTemplate {
     pub(crate) composite_alpha: vk::CompositeAlphaFlagsKHR,
     pub(crate) present_mode: vk::PresentModeKHR,
     pub(crate) clipped: vk::Bool32,
+    pub(crate) maintenance: SwapchainMaintenanceTemplate,
 }
 
 impl SwapchainTemplate {
-    pub(crate) fn from_create_info(info: &vk::SwapchainCreateInfoKHR<'_>) -> Self {
+    pub(crate) fn from_create_info(
+        info: &vk::SwapchainCreateInfoKHR<'_>,
+    ) -> Result<Self, MaintenanceCreateError> {
+        if !supported_swapchain_flags(info.flags) {
+            return Err(MaintenanceCreateError::UnsupportedFlags);
+        }
+        let maintenance = unsafe { SwapchainMaintenanceTemplate::parse(info.p_next) }?;
         let queue_family_indices = if info.image_sharing_mode == vk::SharingMode::CONCURRENT
             && !info.p_queue_family_indices.is_null()
         {
@@ -41,7 +51,7 @@ impl SwapchainTemplate {
         } else {
             Vec::new()
         };
-        Self {
+        Ok(Self {
             flags: info.flags,
             min_image_count: info.min_image_count,
             image_format: info.image_format,
@@ -54,16 +64,37 @@ impl SwapchainTemplate {
             composite_alpha: info.composite_alpha,
             present_mode: info.present_mode,
             clipped: info.clipped,
-        }
+            maintenance,
+        })
     }
 
-    pub(crate) fn create_info<'a>(
-        &'a self,
+    pub(crate) fn with_create_info<R>(
+        &self,
         surface: vk::SurfaceKHR,
         extent: vk::Extent2D,
         old_swapchain: vk::SwapchainKHR,
-    ) -> vk::SwapchainCreateInfoKHR<'a> {
-        vk::SwapchainCreateInfoKHR::default()
+        invoke: impl FnOnce(&vk::SwapchainCreateInfoKHR<'_>) -> R,
+    ) -> R {
+        let mut scaling = self.maintenance.scaling.map(|scaling| {
+            vk::SwapchainPresentScalingCreateInfoEXT::default()
+                .scaling_behavior(scaling.behavior)
+                .present_gravity_x(scaling.gravity_x)
+                .present_gravity_y(scaling.gravity_y)
+        });
+        let mut modes =
+            self.maintenance.present_modes.as_ref().map(|modes| {
+                vk::SwapchainPresentModesCreateInfoEXT::default().present_modes(modes)
+            });
+        let mut next = std::ptr::null();
+        if let Some(scaling) = scaling.as_mut() {
+            scaling.p_next = next;
+            next = (scaling as *mut vk::SwapchainPresentScalingCreateInfoEXT<'_>).cast();
+        }
+        if let Some(modes) = modes.as_mut() {
+            modes.p_next = next;
+            next = (modes as *mut vk::SwapchainPresentModesCreateInfoEXT<'_>).cast();
+        }
+        let mut info = vk::SwapchainCreateInfoKHR::default()
             .flags(self.flags)
             .surface(surface)
             .min_image_count(self.min_image_count)
@@ -78,7 +109,9 @@ impl SwapchainTemplate {
             .composite_alpha(self.composite_alpha)
             .present_mode(self.present_mode)
             .clipped(self.clipped != 0)
-            .old_swapchain(old_swapchain)
+            .old_swapchain(old_swapchain);
+        info.p_next = next;
+        invoke(&info)
     }
 }
 

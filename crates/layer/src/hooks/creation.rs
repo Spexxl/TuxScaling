@@ -1,3 +1,6 @@
+use super::maintenance::{
+    SwapchainMaintenanceTemplate, maintenance_create_supported, supported_swapchain_flags,
+};
 use super::*;
 use crate::mapping::{LogicalSwapchainHandle, Mapping, OldSwapchain};
 use crate::recovery::{LogicalSwapchainContract, PhysicalGeneration, ReconfigurationTicket};
@@ -7,17 +10,14 @@ use std::time::Instant;
 use tuxscaling_display::{Extent, PresentationNegotiation, PresentationState, SurfaceExtent};
 
 fn virtual_swapchain_supported(info: &vk::SwapchainCreateInfoKHR<'_>) -> bool {
-    if !info.flags.is_empty()
+    if !supported_swapchain_flags(info.flags)
         || info.image_array_layers != 1
         || (info.image_sharing_mode == vk::SharingMode::CONCURRENT
             && (info.queue_family_index_count < 2 || info.p_queue_family_indices.is_null()))
     {
         return false;
     }
-    // The physical-generation template deliberately owns only the core
-    // create parameters.  Unknown pNext chains therefore fail open instead
-    // of being silently dropped during an internal generation replacement.
-    info.p_next.is_null()
+    unsafe { SwapchainMaintenanceTemplate::parse(info.p_next) }.is_ok()
 }
 
 #[cfg(test)]
@@ -176,13 +176,11 @@ impl Drop for SurfaceRecreationGuard {
     }
 }
 
-fn translate_recreation_create_info<'a>(
-    template: &'a crate::state::SwapchainTemplate,
+fn translate_recreation_create_info(
     logical_info: &vk::SwapchainCreateInfoKHR<'_>,
     old_contract: &LogicalSwapchainContract,
-    surface: vk::SurfaceKHR,
     downstream_extent: SurfaceExtent,
-) -> Result<vk::SwapchainCreateInfoKHR<'a>, vk::Result> {
+) -> Result<(vk::Extent2D, vk::SwapchainKHR), vk::Result> {
     if logical_info.old_swapchain != old_contract.handle() {
         return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
     }
@@ -215,7 +213,35 @@ fn translate_recreation_create_info<'a>(
     {
         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
     }
-    Ok(template.create_info(surface, physical_extent, old_contract.generation().handle()))
+    Ok((physical_extent, old_contract.generation().handle()))
+}
+
+#[derive(Clone, Copy)]
+struct PhysicalCreateTarget {
+    surface: vk::SurfaceKHR,
+    extent: vk::Extent2D,
+    old_swapchain: vk::SwapchainKHR,
+}
+
+unsafe fn create_physical_swapchain(
+    create: vk::PFN_vkCreateSwapchainKHR,
+    device: vk::Device,
+    allocation_callbacks: *const vk::AllocationCallbacks<'_>,
+    template: Option<&crate::state::SwapchainTemplate>,
+    fallback_info: &vk::SwapchainCreateInfoKHR<'_>,
+    target: PhysicalCreateTarget,
+    swapchain: *mut vk::SwapchainKHR,
+) -> vk::Result {
+    if let Some(template) = template {
+        template.with_create_info(
+            target.surface,
+            target.extent,
+            target.old_swapchain,
+            |create_info| unsafe { create(device, create_info, allocation_callbacks, swapchain) },
+        )
+    } else {
+        unsafe { create(device, fallback_info, allocation_callbacks, swapchain) }
+    }
 }
 
 fn allocate_logical_swapchain(physical: vk::SwapchainKHR) -> Option<vk::SwapchainKHR> {
@@ -641,18 +667,20 @@ pub(super) unsafe fn publish_native_generation(
         return false;
     };
     let create: vk::PFN_vkCreateSwapchainKHR = unsafe { std::mem::transmute(proc) };
-    let create_info = snapshot
-        .template
-        .create_info(surface, target_extent, snapshot.old_physical);
     let mut new_physical = vk::SwapchainKHR::null();
-    let result = unsafe {
-        create(
-            device_state.device.handle(),
-            &create_info,
-            std::ptr::null(),
-            &mut new_physical,
-        )
-    };
+    let result = snapshot.template.with_create_info(
+        surface,
+        target_extent,
+        snapshot.old_physical,
+        |create_info| unsafe {
+            create(
+                device_state.device.handle(),
+                create_info,
+                std::ptr::null(),
+                &mut new_physical,
+            )
+        },
+    );
     let loader = ash::khr::swapchain::Device::new(&device_state.instance, &device_state.device);
     if result != vk::Result::SUCCESS || new_physical == vk::SwapchainKHR::null() {
         unsafe {
@@ -1345,17 +1373,32 @@ unsafe fn create_swapchain_inner(
         | vk::ImageUsageFlags::TRANSFER_DST
         | vk::ImageUsageFlags::COLOR_ATTACHMENT
         | vk::ImageUsageFlags::STORAGE;
+    let maintenance_create_is_supported = state.as_ref().is_some_and(|state| {
+        if state.maintenance1.enabled {
+            maintenance_create_supported(original)
+        } else {
+            original.p_next.is_null() && original.flags.is_empty()
+        }
+    });
+    if state
+        .as_ref()
+        .is_some_and(|state| state.maintenance1.enabled)
+        && !maintenance_create_is_supported
+    {
+        eprintln!(
+            "TuxScaling evidence event=maintenance1_fallback reason=unsupported_create_chain"
+        );
+    }
     let mut virtual_preflight_eligible = state.as_ref().is_some_and(|state| {
         state.virtualization_extension_safe
-            && (!state.maintenance1.enabled
-                || (original.p_next.is_null() && original.flags.is_empty()))
+            && maintenance_create_is_supported
             && virtual_swapchain_supported(original)
             && tuxscaling_capture::supported_format(
                 original.image_format,
                 original.image_color_space,
             )
             && original.image_array_layers == 1
-            && original.flags.is_empty()
+            && supported_swapchain_flags(original.flags)
             && !matches!(
                 original.present_mode,
                 vk::PresentModeKHR::SHARED_DEMAND_REFRESH
@@ -1421,7 +1464,7 @@ unsafe fn create_swapchain_inner(
     if let Some(state) = &state
         && tuxscaling_capture::supported_format(original.image_format, original.image_color_space)
         && original.image_array_layers == 1
-        && original.flags.is_empty()
+        && supported_swapchain_flags(original.flags)
         && !matches!(
             original.present_mode,
             vk::PresentModeKHR::SHARED_DEMAND_REFRESH
@@ -1455,9 +1498,21 @@ unsafe fn create_swapchain_inner(
             }
         }
     }
-    let recreation_template = old_logical
-        .as_ref()
-        .map(|_| crate::state::SwapchainTemplate::from_create_info(&modified));
+    let owned_template = if virtual_preflight_eligible {
+        match crate::state::SwapchainTemplate::from_create_info(&modified) {
+            Ok(template) => Some(template),
+            Err(error) => {
+                eprintln!(
+                    "TuxScaling evidence event=maintenance1_fallback reason=unsupported_create_chain error={error:?}"
+                );
+                virtual_preflight_eligible = false;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let recreation_template = old_logical.as_ref().and(owned_template.as_ref());
     if let Some(old) = old_logical.as_ref() {
         let Some(device_state) = state.as_ref() else {
             return vk::Result::ERROR_INITIALIZATION_FAILED;
@@ -1467,37 +1522,78 @@ unsafe fn create_swapchain_inner(
         else {
             return vk::Result::ERROR_INITIALIZATION_FAILED;
         };
-        let Some(template) = recreation_template.as_ref() else {
+        let Some(_template) = recreation_template.as_ref() else {
             return vk::Result::ERROR_INITIALIZATION_FAILED;
         };
-        modified = match translate_recreation_create_info(
-            template,
+        let (physical_extent, physical_old_swapchain) = match translate_recreation_create_info(
             original,
             &old.contract,
-            original.surface,
             surface_extent(capabilities),
         ) {
             Ok(info) => info,
             Err(error) => return error,
         };
+        modified.image_extent = physical_extent;
+        modified.old_swapchain = physical_old_swapchain;
         eprintln!(
             "TuxScaling evidence event=logical_recreation_translated old_logical=0x{:x} old_physical=0x{:x} downstream_extent={}x{}",
             old.contract.handle().as_raw(),
             old.contract.generation().handle().as_raw(),
-            modified.image_extent.width,
-            modified.image_extent.height,
+            physical_extent.width,
+            physical_extent.height,
         );
     }
-    let mut result =
-        unsafe { create_swapchain(device, &modified, allocation_callbacks, swapchain) };
+    let physical_extent = modified.image_extent;
+    let physical_old_swapchain = modified.old_swapchain;
+    let mut result = unsafe {
+        create_physical_swapchain(
+            create_swapchain,
+            device,
+            allocation_callbacks,
+            recreation_template,
+            &modified,
+            PhysicalCreateTarget {
+                surface: original.surface,
+                extent: physical_extent,
+                old_swapchain: physical_old_swapchain,
+            },
+            swapchain,
+        )
+    };
     if result != vk::Result::SUCCESS
         && capture_enabled
         && modified.image_usage != original.image_usage
     {
         capture_enabled = false;
-        modified = driver_original;
-        result =
-            unsafe { create_swapchain(device, &driver_original, allocation_callbacks, swapchain) };
+        modified.image_usage = original.image_usage;
+        let retry_template = if recreation_template.is_some() {
+            match crate::state::SwapchainTemplate::from_create_info(&modified) {
+                Ok(template) => Some(template),
+                Err(_) => {
+                    result = vk::Result::ERROR_FEATURE_NOT_PRESENT;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if result != vk::Result::ERROR_FEATURE_NOT_PRESENT {
+            result = unsafe {
+                create_physical_swapchain(
+                    create_swapchain,
+                    device,
+                    allocation_callbacks,
+                    retry_template.as_ref(),
+                    &modified,
+                    PhysicalCreateTarget {
+                        surface: original.surface,
+                        extent: physical_extent,
+                        old_swapchain: physical_old_swapchain,
+                    },
+                    swapchain,
+                )
+            };
+        }
     }
     if result != vk::Result::SUCCESS {
         super::lifetime::restore_surface_window(original.surface);
@@ -1516,7 +1612,7 @@ unsafe fn create_swapchain_inner(
             .image_usage
             .contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
             || original.image_array_layers != 1
-            || !original.flags.is_empty()
+            || !supported_swapchain_flags(original.flags)
         {
             return result;
         }
@@ -1615,8 +1711,11 @@ unsafe fn create_swapchain_inner(
             eprintln!("TuxScaling: overlay disabled for swapchain");
             return result;
         };
-        let template =
-            virtual_eligible.then(|| crate::state::SwapchainTemplate::from_create_info(&modified));
+        let template = virtual_eligible.then(|| {
+            owned_template
+                .clone()
+                .expect("virtual preflight owns a valid maintenance template")
+        });
         let mut negotiation = if let Some(old) = old_logical.as_ref() {
             old.negotiation
         } else if virtual_eligible {
@@ -1812,7 +1911,7 @@ pub(super) unsafe extern "system" fn create_swapchain_khr(
 mod tests {
     use super::{
         initial_physical_extent, logical_image_count, native_generation_failure_can_restore,
-        physical_swapchain_info, temporal_enabled_for_logical_creation, translate_old_swapchain,
+        temporal_enabled_for_logical_creation, translate_old_swapchain,
         translate_recreation_create_info, virtual_swapchain_supported,
     };
     use crate::recovery::{
@@ -1979,18 +2078,16 @@ mod tests {
             PresentationState::Virtualized,
         )
         .unwrap();
-        let template = SwapchainTemplate::from_create_info(&info);
+        let _template = SwapchainTemplate::from_create_info(&info).unwrap();
 
-        let physical_info = translate_recreation_create_info(
-            &template,
+        let (recorded_extent, recorded_old_swapchain) = translate_recreation_create_info(
             &info,
             &old_contract,
-            surface,
             SurfaceExtent::fixed(native_extent),
         )
         .unwrap();
 
-        let downstream_recorder = [(physical_info.image_extent, physical_info.old_swapchain)];
+        let downstream_recorder = [(recorded_extent, recorded_old_swapchain)];
         let (recorded_extent, recorded_old_swapchain) = downstream_recorder[0];
         let new_contract = LogicalSwapchainContract::new(
             new_logical,
@@ -2003,13 +2100,6 @@ mod tests {
 
         assert_eq!(
             recorded_extent,
-            vk::Extent2D {
-                width: 3440,
-                height: 1440,
-            }
-        );
-        assert_eq!(
-            physical_swapchain_info(&physical_info).extent,
             vk::Extent2D {
                 width: 3440,
                 height: 1440,
@@ -2056,20 +2146,18 @@ mod tests {
             PresentationState::Virtualized,
         )
         .unwrap();
-        let template = SwapchainTemplate::from_create_info(&info);
+        let _template = SwapchainTemplate::from_create_info(&info).unwrap();
 
-        let physical_info = translate_recreation_create_info(
-            &template,
+        let (physical_extent, physical_old_swapchain) = translate_recreation_create_info(
             &info,
             &old_contract,
-            surface,
             SurfaceExtent::fixed(Extent::new(3440, 1440)),
         )
         .unwrap();
 
-        assert_eq!(physical_info.image_extent.width, 3440);
-        assert_eq!(physical_info.image_extent.height, 1440);
-        assert_eq!(physical_info.old_swapchain, old_physical);
+        assert_eq!(physical_extent.width, 3440);
+        assert_eq!(physical_extent.height, 1440);
+        assert_eq!(physical_old_swapchain, old_physical);
     }
 
     #[test]
