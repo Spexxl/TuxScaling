@@ -362,11 +362,17 @@ mod tests {
             now + Duration::from_millis(1),
         ));
         assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
-        assert!(negotiation.observe(
+        assert!(!negotiation.observe(
             target,
             true,
             SurfaceExtent::fixed(Extent::new(1920, 1080)),
             now + Duration::from_millis(2),
+        ));
+        assert!(negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::fixed(Extent::new(1920, 1080)),
+            now + Duration::from_millis(3),
         ));
         assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
         assert!(negotiation.output_recreation_ready());
@@ -374,7 +380,7 @@ mod tests {
             target,
             true,
             SurfaceExtent::fixed(Extent::new(1920, 1080)),
-            now + Duration::from_millis(2),
+            now + Duration::from_millis(3),
         ));
         assert!(negotiation.output_recreated(
             target,
@@ -425,7 +431,8 @@ mod tests {
         let mut surface = PresentationNegotiation::direct();
         assert!(surface.request_borderless(target, now));
         assert!(surface.borderless_requested(now));
-        assert!(surface.observe(target, true, native, now + Duration::from_secs(1)));
+        assert!(!surface.observe(target, true, native, now + Duration::from_secs(1)));
+        assert!(surface.observe(target, true, native, now + Duration::from_secs(2)));
         assert!(surface.output_recreated(target, true, native, now + Duration::from_secs(2)));
 
         let mut swapchain = surface;

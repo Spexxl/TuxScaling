@@ -78,6 +78,10 @@ fn release_presented_images(translation: &PresentTranslation) {
 }
 
 fn should_retry_native_publication(result: vk::Result) -> bool {
+    result == vk::Result::SUCCESS
+}
+
+fn present_committed(result: vk::Result) -> bool {
     matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR)
 }
 
@@ -502,15 +506,19 @@ unsafe fn queue_present_inner(
                 info.swapchain_count,
             );
         }
-        if should_retry_native_publication(result) {
+        if present_committed(result) {
             if let Some(translation) = &translation {
                 release_presented_images(translation);
             }
-            // The pre-present observation intentionally cannot replace a
-            // generation while the submitted logical slot is still mapped.
-            // Retry after releasing it so the next generation sees an idle
-            // mapping without delaying or changing the WSI result.
-            unsafe { observe_presented_surfaces(queue_state, info) };
+            if should_retry_native_publication(result) {
+                // The pre-present observation intentionally cannot replace a
+                // generation while the submitted logical slot is still mapped.
+                // Retry after releasing it so the next generation sees an idle
+                // mapping without delaying or changing the WSI result. A
+                // suboptimal result is returned unchanged so the application
+                // can recreate before native publication is attempted.
+                unsafe { observe_presented_surfaces(queue_state, info) };
+            }
             if let Some(chain) = present_chain.as_ref() {
                 report_maintenance_present(info, chain);
             }
@@ -546,7 +554,9 @@ pub(super) unsafe extern "system" fn queue_present_khr(
 
 #[cfg(test)]
 mod tests {
-    use super::{should_retry_native_publication, translate_present, with_overlay_wait};
+    use super::{
+        present_committed, should_retry_native_publication, translate_present, with_overlay_wait,
+    };
     use crate::state::retire_swapchain;
     use ash::vk;
     use ash::vk::Handle;
@@ -570,10 +580,18 @@ mod tests {
     #[test]
     fn retries_native_publication_after_a_successful_present_release() {
         assert!(should_retry_native_publication(vk::Result::SUCCESS));
-        assert!(should_retry_native_publication(vk::Result::SUBOPTIMAL_KHR));
+        assert!(!should_retry_native_publication(vk::Result::SUBOPTIMAL_KHR));
         assert!(!should_retry_native_publication(
             vk::Result::ERROR_OUT_OF_DATE_KHR
         ));
+    }
+
+    #[test]
+    fn defers_native_publication_after_a_suboptimal_present() {
+        assert!(!should_retry_native_publication(vk::Result::SUBOPTIMAL_KHR));
+        assert!(present_committed(vk::Result::SUBOPTIMAL_KHR));
+        assert!(present_committed(vk::Result::SUCCESS));
+        assert!(!present_committed(vk::Result::ERROR_OUT_OF_DATE_KHR));
     }
 
     #[test]

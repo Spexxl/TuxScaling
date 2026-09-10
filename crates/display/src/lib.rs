@@ -182,7 +182,6 @@ impl PresentationNegotiation {
                 }
                 if is_native(target, window, fullscreen, surface) {
                     self.stage = NegotiationStage::RecreatingOutput { target, deadline };
-                    return true;
                 }
             }
             NegotiationStage::RecreatingOutput { target, deadline } => {
@@ -190,6 +189,8 @@ impl PresentationNegotiation {
                     self.fail(NegotiationFailure::DeadlineExpired);
                 } else if !is_native(target, window, fullscreen, surface) {
                     self.stage = NegotiationStage::WaitingForNativeExtent { target, deadline };
+                } else {
+                    return true;
                 }
             }
             NegotiationStage::Active { target }
@@ -709,14 +710,51 @@ mod tests {
         ));
         assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
 
-        assert!(negotiation.observe(
+        assert!(!negotiation.observe(
             target,
             true,
             SurfaceExtent::fixed(target.extent()),
             started + Duration::from_secs(2),
         ));
         assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+        assert!(negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(3),
+        ));
 
+        assert!(negotiation.output_recreated(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(3),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Virtualized);
+    }
+
+    #[test]
+    fn native_output_waits_for_stable_geometry_before_recreation() {
+        let target = Rect::new(0, 0, 1920, 1080);
+        let mut negotiation = PresentationNegotiation::direct();
+        let started = Instant::now();
+
+        negotiation.request_borderless(target, started);
+        negotiation.borderless_requested(started);
+
+        assert!(!negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(1),
+        ));
+        assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
+        assert!(negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(2),
+        ));
         assert!(negotiation.output_recreated(
             target,
             true,
@@ -796,7 +834,7 @@ mod tests {
         negotiation.request_borderless(target, started);
         negotiation.borderless_requested(started);
 
-        assert!(negotiation.observe(
+        assert!(!negotiation.observe(
             target,
             true,
             SurfaceExtent::Range {
@@ -805,6 +843,15 @@ mod tests {
             },
             started + Duration::from_secs(1),
         ));
+        assert!(negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::Range {
+                minimum: Extent::new(1280, 720),
+                maximum: Extent::new(3840, 2160),
+            },
+            started + Duration::from_secs(2),
+        ));
         assert!(negotiation.output_recreated(
             target,
             true,
@@ -812,7 +859,7 @@ mod tests {
                 minimum: Extent::new(1280, 720),
                 maximum: Extent::new(3840, 2160),
             },
-            started + Duration::from_secs(1),
+            started + Duration::from_secs(2),
         ));
         assert_eq!(negotiation.public_state(), PresentationState::Virtualized);
     }
@@ -833,11 +880,17 @@ mod tests {
         ));
         assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
 
-        assert!(negotiation.observe(
+        assert!(!negotiation.observe(
             target,
             true,
             SurfaceExtent::fixed(target.extent()),
             started + Duration::from_secs(2),
+        ));
+        assert!(negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(3),
         ));
     }
 
@@ -849,7 +902,7 @@ mod tests {
 
         negotiation.request_borderless(target, started);
         negotiation.borderless_requested(started);
-        assert!(negotiation.observe(
+        assert!(!negotiation.observe(
             target,
             true,
             SurfaceExtent::fixed(target.extent()),
@@ -870,17 +923,23 @@ mod tests {
         ));
         assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
 
-        assert!(negotiation.observe(
+        assert!(!negotiation.observe(
             target,
             true,
             SurfaceExtent::fixed(target.extent()),
             started + Duration::from_secs(3),
         ));
+        assert!(negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(4),
+        ));
         assert!(negotiation.output_recreated(
             target,
             true,
             SurfaceExtent::fixed(target.extent()),
-            started + Duration::from_secs(3),
+            started + Duration::from_secs(4),
         ));
         assert_eq!(negotiation.public_state(), PresentationState::Virtualized);
     }
@@ -893,7 +952,7 @@ mod tests {
 
         negotiation.request_borderless(target, started);
         negotiation.borderless_requested(started);
-        assert!(negotiation.observe(
+        assert!(!negotiation.observe(
             target,
             true,
             SurfaceExtent::fixed(target.extent()),
@@ -917,7 +976,7 @@ mod tests {
 
         negotiation.request_borderless(target, started);
         negotiation.borderless_requested(started);
-        assert!(negotiation.observe(
+        assert!(!negotiation.observe(
             target,
             true,
             SurfaceExtent::fixed(target.extent()),
@@ -945,17 +1004,23 @@ mod tests {
 
         negotiation.request_borderless(target, started);
         negotiation.borderless_requested(started);
-        assert!(negotiation.observe(
+        assert!(!negotiation.observe(
             target,
             true,
             SurfaceExtent::fixed(target.extent()),
             started + Duration::from_secs(1),
         ));
+        assert!(negotiation.observe(
+            target,
+            true,
+            SurfaceExtent::fixed(target.extent()),
+            started + Duration::from_secs(2),
+        ));
         assert!(negotiation.output_recreated(
             target,
             true,
             SurfaceExtent::fixed(target.extent()),
-            started + Duration::from_secs(1),
+            started + Duration::from_secs(2),
         ));
 
         assert!(!negotiation.observe(
