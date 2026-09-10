@@ -183,9 +183,7 @@ fn translate_recreation_create_info<'a>(
     surface: vk::SurfaceKHR,
     downstream_extent: SurfaceExtent,
 ) -> Result<vk::SwapchainCreateInfoKHR<'a>, vk::Result> {
-    if logical_info.old_swapchain != old_contract.handle()
-        || logical_info.image_extent != old_contract.game_extent()
-    {
+    if logical_info.old_swapchain != old_contract.handle() {
         return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
     }
     let physical_extent = match downstream_extent {
@@ -286,6 +284,30 @@ fn surface_extent(capabilities: vk::SurfaceCapabilitiesKHR) -> SurfaceExtent {
             ),
         }
     }
+}
+
+fn initial_physical_extent(
+    requested: vk::Extent2D,
+    surface_extent: SurfaceExtent,
+    virtual_eligible: bool,
+) -> vk::Extent2D {
+    if !virtual_eligible {
+        return requested;
+    }
+    match surface_extent {
+        SurfaceExtent::Fixed(extent) => vk::Extent2D {
+            width: extent.width,
+            height: extent.height,
+        },
+        SurfaceExtent::Range { minimum, maximum } => vk::Extent2D {
+            width: requested.width.clamp(minimum.width, maximum.width),
+            height: requested.height.clamp(minimum.height, maximum.height),
+        },
+    }
+}
+
+const fn native_generation_failure_can_restore(create_attempted: bool) -> bool {
+    !create_attempted
 }
 
 #[derive(Clone, Copy)]
@@ -391,8 +413,6 @@ struct NativeGenerationSnapshot {
     state: Arc<Mutex<SwapchainState>>,
     ticket: ReconfigurationTicket,
     old_physical: vk::SwapchainKHR,
-    old_images: Vec<vk::Image>,
-    old_info: SwapchainInfo,
     template: crate::state::SwapchainTemplate,
     contract: LogicalSwapchainContract,
     negotiation: PresentationNegotiation,
@@ -435,20 +455,12 @@ fn begin_native_generation(
         return None;
     };
     let old_physical = guard.physical_handle;
-    let old_info = SwapchainInfo {
-        format: template.image_format,
-        color_space: template.image_color_space,
-        extent: contract.generation().extent(),
-    };
-    let old_images = guard.physical_images.clone();
     let negotiation = guard.negotiation;
     drop(guard);
     let snapshot = NativeGenerationSnapshot {
         state,
         ticket,
         old_physical,
-        old_images,
-        old_info,
         template,
         contract,
         negotiation,
@@ -467,16 +479,18 @@ unsafe fn destroy_abandoned_generation(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .remove(&snapshot.ticket.logical_handle());
-    if removed.is_none() {
-        return;
+    let owns_old_physical = removed.is_some();
+    if owns_old_physical {
+        retire_swapchain(snapshot.ticket.logical_handle());
     }
-    retire_swapchain(snapshot.ticket.logical_handle());
     let _ = unsafe { device_state.device.device_wait_idle() };
     unsafe { runtime.destroy(&device_state.device) };
     if new_physical != vk::SwapchainKHR::null() {
         unsafe { loader.destroy_swapchain(new_physical, None) };
     }
-    unsafe { loader.destroy_swapchain(snapshot.old_physical, None) };
+    if owns_old_physical {
+        unsafe { loader.destroy_swapchain(snapshot.old_physical, None) };
+    }
     let another_virtual_swapchain = swapchains()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -485,7 +499,7 @@ unsafe fn destroy_abandoned_generation(
             let state = state.lock().unwrap_or_else(|error| error.into_inner());
             state.surface == snapshot.ticket.surface() && state.mapping.is_some()
         });
-    if !another_virtual_swapchain {
+    if owns_old_physical && !another_virtual_swapchain {
         super::lifetime::restore_surface_window(snapshot.ticket.surface());
     }
 }
@@ -496,10 +510,8 @@ unsafe fn finish_native_generation_failure(
     runtime: OverlaySwapchain,
     new_physical: vk::SwapchainKHR,
     loader: &ash::khr::swapchain::Device,
+    create_attempted: bool,
 ) {
-    if new_physical != vk::SwapchainKHR::null() {
-        unsafe { loader.destroy_swapchain(new_physical, None) };
-    }
     let mut runtime = Some(runtime);
     let destroy_requested = {
         let mut guard = snapshot
@@ -512,12 +524,12 @@ unsafe fn finish_native_generation_failure(
         } else {
             let _ = guard.lifecycle.abort(snapshot.ticket);
         }
-        if !destroy_requested && guard.overlay.is_none() {
+        if !destroy_requested && native_generation_failure_can_restore(create_attempted) {
             guard.overlay = runtime.take();
         }
         destroy_requested
     };
-    if destroy_requested {
+    if destroy_requested || !native_generation_failure_can_restore(create_attempted) {
         unsafe {
             destroy_abandoned_generation(
                 device_state,
@@ -525,7 +537,7 @@ unsafe fn finish_native_generation_failure(
                 runtime
                     .take()
                     .expect("destroyed transaction owns the runtime"),
-                vk::SwapchainKHR::null(),
+                new_physical,
                 loader,
             )
         };
@@ -608,6 +620,7 @@ pub(super) unsafe fn publish_native_generation(
                 runtime,
                 vk::SwapchainKHR::null(),
                 &ash::khr::swapchain::Device::new(&device_state.instance, &device_state.device),
+                false,
             )
         };
         return false;
@@ -622,6 +635,7 @@ pub(super) unsafe fn publish_native_generation(
                 runtime,
                 vk::SwapchainKHR::null(),
                 &ash::khr::swapchain::Device::new(&device_state.instance, &device_state.device),
+                false,
             )
         };
         return false;
@@ -642,7 +656,14 @@ pub(super) unsafe fn publish_native_generation(
     let loader = ash::khr::swapchain::Device::new(&device_state.instance, &device_state.device);
     if result != vk::Result::SUCCESS || new_physical == vk::SwapchainKHR::null() {
         unsafe {
-            finish_native_generation_failure(device_state, snapshot, runtime, new_physical, &loader)
+            finish_native_generation_failure(
+                device_state,
+                snapshot,
+                runtime,
+                new_physical,
+                &loader,
+                true,
+            )
         };
         return false;
     }
@@ -656,6 +677,7 @@ pub(super) unsafe fn publish_native_generation(
                     runtime,
                     new_physical,
                     &loader,
+                    true,
                 )
             };
             return false;
@@ -668,7 +690,14 @@ pub(super) unsafe fn publish_native_generation(
     };
     if unsafe { runtime.reconfigure_output(info, new_images.clone()) }.is_err() {
         unsafe {
-            finish_native_generation_failure(device_state, snapshot, runtime, new_physical, &loader)
+            finish_native_generation_failure(
+                device_state,
+                snapshot,
+                runtime,
+                new_physical,
+                &loader,
+                true,
+            )
         };
         return false;
     }
@@ -745,14 +774,16 @@ pub(super) unsafe fn publish_native_generation(
         }
     };
     if !published {
-        let mut runtime = runtime.expect("failed publication retains the runtime");
-        let rollback =
-            unsafe { runtime.restore_output(snapshot.old_info, snapshot.old_images.clone()) };
-        if rollback.is_err() {
-            runtime.disable();
-        }
+        let runtime = runtime.expect("failed publication retains the runtime");
         unsafe {
-            finish_native_generation_failure(device_state, snapshot, runtime, new_physical, &loader)
+            finish_native_generation_failure(
+                device_state,
+                snapshot,
+                runtime,
+                new_physical,
+                &loader,
+                true,
+            )
         };
         return false;
     }
@@ -1382,6 +1413,10 @@ unsafe fn create_swapchain_inner(
     if !virtual_preflight_eligible {
         super::lifetime::restore_surface_window(original.surface);
     }
+    if virtual_preflight_eligible && let Some(capabilities) = logical_capabilities {
+        modified.image_extent =
+            initial_physical_extent(original.image_extent, surface_extent(capabilities), true);
+    }
     // Probe X11 only.  The physical swapchain is intentionally created at
     // the extent accepted by the surface now; promotion happens only after
     // the logical token and images have been installed below.
@@ -1796,8 +1831,9 @@ pub(super) unsafe extern "system" fn create_swapchain_khr(
 #[cfg(test)]
 mod tests {
     use super::{
-        logical_image_count, physical_swapchain_info, temporal_enabled_for_logical_creation,
-        translate_old_swapchain, translate_recreation_create_info, virtual_swapchain_supported,
+        initial_physical_extent, logical_image_count, native_generation_failure_can_restore,
+        physical_swapchain_info, temporal_enabled_for_logical_creation, translate_old_swapchain,
+        translate_recreation_create_info, virtual_swapchain_supported,
     };
     use crate::recovery::{
         LogicalSwapchainContract, PhysicalGeneration, ReconfigurationLifecycle,
@@ -1901,6 +1937,33 @@ mod tests {
     }
 
     #[test]
+    fn initial_virtual_generation_uses_fixed_surface_extent_for_physical_swapchain() {
+        let requested = vk::Extent2D {
+            width: 1280,
+            height: 720,
+        };
+        let native = Extent::new(3440, 1440);
+
+        assert_eq!(
+            initial_physical_extent(requested, SurfaceExtent::fixed(native), true),
+            vk::Extent2D {
+                width: 3440,
+                height: 1440,
+            }
+        );
+        assert_eq!(
+            initial_physical_extent(requested, SurfaceExtent::fixed(native), false),
+            requested
+        );
+    }
+
+    #[test]
+    fn failed_native_creation_cannot_restore_an_old_generation_after_create_attempt() {
+        assert!(native_generation_failure_can_restore(false));
+        assert!(!native_generation_failure_can_restore(true));
+    }
+
+    #[test]
     fn recreation_hook_translates_physical_extent_and_preserves_new_logical_contract() {
         let surface = vk::SurfaceKHR::from_raw(0x9001);
         let old_logical = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0101);
@@ -1976,6 +2039,57 @@ mod tests {
         assert_eq!(new_contract.handle(), new_logical);
         assert_eq!(new_contract.logical_images(), new_logical_images.as_slice());
         assert_eq!(new_contract.game_extent(), logical_extent);
+    }
+
+    #[test]
+    fn recreation_accepts_a_changed_logical_extent() {
+        let surface = vk::SurfaceKHR::from_raw(0x9002);
+        let old_logical = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0111);
+        let old_physical = vk::SwapchainKHR::from_raw(0x311);
+        let old_extent = vk::Extent2D {
+            width: 1280,
+            height: 720,
+        };
+        let new_extent = vk::Extent2D {
+            width: 960,
+            height: 540,
+        };
+        let info = vk::SwapchainCreateInfoKHR::default()
+            .surface(surface)
+            .min_image_count(2)
+            .image_format(vk::Format::B8G8R8A8_UNORM)
+            .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
+            .image_extent(new_extent)
+            .image_array_layers(1)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .present_mode(vk::PresentModeKHR::FIFO)
+            .clipped(true)
+            .old_swapchain(old_logical);
+        let old_contract = LogicalSwapchainContract::new(
+            old_logical,
+            vec![vk::Image::from_raw(0x111)],
+            old_extent,
+            PhysicalGeneration::new(0, old_physical, old_extent, 2),
+            PresentationState::Virtualized,
+        )
+        .unwrap();
+        let template = SwapchainTemplate::from_create_info(&info);
+
+        let physical_info = translate_recreation_create_info(
+            &template,
+            &info,
+            &old_contract,
+            surface,
+            SurfaceExtent::fixed(Extent::new(3440, 1440)),
+        )
+        .unwrap();
+
+        assert_eq!(physical_info.image_extent.width, 3440);
+        assert_eq!(physical_info.image_extent.height, 1440);
+        assert_eq!(physical_info.old_swapchain, old_physical);
     }
 
     #[test]
