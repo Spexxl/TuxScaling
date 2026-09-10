@@ -2010,7 +2010,7 @@ mod tests {
         )
         .unwrap();
 
-        let downstream_recorder = vec![(physical_info.image_extent, physical_info.old_swapchain)];
+        let downstream_recorder = [(physical_info.image_extent, physical_info.old_swapchain)];
         let (recorded_extent, recorded_old_swapchain) = downstream_recorder[0];
         let new_contract = LogicalSwapchainContract::new(
             new_logical,

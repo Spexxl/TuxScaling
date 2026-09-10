@@ -708,11 +708,10 @@ mod tests {
     };
     use ash::vk;
     use ash::vk::Handle;
-    use std::ffi::CStr;
 
     #[test]
     fn unknown_swapchain_proc_names_are_not_forwarded_to_downstream() {
-        let name = CStr::from_bytes_with_nul(b"vkFutureSwapchainCommandKHR\0").unwrap();
+        let name = c"vkFutureSwapchainCommandKHR";
 
         assert!(is_swapchain_related_proc(name));
         assert!(

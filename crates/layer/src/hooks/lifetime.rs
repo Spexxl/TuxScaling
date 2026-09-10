@@ -145,61 +145,6 @@ pub(super) unsafe extern "system" fn destroy_swapchain_khr(
     }));
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{restore_surface_window, suppress_unknown_swapchain_destroy};
-    use crate::state::{X11Surface, surfaces};
-    use ash::vk;
-    use ash::vk::Handle;
-    use tuxscaling_display::{
-        BorderlessLease, Monitor, PresentationNegotiation, Rect, WindowSnapshot,
-    };
-
-    #[test]
-    fn unknown_reserved_token_is_suppressed_before_downstream_destroy() {
-        let token = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0abc);
-
-        assert!(super::is_unknown_logical_swapchain(token));
-        assert!(suppress_unknown_swapchain_destroy(token));
-    }
-
-    #[test]
-    fn fail_open_cleanup_takes_lease_and_resets_negotiation() {
-        let surface = vk::SurfaceKHR::from_raw(0xfeed);
-        let mut negotiation = PresentationNegotiation::direct();
-        negotiation.fail(tuxscaling_display::NegotiationFailure::DeadlineExpired);
-        surfaces().lock().unwrap().insert(
-            surface,
-            X11Surface {
-                window: 0,
-                logical_extent: Some(vk::Extent2D {
-                    width: 1,
-                    height: 1,
-                }),
-                logical_capabilities: None,
-                borderless_lease: Some(BorderlessLease {
-                    window: 0,
-                    original: WindowSnapshot {
-                        rect: Rect::new(0, 0, 1, 1),
-                        fullscreen: false,
-                    },
-                    monitor: Monitor::new(Rect::new(0, 0, 1, 1)),
-                }),
-                negotiation,
-            },
-        );
-
-        restore_surface_window(surface);
-        let state = surfaces().lock().unwrap().remove(&surface).unwrap();
-        assert!(state.borderless_lease.is_none());
-        assert!(state.logical_extent.is_none());
-        assert_eq!(
-            state.negotiation.public_state(),
-            tuxscaling_display::PresentationState::Direct
-        );
-    }
-}
-
 unsafe fn destroy_device_inner(
     device: vk::Device,
     allocation_callbacks: *const vk::AllocationCallbacks<'_>,
@@ -299,4 +244,59 @@ pub(super) unsafe extern "system" fn destroy_instance(
     let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         destroy_instance_inner(instance, allocation_callbacks)
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{restore_surface_window, suppress_unknown_swapchain_destroy};
+    use crate::state::{X11Surface, surfaces};
+    use ash::vk;
+    use ash::vk::Handle;
+    use tuxscaling_display::{
+        BorderlessLease, Monitor, PresentationNegotiation, Rect, WindowSnapshot,
+    };
+
+    #[test]
+    fn unknown_reserved_token_is_suppressed_before_downstream_destroy() {
+        let token = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0abc);
+
+        assert!(super::is_unknown_logical_swapchain(token));
+        assert!(suppress_unknown_swapchain_destroy(token));
+    }
+
+    #[test]
+    fn fail_open_cleanup_takes_lease_and_resets_negotiation() {
+        let surface = vk::SurfaceKHR::from_raw(0xfeed);
+        let mut negotiation = PresentationNegotiation::direct();
+        negotiation.fail(tuxscaling_display::NegotiationFailure::DeadlineExpired);
+        surfaces().lock().unwrap().insert(
+            surface,
+            X11Surface {
+                window: 0,
+                logical_extent: Some(vk::Extent2D {
+                    width: 1,
+                    height: 1,
+                }),
+                logical_capabilities: None,
+                borderless_lease: Some(BorderlessLease {
+                    window: 0,
+                    original: WindowSnapshot {
+                        rect: Rect::new(0, 0, 1, 1),
+                        fullscreen: false,
+                    },
+                    monitor: Monitor::new(Rect::new(0, 0, 1, 1)),
+                }),
+                negotiation,
+            },
+        );
+
+        restore_surface_window(surface);
+        let state = surfaces().lock().unwrap().remove(&surface).unwrap();
+        assert!(state.borderless_lease.is_none());
+        assert!(state.logical_extent.is_none());
+        assert_eq!(
+            state.negotiation.public_state(),
+            tuxscaling_display::PresentationState::Direct
+        );
+    }
 }

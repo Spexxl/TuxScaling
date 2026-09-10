@@ -1,3 +1,5 @@
+use ash::vk;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AcquireError {
     PhysicalBusy,
@@ -389,4 +391,3 @@ mod tests {
         assert!(LogicalSwapchainHandle::from_raw(physical).is_none());
     }
 }
-use ash::vk;

@@ -172,22 +172,6 @@ pub(crate) fn is_reconfiguring_swapchain(swapchain: vk::SwapchainKHR) -> bool {
         .is_some_and(|state| state.lifecycle.blocks_frame_operations())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{is_retired_swapchain, retire_swapchain};
-    use ash::vk;
-    use ash::vk::Handle;
-
-    #[test]
-    fn retired_logical_tokens_are_explicitly_rejected() {
-        let token = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0055);
-
-        assert!(!is_retired_swapchain(token));
-        retire_swapchain(token);
-        assert!(is_retired_swapchain(token));
-    }
-}
-
 pub(crate) fn retire_swapchain(swapchain: vk::SwapchainKHR) {
     RETIRED_SWAPCHAINS
         .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
@@ -237,4 +221,20 @@ pub(crate) fn instance_dispatch()
     static DISPATCH: OnceLock<Mutex<HashMap<vk::Instance, vk::PFN_vkGetInstanceProcAddr>>> =
         OnceLock::new();
     DISPATCH.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_retired_swapchain, retire_swapchain};
+    use ash::vk;
+    use ash::vk::Handle;
+
+    #[test]
+    fn retired_logical_tokens_are_explicitly_rejected() {
+        let token = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0055);
+
+        assert!(!is_retired_swapchain(token));
+        retire_swapchain(token);
+        assert!(is_retired_swapchain(token));
+    }
 }
