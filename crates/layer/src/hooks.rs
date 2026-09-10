@@ -84,6 +84,8 @@ const VIRTUALIZATION_SAFE_EXTENSIONS: &[&[u8]] = &[
     b"VK_KHR_swapchain",
     b"VK_KHR_incremental_present",
     b"VK_EXT_swapchain_colorspace",
+    b"VK_EXT_swapchain_maintenance1",
+    b"VK_KHR_swapchain_maintenance1",
 ];
 
 pub(crate) fn virtualization_extension_safe(create_info: &vk::DeviceCreateInfo<'_>) -> bool {
@@ -764,6 +766,17 @@ mod tests {
         let info = vk::DeviceCreateInfo::default().enabled_extension_names(&extension_names);
 
         assert!(!virtualization_extension_safe(&info));
+    }
+
+    #[test]
+    fn maintenance_virtualization_accepts_both_extension_aliases() {
+        let ext_names = [vk::EXT_SWAPCHAIN_MAINTENANCE1_NAME.as_ptr()];
+        let ext_info = vk::DeviceCreateInfo::default().enabled_extension_names(&ext_names);
+        assert!(virtualization_extension_safe(&ext_info));
+
+        let khr_names = [super::maintenance::KHR_SWAPCHAIN_MAINTENANCE1_NAME.as_ptr()];
+        let khr_info = vk::DeviceCreateInfo::default().enabled_extension_names(&khr_names);
+        assert!(virtualization_extension_safe(&khr_info));
     }
 
     #[test]

@@ -5,6 +5,40 @@ fn suppress_unknown_swapchain_destroy(swapchain: vk::SwapchainKHR) -> bool {
     is_retired_swapchain(swapchain) || is_unknown_logical_swapchain(swapchain)
 }
 
+fn unique_physical_handles(
+    current: vk::SwapchainKHR,
+    retired: &[vk::SwapchainKHR],
+) -> Vec<vk::SwapchainKHR> {
+    let mut handles = Vec::with_capacity(retired.len() + 1);
+    for handle in std::iter::once(current).chain(retired.iter().copied()) {
+        if handle != vk::SwapchainKHR::null() && !handles.contains(&handle) {
+            handles.push(handle);
+        }
+    }
+    handles
+}
+
+struct SwapchainTeardown {
+    physical_handles: Vec<vk::SwapchainKHR>,
+    restore_surface: Option<vk::SurfaceKHR>,
+    virtualized: bool,
+    overlay: Option<OverlaySwapchain>,
+}
+
+fn take_swapchain_teardown(state: &Arc<Mutex<SwapchainState>>) -> SwapchainTeardown {
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    let virtualized = state.mapping.is_some();
+    SwapchainTeardown {
+        physical_handles: unique_physical_handles(
+            state.physical_handle,
+            &state.retired_physical_generations,
+        ),
+        restore_surface: virtualized.then_some(state.surface),
+        virtualized,
+        overlay: state.overlay.take(),
+    }
+}
+
 unsafe fn destroy_overlay(device_state: &DeviceState, overlay: OverlaySwapchain) {
     let _ = unsafe { device_state.device.device_wait_idle() };
     unsafe { overlay.destroy(&device_state.device) };
@@ -39,40 +73,33 @@ unsafe fn destroy_swapchain_inner(
     if state.is_none() && suppress_unknown_swapchain_destroy(swapchain) {
         return;
     }
-    let physical_swapchain = state
+    let teardown = state
         .as_ref()
-        .and_then(|state| state.lock().ok().map(|state| state.physical_handle))
-        .unwrap_or(swapchain);
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        if state.as_ref().is_some_and(|state| {
-            state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .mapping
-                .is_some()
-        }) {
-            retire_swapchain(swapchain);
-        }
-        let restore_surface = state.as_ref().and_then(|state| {
-            let state = state.lock().unwrap_or_else(|e| e.into_inner());
-            state.mapping.as_ref().map(|_| state.surface)
+        .map(take_swapchain_teardown)
+        .unwrap_or_else(|| SwapchainTeardown {
+            physical_handles: vec![swapchain],
+            restore_surface: None,
+            virtualized: false,
+            overlay: None,
         });
-        let device_state = devices()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&device)
-            .cloned();
-        if let Some(state) = state
-            .and_then(|s| Arc::try_unwrap(s).ok())
-            .map(|s| s.into_inner().unwrap_or_else(|e| e.into_inner()))
-            && let Some(device_state) = device_state
-            && let Some(overlay) = state.overlay
+    if teardown.virtualized {
+        retire_swapchain(swapchain);
+    }
+    drop(state);
+    let device_state = devices()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&device)
+        .cloned();
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(device_state) = device_state.as_ref()
+            && let Some(overlay) = teardown.overlay
         {
             let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
-                destroy_overlay(&device_state, overlay)
+                destroy_overlay(device_state, overlay)
             }));
         }
-        if let Some(surface) = restore_surface {
+        if let Some(surface) = teardown.restore_surface {
             let another_virtual_swapchain = swapchains()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -88,7 +115,9 @@ unsafe fn destroy_swapchain_inner(
     }));
     if let Some(proc) = destroy {
         let destroy_swapchain: vk::PFN_vkDestroySwapchainKHR = unsafe { std::mem::transmute(proc) };
-        unsafe { destroy_swapchain(device, physical_swapchain, allocation_callbacks) };
+        for physical_swapchain in teardown.physical_handles {
+            unsafe { destroy_swapchain(device, physical_swapchain, allocation_callbacks) };
+        }
     }
 }
 
@@ -155,46 +184,76 @@ unsafe fn destroy_device_inner(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&device);
-        let overlays = {
+        let swapchains_to_destroy = {
             let mut swapchains = swapchains().lock().unwrap_or_else(|e| e.into_inner());
             let handles = swapchains
                 .iter()
                 .filter_map(|(handle, state)| {
-                    let state = state.lock().unwrap_or_else(|e| e.into_inner());
-                    if state.device != device {
+                    if state.lock().unwrap_or_else(|e| e.into_inner()).device != device {
                         return None;
-                    }
-                    if state.mapping.is_some() {
-                        retire_swapchain(*handle);
                     }
                     Some(*handle)
                 })
                 .collect::<Vec<_>>();
             handles
                 .into_iter()
-                .filter_map(|handle| swapchains.remove(&handle))
+                .filter_map(|handle| {
+                    let state = swapchains.remove(&handle)?;
+                    let teardown = take_swapchain_teardown(&state);
+                    if teardown.virtualized {
+                        retire_swapchain(handle);
+                    }
+                    Some(teardown)
+                })
                 .collect::<Vec<_>>()
         };
         queues()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|_, state| state.device != device);
-        if let Some(device_state) = device_state {
-            let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        let surfaces_to_restore = swapchains_to_destroy
+            .iter()
+            .filter_map(|teardown| teardown.restore_surface)
+            .fold(Vec::new(), |mut surfaces, surface| {
+                if !surfaces.contains(&surface) {
+                    surfaces.push(surface);
+                }
+                surfaces
+            });
+        let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+            if let Some(device_state) = device_state.as_ref() {
                 let _ = device_state.device.device_wait_idle();
-                for state in overlays {
-                    if let Ok(state) = Arc::try_unwrap(state) {
-                        let state = state.into_inner().unwrap_or_else(|e| e.into_inner());
-                        let restore_surface = state.mapping.is_some().then_some(state.surface);
-                        if let Some(overlay) = state.overlay {
-                            overlay.destroy(&device_state.device);
-                        }
-                        if let Some(surface) = restore_surface {
-                            restore_surface_window(surface);
-                        }
+            }
+            let destroy_swapchain = destroy.map(|proc| {
+                std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkDestroySwapchainKHR>(
+                    proc,
+                )
+            });
+            for teardown in swapchains_to_destroy {
+                if let Some(device_state) = device_state.as_ref()
+                    && let Some(overlay) = teardown.overlay
+                {
+                    overlay.destroy(&device_state.device);
+                }
+                if let Some(destroy_swapchain) = destroy_swapchain {
+                    for physical_swapchain in teardown.physical_handles {
+                        destroy_swapchain(device, physical_swapchain, allocation_callbacks);
                     }
                 }
-            }));
+            }
+        }));
+        for surface in surfaces_to_restore {
+            let another_virtual_swapchain = swapchains()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .values()
+                .any(|state| {
+                    let state = state.lock().unwrap_or_else(|error| error.into_inner());
+                    state.surface == surface && state.mapping.is_some()
+                });
+            if !another_virtual_swapchain {
+                restore_surface_window(surface);
+            }
         }
     }));
     if let Some(proc) = destroy {
@@ -248,7 +307,9 @@ pub(super) unsafe extern "system" fn destroy_instance(
 
 #[cfg(test)]
 mod tests {
-    use super::{restore_surface_window, suppress_unknown_swapchain_destroy};
+    use super::{
+        restore_surface_window, suppress_unknown_swapchain_destroy, unique_physical_handles,
+    };
     use crate::state::{X11Surface, surfaces};
     use ash::vk;
     use ash::vk::Handle;
@@ -297,6 +358,22 @@ mod tests {
         assert_eq!(
             state.negotiation.public_state(),
             tuxscaling_display::PresentationState::Direct
+        );
+    }
+
+    #[test]
+    fn retired_physical_generations_are_destroyed_once() {
+        let current = vk::SwapchainKHR::from_raw(41);
+        let retired = [
+            vk::SwapchainKHR::from_raw(17),
+            current,
+            vk::SwapchainKHR::null(),
+            vk::SwapchainKHR::from_raw(17),
+        ];
+
+        assert_eq!(
+            unique_physical_handles(current, &retired),
+            vec![current, retired[0]]
         );
     }
 }

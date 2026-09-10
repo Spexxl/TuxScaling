@@ -81,6 +81,42 @@ fn should_retry_native_publication(result: vk::Result) -> bool {
     matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR)
 }
 
+fn report_maintenance_present(info: &vk::PresentInfoKHR<'_>, chain: &PresentChain<'_>) {
+    let fence_count = chain
+        .fences
+        .as_ref()
+        .map_or(0, |fences| fences.swapchain_count);
+    let mode_count = chain
+        .modes
+        .as_ref()
+        .map_or(0, |modes| modes.swapchain_count);
+    if fence_count == 0 && mode_count == 0 {
+        return;
+    }
+    let presented = if info.swapchain_count == 0 || info.p_swapchains.is_null() {
+        return;
+    } else {
+        unsafe { std::slice::from_raw_parts(info.p_swapchains, info.swapchain_count as usize) }
+    };
+    let states = swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for swapchain in presented {
+        let Some(state) = states.get(swapchain) else {
+            continue;
+        };
+        let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.mapping.is_some() && !state.maintenance_present_reported {
+            state.maintenance_present_reported = true;
+            eprintln!(
+                "TuxScaling evidence event=maintenance1_present fences={} modes={} virtual=1",
+                fence_count, mode_count,
+            );
+            break;
+        }
+    }
+}
+
 unsafe fn observe_presented_surfaces(queue_state: QueueState, info: &vk::PresentInfoKHR<'_>) {
     if info.swapchain_count == 0 || info.p_swapchains.is_null() {
         return;
@@ -360,10 +396,24 @@ unsafe fn submit_overlay(
             }
             break;
         }
-        if let Ok(mut state) = state.lock()
+        let maintenance_report = if let Ok(mut state) = state.lock()
             && let Some(overlay) = state.overlay.as_mut()
         {
             overlay.submitted();
+            if device_state.maintenance1.enabled
+                && state.mapping.is_some()
+                && !state.maintenance_overlay_reported
+            {
+                state.maintenance_overlay_reported = true;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if maintenance_report {
+            eprintln!("TuxScaling evidence event=overlay_submitted maintenance1=1");
         }
         previous = Some(frame.render_complete);
     }
@@ -450,6 +500,9 @@ unsafe fn queue_present_inner(
             // Retry after releasing it so the next generation sees an idle
             // mapping without delaying or changing the WSI result.
             unsafe { observe_presented_surfaces(queue_state, info) };
+            if let Some(chain) = present_chain.as_ref() {
+                report_maintenance_present(info, chain);
+            }
         }
         if result != vk::Result::SUCCESS && !info.p_swapchains.is_null() {
             let presented = unsafe {

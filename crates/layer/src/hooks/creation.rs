@@ -796,7 +796,19 @@ pub(super) unsafe fn publish_native_generation(
             guard.negotiation = published_negotiation;
             guard.physical_handle = new_physical;
             guard.physical_images = new_images.clone();
+            guard.maintenance_overlay_reported = false;
+            guard.maintenance_present_reported = false;
+            guard.maintenance_release_reported = false;
             guard.generation = next_generation;
+            if snapshot.old_physical != vk::SwapchainKHR::null()
+                && !guard
+                    .retired_physical_generations
+                    .contains(&snapshot.old_physical)
+            {
+                guard
+                    .retired_physical_generations
+                    .push(snapshot.old_physical);
+            }
             guard.overlay = runtime.take();
             true
         }
@@ -826,7 +838,6 @@ pub(super) unsafe fn publish_native_generation(
         target_extent.height,
         snapshot.ticket.generation().saturating_add(1),
     );
-    unsafe { loader.destroy_swapchain(snapshot.old_physical, None) };
     true
 }
 
@@ -1175,10 +1186,19 @@ unsafe fn create_device_inner(
                 *device,
             )
         };
+        let maintenance1 = unsafe { super::maintenance::maintenance1_support(&*create_info) };
+        if maintenance1.enabled {
+            let flavor = match maintenance1.flavor {
+                Some(super::maintenance::Maintenance1Flavor::Ext) => "ext",
+                Some(super::maintenance::Maintenance1Flavor::Khr) => "khr",
+                None => "unknown",
+            };
+            eprintln!("TuxScaling evidence event=maintenance1_device enabled=1 flavor={flavor}");
+        }
         devices().lock().unwrap_or_else(|e| e.into_inner()).insert(
             unsafe { *device },
             DeviceState {
-                maintenance1: unsafe { super::maintenance::maintenance1_support(&*create_info) },
+                maintenance1,
                 virtualization_extension_safe: super::virtualization_extension_safe(unsafe {
                     &*create_info
                 }),
@@ -1764,6 +1784,10 @@ unsafe fn create_swapchain_inner(
             overlay: Some(overlay),
             virtual_images,
             physical_images: output_images.clone(),
+            retired_physical_generations: Vec::new(),
+            maintenance_overlay_reported: false,
+            maintenance_present_reported: false,
+            maintenance_release_reported: false,
             generation: 0,
             template,
             contract,
