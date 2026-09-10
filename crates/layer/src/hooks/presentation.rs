@@ -81,6 +81,19 @@ fn should_retry_native_publication(result: vk::Result) -> bool {
     matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR)
 }
 
+fn with_overlay_wait<R>(
+    mut modified: vk::PresentInfoKHR<'_>,
+    overlay_wait: Option<vk::Semaphore>,
+    invoke: impl FnOnce(&vk::PresentInfoKHR<'_>) -> R,
+) -> R {
+    let wait_storage = overlay_wait.map(|semaphore| [semaphore]);
+    if let Some(wait_storage) = wait_storage.as_ref() {
+        modified.wait_semaphore_count = 1;
+        modified.p_wait_semaphores = wait_storage.as_ptr();
+    }
+    invoke(&modified)
+}
+
 fn report_maintenance_present(info: &vk::PresentInfoKHR<'_>, chain: &PresentChain<'_>) {
     let fence_count = chain
         .fences
@@ -467,10 +480,6 @@ unsafe fn queue_present_inner(
     });
     if overlay_complete.is_some() || translation.is_some() {
         let mut modified = *info;
-        if let Some(render_complete) = overlay_complete {
-            modified.wait_semaphore_count = 1;
-            modified.p_wait_semaphores = &render_complete;
-        }
         if let Some(translation) = &translation {
             modified.p_swapchains = translation.swapchains.as_ptr();
             modified.p_image_indices = translation.image_indices.as_ptr();
@@ -478,13 +487,15 @@ unsafe fn queue_present_inner(
         let mapped_regions = present_chain
             .as_ref()
             .and_then(|chain| unsafe { map_present_regions(info, chain) });
-        let result = if let Some(chain) = present_chain.as_ref() {
-            chain.with_rebuilt_chain(modified, mapped_regions.as_ref(), |modified| unsafe {
-                present(queue, modified)
-            })
-        } else {
-            unsafe { present(queue, &modified) }
-        };
+        let result = with_overlay_wait(modified, overlay_complete, |modified| {
+            if let Some(chain) = present_chain.as_ref() {
+                chain.with_rebuilt_chain(*modified, mapped_regions.as_ref(), |modified| unsafe {
+                    present(queue, modified)
+                })
+            } else {
+                unsafe { present(queue, modified) }
+            }
+        });
         if result != vk::Result::SUCCESS && result != vk::Result::SUBOPTIMAL_KHR {
             eprintln!(
                 "TuxScaling evidence event=present_result result={result:?} swapchains={}",
@@ -535,7 +546,7 @@ pub(super) unsafe extern "system" fn queue_present_khr(
 
 #[cfg(test)]
 mod tests {
-    use super::{should_retry_native_publication, translate_present};
+    use super::{should_retry_native_publication, translate_present, with_overlay_wait};
     use crate::state::retire_swapchain;
     use ash::vk;
     use ash::vk::Handle;
@@ -563,5 +574,19 @@ mod tests {
         assert!(!should_retry_native_publication(
             vk::Result::ERROR_OUT_OF_DATE_KHR
         ));
+    }
+
+    #[test]
+    fn overlay_wait_semaphore_remains_valid_for_downstream_callback() {
+        let semaphore = vk::Semaphore::from_raw(0xcf00_0000_00cf);
+        let info = vk::PresentInfoKHR::default();
+
+        let observed = with_overlay_wait(info, Some(semaphore), |modified| unsafe {
+            assert_eq!(modified.wait_semaphore_count, 1);
+            assert!(!modified.p_wait_semaphores.is_null());
+            *modified.p_wait_semaphores
+        });
+
+        assert_eq!(observed, semaphore);
     }
 }
