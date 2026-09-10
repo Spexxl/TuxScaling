@@ -44,9 +44,29 @@ pub(crate) enum PresentError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReleaseError {
+    DuplicateLogicalSlot,
+    LogicalSlotIdle,
+    OutOfRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PhysicalImage {
     generation: u64,
     index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReleasePlan {
+    generation: u64,
+    logical_indices: Vec<u32>,
+    physical_indices: Vec<u32>,
+}
+
+impl ReleasePlan {
+    pub(crate) fn physical_indices(&self) -> &[u32] {
+        &self.physical_indices
+    }
 }
 
 /// Maps application-visible image slots to the images acquired from the
@@ -153,6 +173,61 @@ impl Mapping {
             .and_then(|slot| *slot)
             .filter(|mapped| mapped.generation == self.generation)
             .map(|mapped| mapped.index)
+    }
+
+    pub(crate) fn plan_release(
+        &self,
+        logical_indices: &[u32],
+    ) -> Result<ReleasePlan, ReleaseError> {
+        let mut physical_indices = Vec::with_capacity(logical_indices.len());
+        for (position, logical_index) in logical_indices.iter().enumerate() {
+            if logical_indices[..position].contains(logical_index) {
+                return Err(ReleaseError::DuplicateLogicalSlot);
+            }
+            let Some(mapped) = self
+                .logical_slots
+                .get(*logical_index as usize)
+                .and_then(|slot| *slot)
+                .filter(|mapped| mapped.generation == self.generation)
+            else {
+                if (*logical_index as usize) >= self.logical_slots.len() {
+                    return Err(ReleaseError::OutOfRange);
+                }
+                return Err(ReleaseError::LogicalSlotIdle);
+            };
+            physical_indices.push(mapped.index);
+        }
+        Ok(ReleasePlan {
+            generation: self.generation,
+            logical_indices: logical_indices.to_vec(),
+            physical_indices,
+        })
+    }
+
+    pub(crate) fn commit_release(&mut self, plan: &ReleasePlan) -> bool {
+        if self.generation != plan.generation
+            || plan.logical_indices.len() != plan.physical_indices.len()
+        {
+            return false;
+        }
+        let still_current = plan.logical_indices.iter().zip(&plan.physical_indices).all(
+            |(logical_index, physical_index)| {
+                self.logical_slots
+                    .get(*logical_index as usize)
+                    .and_then(|slot| *slot)
+                    == Some(PhysicalImage {
+                        generation: self.generation,
+                        index: *physical_index,
+                    })
+            },
+        );
+        if !still_current {
+            return false;
+        }
+        for logical_index in &plan.logical_indices {
+            self.logical_slots[*logical_index as usize] = None;
+        }
+        true
     }
 
     pub(crate) fn replace_generation(&mut self, generation: u64) -> bool {
@@ -372,6 +447,57 @@ mod tests {
             Some(77)
         );
         assert_eq!(OldSwapchain::translate(None, 42, current_physical), None);
+    }
+
+    #[test]
+    fn release_plan_preserves_mapping_until_downstream_success() {
+        let mut mapping = Mapping::new(7, 3);
+        let first = mapping.acquire(4).unwrap();
+        let second = mapping.acquire(1).unwrap();
+        let plan = mapping.plan_release(&[second, first]).unwrap();
+
+        assert_eq!(plan.physical_indices(), &[1, 4]);
+        assert_eq!(mapping.resolve(first), Some(4));
+        assert!(mapping.commit_release(&plan));
+        assert_eq!(mapping.resolve(first), None);
+        assert_eq!(mapping.resolve(second), None);
+    }
+
+    #[test]
+    fn failed_downstream_release_does_not_commit_the_plan() {
+        let mut mapping = Mapping::new(71, 1);
+        let logical = mapping.acquire(6).unwrap();
+        let plan = mapping.plan_release(&[logical]).unwrap();
+        let downstream_result = vk::Result::ERROR_DEVICE_LOST;
+
+        if downstream_result == vk::Result::SUCCESS {
+            assert!(mapping.commit_release(&plan));
+        }
+
+        assert_eq!(mapping.resolve(logical), Some(6));
+    }
+
+    #[test]
+    fn release_plan_rejects_duplicate_idle_and_out_of_range_slots() {
+        let mut mapping = Mapping::new(8, 2);
+        let acquired = mapping.acquire(3).unwrap();
+
+        assert!(mapping.plan_release(&[acquired, acquired]).is_err());
+        assert!(mapping.plan_release(&[1]).is_err());
+        assert!(mapping.plan_release(&[2]).is_err());
+        assert!(mapping.plan_release(&[]).is_ok());
+    }
+
+    #[test]
+    fn stale_release_plan_cannot_commit_after_generation_change() {
+        let mut mapping = Mapping::new(9, 1);
+        let logical = mapping.acquire(5).unwrap();
+        let plan = mapping.plan_release(&[logical]).unwrap();
+        assert_eq!(mapping.present(logical), Ok(5));
+        assert!(mapping.replace_generation(10));
+
+        assert!(!mapping.commit_release(&plan));
+        assert_eq!(mapping.generation(), 10);
     }
 
     #[test]

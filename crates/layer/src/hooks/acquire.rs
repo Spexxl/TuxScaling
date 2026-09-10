@@ -1,6 +1,8 @@
 use super::*;
 #[cfg(test)]
 use crate::mapping::Mapping;
+use crate::mapping::ReleasePlan;
+use std::time::Instant;
 
 fn reject_retired_swapchain(swapchain: vk::SwapchainKHR) -> Result<(), vk::Result> {
     if is_retired_swapchain(swapchain) || is_unknown_logical_swapchain(swapchain) {
@@ -95,15 +97,198 @@ unsafe fn release_acquired_physical_image(
     physical_swapchain: vk::SwapchainKHR,
     physical_index: u32,
 ) -> bool {
-    let Some(proc) = (unsafe { device_downstream(device, c"vkReleaseSwapchainImagesEXT") }) else {
+    let Some(release) =
+        (unsafe { downstream_release_proc(device, c"vkReleaseSwapchainImagesEXT") })
+    else {
         return false;
     };
-    let release: vk::PFN_vkReleaseSwapchainImagesEXT = unsafe { std::mem::transmute(proc) };
     let indices = [physical_index];
     let info = vk::ReleaseSwapchainImagesInfoEXT::default()
         .swapchain(physical_swapchain)
         .image_indices(&indices);
     unsafe { release(device, &info) == vk::Result::SUCCESS }
+}
+
+unsafe fn downstream_release_proc(
+    device: vk::Device,
+    preferred_name: &CStr,
+) -> Option<vk::PFN_vkReleaseSwapchainImagesEXT> {
+    let alternate_name = if preferred_name.to_bytes() == b"vkReleaseSwapchainImagesKHR" {
+        c"vkReleaseSwapchainImagesEXT"
+    } else {
+        c"vkReleaseSwapchainImagesKHR"
+    };
+    let proc = unsafe { device_downstream(device, preferred_name) }
+        .or_else(|| unsafe { device_downstream(device, alternate_name) })?;
+    Some(unsafe {
+        std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkReleaseSwapchainImagesEXT>(
+            proc,
+        )
+    })
+}
+
+fn release_info_with_plan<'a>(
+    original: &vk::ReleaseSwapchainImagesInfoEXT<'a>,
+    physical_swapchain: vk::SwapchainKHR,
+    plan: &ReleasePlan,
+) -> vk::ReleaseSwapchainImagesInfoEXT<'a> {
+    let mut modified = *original;
+    modified.swapchain = physical_swapchain;
+    modified.image_index_count = plan.physical_indices().len() as u32;
+    modified.p_image_indices = plan.physical_indices().as_ptr();
+    modified
+}
+
+struct ReleaseTranslation {
+    state: Arc<Mutex<SwapchainState>>,
+    surface: vk::SurfaceKHR,
+    physical_swapchain: vk::SwapchainKHR,
+    plan: ReleasePlan,
+}
+
+enum ReleaseTarget {
+    Direct,
+    Virtual(ReleaseTranslation),
+}
+
+fn prepare_release_target(
+    info: &vk::ReleaseSwapchainImagesInfoEXT<'_>,
+) -> Result<ReleaseTarget, vk::Result> {
+    let logical_swapchain = info.swapchain;
+    if is_retired_swapchain(logical_swapchain) {
+        return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
+    }
+    let state = swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&logical_swapchain)
+        .cloned();
+    let Some(state) = state else {
+        return if is_unknown_logical_swapchain(logical_swapchain) {
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+        } else {
+            Ok(ReleaseTarget::Direct)
+        };
+    };
+    let state_guard = state.lock().unwrap_or_else(|error| error.into_inner());
+    if state_guard.lifecycle.blocks_frame_operations() {
+        return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
+    }
+    let Some(mapping) = state_guard.mapping.as_ref() else {
+        return if LogicalSwapchainHandle::is_reserved(logical_swapchain.as_raw()) {
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+        } else {
+            Ok(ReleaseTarget::Direct)
+        };
+    };
+    if info.image_index_count != 0 && info.p_image_indices.is_null() {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
+    let logical_indices = if info.image_index_count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(info.p_image_indices, info.image_index_count as usize) }
+    };
+    let plan = mapping
+        .plan_release(logical_indices)
+        .map_err(|_| vk::Result::ERROR_OUT_OF_DATE_KHR)?;
+    Ok(ReleaseTarget::Virtual(ReleaseTranslation {
+        state: state.clone(),
+        surface: state_guard.surface,
+        physical_swapchain: state_guard.physical_handle,
+        plan,
+    }))
+}
+
+unsafe fn release_swapchain_images_inner(
+    device: vk::Device,
+    info: *const vk::ReleaseSwapchainImagesInfoEXT<'_>,
+    preferred_name: &CStr,
+) -> vk::Result {
+    if info.is_null() {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    let original = unsafe { &*info };
+    let target = match prepare_release_target(original) {
+        Ok(target) => target,
+        Err(error) => return error,
+    };
+    let mut modified = *original;
+    let virtual_translation = match &target {
+        ReleaseTarget::Direct => None,
+        ReleaseTarget::Virtual(translation) => {
+            modified =
+                release_info_with_plan(original, translation.physical_swapchain, &translation.plan);
+            Some(translation)
+        }
+    };
+    let Some(release) = (unsafe { downstream_release_proc(device, preferred_name) }) else {
+        return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
+    };
+    let result = unsafe { release(device, &modified) };
+    let Some(translation) = virtual_translation else {
+        return result;
+    };
+    if result != vk::Result::SUCCESS {
+        return result;
+    }
+    let (committed, idle) = {
+        let mut state = translation
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(mapping) = state.mapping.as_mut() else {
+            return vk::Result::ERROR_OUT_OF_DATE_KHR;
+        };
+        let committed = mapping.commit_release(&translation.plan);
+        (committed, committed && mapping.is_idle())
+    };
+    if !committed {
+        eprintln!("TuxScaling evidence event=maintenance1_release_rejected reason=stale_mapping");
+        return vk::Result::ERROR_OUT_OF_DATE_KHR;
+    }
+    eprintln!(
+        "TuxScaling evidence event=maintenance1_release logical=0x{:x} physical=0x{:x} count={} virtual=1",
+        original.swapchain.as_raw(),
+        translation.physical_swapchain.as_raw(),
+        translation.plan.physical_indices().len(),
+    );
+    if idle
+        && let Some(device_state) = devices()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&device)
+            .cloned()
+    {
+        unsafe {
+            super::creation::observe_surface_negotiation(
+                &device_state,
+                translation.surface,
+                Instant::now(),
+            );
+        }
+    }
+    result
+}
+
+pub(super) unsafe extern "system" fn release_swapchain_images(
+    device: vk::Device,
+    info: *const vk::ReleaseSwapchainImagesInfoEXT<'_>,
+) -> vk::Result {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        release_swapchain_images_inner(device, info, c"vkReleaseSwapchainImagesEXT")
+    }))
+    .unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED)
+}
+
+pub(super) unsafe extern "system" fn release_swapchain_images_khr(
+    device: vk::Device,
+    info: *const vk::ReleaseSwapchainImagesInfoEXT<'_>,
+) -> vk::Result {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        release_swapchain_images_inner(device, info, c"vkReleaseSwapchainImagesKHR")
+    }))
+    .unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED)
 }
 
 fn acquired(result: vk::Result) -> bool {
@@ -363,7 +548,11 @@ pub(super) unsafe extern "system" fn acquire_next_image2_khr(
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_virtual_images, map_acquire_result, reject_retired_swapchain};
+    use super::{
+        copy_virtual_images, map_acquire_result, prepare_release_target, reject_retired_swapchain,
+        release_info_with_plan,
+    };
+    use crate::mapping::Mapping;
     use crate::state::retire_swapchain;
     use ash::vk;
     use ash::vk::Handle;
@@ -462,5 +651,43 @@ mod tests {
             Err(crate::mapping::AcquireError::NoLogicalSlot)
         );
         assert_eq!(downstream_acquires, 0);
+    }
+
+    #[test]
+    fn release_hook_recorder_receives_physical_handle_and_indices_in_order() {
+        let mut mapping = Mapping::new(14, 3);
+        let first = mapping.acquire(4).unwrap();
+        let second = mapping.acquire(1).unwrap();
+        let logical_indices = [second, first];
+        let plan = mapping.plan_release(&logical_indices).unwrap();
+        let logical_swapchain = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0041);
+        let physical_swapchain = vk::SwapchainKHR::from_raw(0x0042);
+        let original = vk::ReleaseSwapchainImagesInfoEXT::default()
+            .swapchain(logical_swapchain)
+            .image_indices(&logical_indices);
+
+        let modified = release_info_with_plan(&original, physical_swapchain, &plan);
+        let recorded_indices = unsafe {
+            std::slice::from_raw_parts(
+                modified.p_image_indices,
+                modified.image_index_count as usize,
+            )
+        };
+
+        assert_eq!(modified.swapchain, physical_swapchain);
+        assert_eq!(recorded_indices, &[1, 4]);
+        assert_eq!(mapping.resolve(first), Some(4));
+        assert_eq!(mapping.resolve(second), Some(1));
+    }
+
+    #[test]
+    fn invalid_tagged_release_is_rejected_before_downstream_lookup() {
+        let token = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0043);
+        let info = vk::ReleaseSwapchainImagesInfoEXT::default().swapchain(token);
+
+        assert!(matches!(
+            prepare_release_target(&info),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+        ));
     }
 }

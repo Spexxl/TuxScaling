@@ -29,7 +29,10 @@ pub(crate) mod maintenance;
 pub(crate) mod present_chain;
 mod presentation;
 mod surface;
-use acquire::{acquire_next_image_khr, acquire_next_image2_khr, get_swapchain_images_khr};
+use acquire::{
+    acquire_next_image_khr, acquire_next_image2_khr, get_swapchain_images_khr,
+    release_swapchain_images, release_swapchain_images_khr,
+};
 use creation::{
     create_device, create_instance, create_swapchain_khr, get_device_queue, get_device_queue2,
 };
@@ -342,7 +345,16 @@ pub(crate) unsafe fn get_device_proc_addr_inner(
                 device,
                 name,
                 std::mem::transmute::<vk::PFN_vkReleaseSwapchainImagesEXT, vk::PFN_vkVoidFunction>(
-                    reject_release_swapchain_images_ext as vk::PFN_vkReleaseSwapchainImagesEXT,
+                    release_swapchain_images as vk::PFN_vkReleaseSwapchainImagesEXT,
+                ),
+            )
+        },
+        b"vkReleaseSwapchainImagesKHR" => unsafe {
+            extension_proc_or_downstream(
+                device,
+                name,
+                std::mem::transmute::<vk::PFN_vkReleaseSwapchainImagesEXT, vk::PFN_vkVoidFunction>(
+                    release_swapchain_images_khr as vk::PFN_vkReleaseSwapchainImagesEXT,
                 ),
             )
         },
@@ -502,30 +514,6 @@ unsafe fn downstream_result(
         return fallback;
     };
     invoke(proc)
-}
-
-unsafe extern "system" fn reject_release_swapchain_images_ext(
-    device: vk::Device,
-    info: *const vk::ReleaseSwapchainImagesInfoEXT<'_>,
-) -> vk::Result {
-    if info.is_null() {
-        return vk::Result::ERROR_INITIALIZATION_FAILED;
-    }
-    let swapchain = unsafe { (*info).swapchain };
-    if let Some(error) = reject_extension_token(swapchain) {
-        return error;
-    }
-    unsafe {
-        downstream_result(
-            device,
-            c"vkReleaseSwapchainImagesEXT",
-            vk::Result::ERROR_EXTENSION_NOT_PRESENT,
-            |proc| {
-                let release: vk::PFN_vkReleaseSwapchainImagesEXT = std::mem::transmute(proc);
-                release(device, info)
-            },
-        )
-    }
 }
 
 unsafe extern "system" fn reject_get_swapchain_status_khr(
@@ -730,6 +718,7 @@ mod tests {
             c"vkGetSwapchainCounterEXT",
             c"vkGetSwapchainStatusKHR",
             c"vkReleaseSwapchainImagesEXT",
+            c"vkReleaseSwapchainImagesKHR",
             c"vkSetHdrMetadataEXT",
             c"vkAcquireFullScreenExclusiveModeEXT",
             c"vkReleaseFullScreenExclusiveModeEXT",
