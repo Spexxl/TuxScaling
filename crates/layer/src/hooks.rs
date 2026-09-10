@@ -26,6 +26,7 @@ mod acquire;
 mod creation;
 mod lifetime;
 pub(crate) mod maintenance;
+pub(crate) mod present_chain;
 mod presentation;
 mod surface;
 use acquire::{acquire_next_image_khr, acquire_next_image2_khr, get_swapchain_images_khr};

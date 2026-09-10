@@ -1,3 +1,4 @@
+use super::present_chain::{MappedPresentRegions, PresentChain};
 use super::*;
 use crate::mapping::{LogicalSwapchainHandle, rewrite_present_array};
 use crate::recovery::{FrameBinding, PresentationPath};
@@ -132,23 +133,69 @@ unsafe fn uses_virtual_output(info: &vk::PresentInfoKHR<'_>) -> bool {
     })
 }
 
-unsafe fn find_present_regions(
-    mut next: *const std::ffi::c_void,
-) -> Option<vk::PresentRegionsKHR<'static>> {
-    let mut regions = None;
-    while !next.is_null() {
-        let header = unsafe { &*next.cast::<vk::BaseInStructure<'_>>() };
-        if header.s_type == vk::StructureType::PRESENT_REGIONS_KHR {
-            regions = Some(unsafe { *next.cast::<vk::PresentRegionsKHR<'static>>() });
-        } else if !matches!(
-            header.s_type,
-            vk::StructureType::PRESENT_ID_KHR | vk::StructureType::PRESENT_TIMES_INFO_GOOGLE
-        ) {
-            return None;
-        }
-        next = header.p_next.cast();
+unsafe fn map_present_regions(
+    info: &vk::PresentInfoKHR<'_>,
+    chain: &PresentChain<'_>,
+) -> Option<MappedPresentRegions> {
+    chain.regions.as_ref()?;
+    if info.swapchain_count == 0 || info.p_swapchains.is_null() {
+        return Some(MappedPresentRegions::default());
     }
-    regions
+    let source_regions = unsafe { chain.regions_slice() };
+    let presented =
+        unsafe { std::slice::from_raw_parts(info.p_swapchains, info.swapchain_count as usize) };
+    if source_regions.len() != presented.len() {
+        return None;
+    }
+    let states = swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mapped = presented
+        .iter()
+        .zip(source_regions)
+        .map(|(swapchain, region)| {
+            if region.rectangle_count == 0 {
+                return Vec::new();
+            }
+            let rectangles = unsafe {
+                std::slice::from_raw_parts(region.p_rectangles, region.rectangle_count as usize)
+            };
+            let state = states.get(swapchain).cloned();
+            let virtual_output = state.as_ref().is_some_and(|state| {
+                state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .virtual_images
+                    .is_some()
+            });
+            rectangles
+                .iter()
+                .map(|rectangle| {
+                    if virtual_output {
+                        state.as_ref().and_then(|state| state.lock().ok()).map_or(
+                            *rectangle,
+                            |state| {
+                                state.overlay.as_ref().map_or(*rectangle, |overlay| {
+                                    let mapped = overlay.map_damage_rect(vk::Rect2D {
+                                        offset: rectangle.offset,
+                                        extent: rectangle.extent,
+                                    });
+                                    vk::RectLayerKHR {
+                                        offset: mapped.offset,
+                                        extent: mapped.extent,
+                                        layer: rectangle.layer,
+                                    }
+                                })
+                            },
+                        )
+                    } else {
+                        *rectangle
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    Some(MappedPresentRegions::from_rectangles(mapped))
 }
 
 unsafe fn submit_overlay(
@@ -351,6 +398,20 @@ unsafe fn queue_present_inner(
         Ok(translation) => translation,
         Err(error) => return error,
     };
+    let present_chain = if unsafe { uses_virtual_output(info) } {
+        match unsafe { PresentChain::parse(info.p_next, info.swapchain_count) } {
+            Ok(chain) => Some(chain),
+            Err(error) => {
+                eprintln!(
+                    "TuxScaling evidence event=maintenance1_present_rejected reason={}",
+                    error.reason()
+                );
+                return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+            }
+        }
+    } else {
+        None
+    };
     let overlay_complete = crate::handoff::handoff(|handoff| unsafe {
         let _ = submit_overlay(queue, queue_state, info, handoff);
     });
@@ -364,132 +425,26 @@ unsafe fn queue_present_inner(
             modified.p_swapchains = translation.swapchains.as_ptr();
             modified.p_image_indices = translation.image_indices.as_ptr();
         }
-        let mut mapped_rectangles = Vec::<Vec<vk::RectLayerKHR>>::new();
-        let mapped_regions: Vec<vk::PresentRegionKHR<'_>>;
-        let mut mapped_present_regions = vk::PresentRegionsKHR::default();
-        let mut present_id = None;
-        let mut present_times = None;
-        let mut chain = info.p_next;
-        while !chain.is_null() {
-            let header = unsafe { &*chain.cast::<vk::BaseInStructure<'_>>() };
-            match header.s_type {
-                vk::StructureType::PRESENT_ID_KHR => {
-                    present_id = Some(unsafe { *chain.cast::<vk::PresentIdKHR<'_>>() })
-                }
-                vk::StructureType::PRESENT_TIMES_INFO_GOOGLE => {
-                    present_times = Some(unsafe { *chain.cast::<vk::PresentTimesInfoGOOGLE<'_>>() })
-                }
-                _ => {}
-            }
-            chain = header.p_next.cast();
-        }
-        if unsafe { uses_virtual_output(info) }
-            && let Some(source) = unsafe { find_present_regions(info.p_next) }
-        {
-            let valid = source.swapchain_count == info.swapchain_count
-                && (source.swapchain_count == 0 || !source.p_regions.is_null());
-            if valid {
-                let source_regions = unsafe {
-                    std::slice::from_raw_parts(source.p_regions, source.swapchain_count as usize)
-                };
-                let presented = unsafe {
-                    std::slice::from_raw_parts(info.p_swapchains, info.swapchain_count as usize)
-                };
-                let states = swapchains()
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                for (swapchain, region) in presented.iter().zip(source_regions) {
-                    let state = states.get(swapchain).cloned();
-                    let virtual_output = state.as_ref().is_some_and(|state| {
-                        state
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .virtual_images
-                            .is_some()
-                    });
-                    let region_rectangles = if region.rectangle_count == 0 {
-                        Vec::new()
-                    } else if region.p_rectangles.is_null() {
-                        mapped_rectangles.clear();
-                        break;
-                    } else {
-                        let rectangles = unsafe {
-                            std::slice::from_raw_parts(
-                                region.p_rectangles,
-                                region.rectangle_count as usize,
-                            )
-                        };
-                        rectangles
-                            .iter()
-                            .map(|rectangle| {
-                                if virtual_output {
-                                    state.as_ref().and_then(|state| state.lock().ok()).map_or(
-                                        *rectangle,
-                                        |state| {
-                                            state.overlay.as_ref().map_or(*rectangle, |overlay| {
-                                                let mapped = overlay.map_damage_rect(vk::Rect2D {
-                                                    offset: rectangle.offset,
-                                                    extent: rectangle.extent,
-                                                });
-                                                vk::RectLayerKHR {
-                                                    offset: mapped.offset,
-                                                    extent: mapped.extent,
-                                                    layer: rectangle.layer,
-                                                }
-                                            })
-                                        },
-                                    )
-                                } else {
-                                    *rectangle
-                                }
-                            })
-                            .collect()
-                    };
-                    mapped_rectangles.push(region_rectangles);
-                }
-                if mapped_rectangles.len() == info.swapchain_count as usize {
-                    mapped_regions = mapped_rectangles
-                        .iter()
-                        .map(|rectangles| vk::PresentRegionKHR {
-                            rectangle_count: rectangles.len() as u32,
-                            p_rectangles: rectangles.as_ptr(),
-                            _marker: std::marker::PhantomData,
-                        })
-                        .collect();
-                    mapped_present_regions.swapchain_count = mapped_regions.len() as u32;
-                    mapped_present_regions.p_regions = mapped_regions.as_ptr();
-                    {
-                        let mut next = std::ptr::null();
-                        if let Some(times) = &mut present_times {
-                            times.p_next = next;
-                            next = (times as *const vk::PresentTimesInfoGOOGLE<'_>).cast();
-                        }
-                        if let Some(id) = &mut present_id {
-                            id.p_next = next;
-                            next = (id as *const vk::PresentIdKHR<'_>).cast();
-                        }
-                        mapped_present_regions.p_next = next;
-                    }
-                    modified.p_next =
-                        (&mapped_present_regions as *const vk::PresentRegionsKHR<'_>).cast();
-                } else {
-                    modified.p_next = std::ptr::null();
-                }
-            } else {
-                modified.p_next = std::ptr::null();
-            }
-        }
-        let result = unsafe { present(queue, &modified) };
+        let mapped_regions = present_chain
+            .as_ref()
+            .and_then(|chain| unsafe { map_present_regions(info, chain) });
+        let result = if let Some(chain) = present_chain.as_ref() {
+            chain.with_rebuilt_chain(modified, mapped_regions.as_ref(), |modified| unsafe {
+                present(queue, modified)
+            })
+        } else {
+            unsafe { present(queue, &modified) }
+        };
         if result != vk::Result::SUCCESS && result != vk::Result::SUBOPTIMAL_KHR {
             eprintln!(
                 "TuxScaling evidence event=present_result result={result:?} swapchains={}",
                 info.swapchain_count,
             );
         }
-        if let Some(translation) = &translation {
-            release_presented_images(translation);
-        }
         if should_retry_native_publication(result) {
+            if let Some(translation) = &translation {
+                release_presented_images(translation);
+            }
             // The pre-present observation intentionally cannot replace a
             // generation while the submitted logical slot is still mapped.
             // Retry after releasing it so the next generation sees an idle
