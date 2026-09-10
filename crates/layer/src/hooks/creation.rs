@@ -843,22 +843,6 @@ fn temporal_enabled_for_logical_creation(
     !virtual_eligible || previous_state == Some(PresentationState::Virtualized)
 }
 
-unsafe fn has_present_fences(mut next: *const c_void) -> bool {
-    while !next.is_null() {
-        let header = unsafe { &*next.cast::<vk::BaseInStructure<'_>>() };
-        if header.s_type == vk::StructureType::PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT
-        {
-            return unsafe {
-                (*next.cast::<vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT<'_>>())
-                    .swapchain_maintenance1
-                    != 0
-            };
-        }
-        next = header.p_next.cast();
-    }
-    false
-}
-
 unsafe fn find_device_callback(
     mut next: *const c_void,
 ) -> Option<tuxscaling_runtime::SetLoaderData> {
@@ -1166,7 +1150,7 @@ unsafe fn create_device_inner(
         devices().lock().unwrap_or_else(|e| e.into_inner()).insert(
             unsafe { *device },
             DeviceState {
-                overlay_supported: !unsafe { has_present_fences((*create_info).p_next) },
+                maintenance1: unsafe { super::maintenance::maintenance1_support(&*create_info) },
                 virtualization_extension_safe: super::virtualization_extension_safe(unsafe {
                     &*create_info
                 }),
@@ -1362,8 +1346,9 @@ unsafe fn create_swapchain_inner(
         | vk::ImageUsageFlags::COLOR_ATTACHMENT
         | vk::ImageUsageFlags::STORAGE;
     let mut virtual_preflight_eligible = state.as_ref().is_some_and(|state| {
-        state.overlay_supported
-            && state.virtualization_extension_safe
+        state.virtualization_extension_safe
+            && (!state.maintenance1.enabled
+                || (original.p_next.is_null() && original.flags.is_empty()))
             && virtual_swapchain_supported(original)
             && tuxscaling_capture::supported_format(
                 original.image_format,
@@ -1434,7 +1419,6 @@ unsafe fn create_swapchain_inner(
     };
     let mut capture_enabled = false;
     if let Some(state) = &state
-        && state.overlay_supported
         && tuxscaling_capture::supported_format(original.image_format, original.image_color_space)
         && original.image_array_layers == 1
         && original.flags.is_empty()
@@ -1528,10 +1512,6 @@ unsafe fn create_swapchain_inner(
         else {
             return result;
         };
-        if !device_state.overlay_supported {
-            eprintln!("TuxScaling bypass: application-managed presentation fences");
-            return result;
-        }
         if !modified
             .image_usage
             .contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)

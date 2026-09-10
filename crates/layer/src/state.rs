@@ -6,6 +6,7 @@ use std::{
 use tuxscaling_runtime::{SetLoaderData, SwapchainRuntime as OverlaySwapchain};
 use tuxscaling_vulkan::Image;
 
+use crate::hooks::maintenance::Maintenance1Support;
 use crate::mapping::{LogicalSwapchainHandle, Mapping};
 use crate::recovery::{LogicalSwapchainContract, ReconfigurationLifecycle};
 
@@ -117,7 +118,7 @@ pub(crate) struct QueueState {
 
 #[derive(Clone)]
 pub(crate) struct DeviceState {
-    pub(crate) overlay_supported: bool,
+    pub(crate) maintenance1: Maintenance1Support,
     /// Virtualization is disabled when an enabled swapchain extension has no
     /// complete logical-to-physical translation in this Task 2 layer.
     pub(crate) virtualization_extension_safe: bool,

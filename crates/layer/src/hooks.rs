@@ -25,6 +25,7 @@ use crate::mapping::LogicalSwapchainHandle;
 mod acquire;
 mod creation;
 mod lifetime;
+pub(crate) mod maintenance;
 mod presentation;
 mod surface;
 use acquire::{acquire_next_image_khr, acquire_next_image2_khr, get_swapchain_images_khr};
@@ -770,6 +771,14 @@ mod tests {
     fn vendor_swapchain_commands_disable_virtualization_before_promotion() {
         let extension_name = std::ffi::CString::new("VK_NV_present_barrier").unwrap();
         let extension_names = [extension_name.as_ptr()];
+        let info = vk::DeviceCreateInfo::default().enabled_extension_names(&extension_names);
+
+        assert!(!virtualization_extension_safe(&info));
+    }
+
+    #[test]
+    fn null_enabled_extension_names_disable_virtualization_conservatively() {
+        let extension_names = [std::ptr::null()];
         let info = vk::DeviceCreateInfo::default().enabled_extension_names(&extension_names);
 
         assert!(!virtualization_extension_safe(&info));
