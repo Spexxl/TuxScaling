@@ -428,8 +428,9 @@ fn initial_physical_extent(
     }
 }
 
-const fn native_generation_failure_can_restore(create_attempted: bool) -> bool {
-    !create_attempted
+#[cfg(test)]
+const fn native_generation_failure_can_restore(destroy_requested: bool) -> bool {
+    !destroy_requested
 }
 
 #[derive(Clone, Copy)]
@@ -535,6 +536,8 @@ struct NativeGenerationSnapshot {
     state: Arc<Mutex<SwapchainState>>,
     ticket: ReconfigurationTicket,
     old_physical: vk::SwapchainKHR,
+    old_physical_images: Vec<vk::Image>,
+    old_runtime_info: SwapchainInfo,
     template: crate::state::SwapchainTemplate,
     contract: LogicalSwapchainContract,
     negotiation: PresentationNegotiation,
@@ -578,6 +581,12 @@ fn begin_native_generation(
         return None;
     };
     let old_physical = guard.physical_handle;
+    let old_physical_images = guard.physical_images.clone();
+    let old_runtime_info = SwapchainInfo {
+        format: template.image_format,
+        color_space: template.image_color_space,
+        extent: contract.generation().extent(),
+    };
     let negotiation = guard.negotiation;
     let hdr_metadata = guard.hdr_metadata;
     drop(guard);
@@ -585,6 +594,8 @@ fn begin_native_generation(
         state,
         ticket,
         old_physical,
+        old_physical_images,
+        old_runtime_info,
         template,
         contract,
         negotiation,
@@ -629,13 +640,26 @@ unsafe fn destroy_abandoned_generation(
     }
 }
 
+unsafe fn destroy_temporary_generation(
+    device_state: &DeviceState,
+    snapshot: &NativeGenerationSnapshot,
+    new_physical: vk::SwapchainKHR,
+    loader: &ash::khr::swapchain::Device,
+) {
+    if new_physical == vk::SwapchainKHR::null() || new_physical == snapshot.old_physical {
+        return;
+    }
+    let _ = unsafe { device_state.device.device_wait_idle() };
+    unsafe { loader.destroy_swapchain(new_physical, None) };
+}
+
 unsafe fn finish_native_generation_failure(
     device_state: &DeviceState,
     snapshot: NativeGenerationSnapshot,
     runtime: OverlaySwapchain,
     new_physical: vk::SwapchainKHR,
     loader: &ash::khr::swapchain::Device,
-    create_attempted: bool,
+    runtime_reconfigured: bool,
 ) {
     let mut runtime = Some(runtime);
     let destroy_requested = {
@@ -646,15 +670,10 @@ unsafe fn finish_native_generation_failure(
         let destroy_requested = guard.lifecycle.destroy_requested();
         if destroy_requested {
             let _ = guard.lifecycle.take_destroy_request(snapshot.ticket);
-        } else {
-            let _ = guard.lifecycle.abort(snapshot.ticket);
-        }
-        if !destroy_requested && native_generation_failure_can_restore(create_attempted) {
-            guard.overlay = runtime.take();
         }
         destroy_requested
     };
-    if destroy_requested || !native_generation_failure_can_restore(create_attempted) {
+    if destroy_requested {
         unsafe {
             destroy_abandoned_generation(
                 device_state,
@@ -662,6 +681,69 @@ unsafe fn finish_native_generation_failure(
                 runtime
                     .take()
                     .expect("destroyed transaction owns the runtime"),
+                new_physical,
+                loader,
+            )
+        };
+        return;
+    }
+
+    if runtime_reconfigured
+        && unsafe {
+            runtime
+                .as_mut()
+                .expect("reconfiguration owns the runtime")
+                .restore_output(
+                    snapshot.old_runtime_info,
+                    snapshot.old_physical_images.clone(),
+                )
+        }
+        .is_err()
+    {
+        unsafe {
+            destroy_abandoned_generation(
+                device_state,
+                &snapshot,
+                runtime.take().expect("failed restoration owns the runtime"),
+                new_physical,
+                loader,
+            )
+        };
+        return;
+    }
+
+    let restored = {
+        let mut guard = snapshot
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if guard.lifecycle.destroy_requested() {
+            let _ = guard.lifecycle.take_destroy_request(snapshot.ticket);
+            false
+        } else if guard.lifecycle.can_publish(
+            snapshot.ticket,
+            guard.logical_handle,
+            guard.surface,
+            guard.generation,
+            is_retired_swapchain(guard.logical_handle),
+        ) {
+            guard.overlay = runtime.take();
+            let _ = guard.lifecycle.abort(snapshot.ticket);
+            true
+        } else {
+            false
+        }
+    };
+    if restored {
+        unsafe { destroy_temporary_generation(device_state, &snapshot, new_physical, loader) };
+    } else {
+        unsafe {
+            destroy_abandoned_generation(
+                device_state,
+                &snapshot,
+                runtime
+                    .take()
+                    .expect("abandoned transaction owns the runtime"),
                 new_physical,
                 loader,
             )
@@ -789,7 +871,7 @@ pub(super) unsafe fn publish_native_generation(
                 runtime,
                 new_physical,
                 &loader,
-                true,
+                false,
             )
         };
         return false;
@@ -804,7 +886,7 @@ pub(super) unsafe fn publish_native_generation(
                     runtime,
                     new_physical,
                     &loader,
-                    true,
+                    false,
                 )
             };
             return false;
@@ -822,7 +904,7 @@ pub(super) unsafe fn publish_native_generation(
                 runtime,
                 new_physical,
                 &loader,
-                true,
+                false,
             )
         };
         return false;
@@ -840,7 +922,7 @@ pub(super) unsafe fn publish_native_generation(
                 runtime,
                 new_physical,
                 &loader,
-                true,
+                false,
             )
         };
         return false;
@@ -2357,7 +2439,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_native_creation_cannot_restore_an_old_generation_after_create_attempt() {
+    fn native_generation_failure_restores_unless_destroy_was_requested() {
         assert!(native_generation_failure_can_restore(false));
         assert!(!native_generation_failure_can_restore(true));
     }
