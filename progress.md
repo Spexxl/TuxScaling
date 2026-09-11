@@ -37,28 +37,43 @@ audit remains open until every required gate passes.
 - The real title was launched through Steam and GE-Proton 11-6 with the
   validation layer, native output, guidance scale 1, ultra motion quality,
   FSR 3.1.4, MangoHud disabled, and LSFG disabled.
-- The title visibly rendered its menu in a real XWayland window and reached
-  repeated logical `1280x720` virtual swapchains. It then destroyed those
-  contracts and issued a final `vkCreateSwapchainKHR` with `oldSwapchain=0`
-  and requested `3440x1440`, producing `virtual=0` without a native-generation
-  publication or an upscale dispatch. The required egui interaction was not
-  observed.
-- This is a failed acceptance gate, not a production-code excuse for a game
-  or executable special case. No egui production task was started.
-- The temporary Steam launch configuration was restored byte-for-byte and no
-  remote push was performed.
+- The first session only reached repeated logical `1280x720` virtual
+  swapchains followed by a direct contract, without a native-generation
+  publication or an upscale dispatch, and without egui interaction.
+- Root causes found with surface-identity evidence (no game-specific
+  branches): Wine chains host Xlib surface creation through the layer (the
+  Win32 wrapper is bypassed); Wine reparents game windows so configure
+  coordinates must be parent-relative; Wine-owned windows never retain an
+  externally requested EWMH fullscreen flag, so exact monitor geometry now
+  counts as native; Unity tracks the HWND size and adopts a promoted window,
+  so native requests go direct with the lease kept (a later smaller request
+  promotes idempotently) and stale logical overrides are dropped whenever
+  virtualization is abandoned with no live virtual swapchain.
+- The follow-up session published a native generation (`logical=1280x720`
+  `physical=2160x1440`), dispatched FSR 3.1.4, presented reconstructed
+  output, translated present waits across the generation, submitted the
+  overlay, and kept `virtual=1` with zero validation errors, VUIDs, or
+  panics. The user visibly confirmed the game rendering, opened the
+  TuxScaling egui with `Insert`, and confirmed the session stable
+  fullscreen after the application adopted the promoted window.
+- No remote push was performed.
 
 ## Local commits
 
 The implementation remains on `main` and preserves the existing local
 history. The compatibility commits are `aea0619`, `74f0803`, `eb1acc5`,
 `3b1adaf`, `0b2213d`, `37039f2`, `df5932f`, `9ca5c4f`, `aa4678d`, `15f5f5b`,
-and `704aa1b`. The documentation/report commit is created only after its
-checks are verified.
+and `704aa1b`. The Proton follow-ups are `97783f1` (Win32 surface mapping),
+`127dc84`, `1652963`, `0c1ff59` (surface-identity diagnostics), `c1f14fe`
+(parent-relative configure), `b166086` (geometry-native without EWMH),
+`893e8e8` (superseded follow-restore experiment), and `2a85592`
+(adopt promoted windows tracked by the application).
 
 ## Boundary
 
-The plan is not globally complete: Task 10 remains unaccepted and the
-display-timing scenario remains environment-unverified. The next valid step
-is to fix or re-run those gates with evidence; no remote publication is
-authorized.
+The `display_timing` WSI scenario remains environment-unverified on the
+selected RADV device (missing display-timing/display-control support); all
+other portable scenarios pass. Validation was performed on AMD Radeon
+RX 9060 XT / RADV / Mesa with a Mutter XWayland session; portability to
+other drivers rests on synthetic contracts, not on claims. No remote
+publication is authorized.
