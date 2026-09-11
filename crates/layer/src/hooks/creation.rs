@@ -1,5 +1,5 @@
-use super::maintenance::{
-    SwapchainMaintenanceTemplate, maintenance_create_supported, supported_swapchain_flags,
+use super::swapchain_create::{
+    SwapchainCompatibilityError, SwapchainCreateChain, supported_swapchain_flags,
 };
 use super::*;
 use crate::mapping::{LogicalSwapchainHandle, Mapping, OldSwapchain};
@@ -17,7 +17,7 @@ fn virtual_swapchain_supported(info: &vk::SwapchainCreateInfoKHR<'_>) -> bool {
     {
         return false;
     }
-    unsafe { SwapchainMaintenanceTemplate::parse(info.p_next) }.is_ok()
+    unsafe { SwapchainCreateChain::from_create_info(info) }.is_ok()
 }
 
 #[cfg(test)]
@@ -1403,7 +1403,7 @@ unsafe fn create_swapchain_inner(
         | vk::ImageUsageFlags::STORAGE;
     let maintenance_create_is_supported = state.as_ref().is_some_and(|state| {
         if state.wsi.maintenance1.enabled {
-            maintenance_create_supported(original)
+            unsafe { SwapchainCreateChain::from_create_info(original) }.is_ok()
         } else {
             original.p_next.is_null() && original.flags.is_empty()
         }
@@ -1415,6 +1415,18 @@ unsafe fn create_swapchain_inner(
     {
         eprintln!(
             "TuxScaling evidence event=maintenance1_fallback reason=unsupported_create_chain"
+        );
+    }
+    if let Some(error) = state.as_ref().and_then(|state| {
+        state
+            .wsi
+            .incompatible
+            .as_ref()
+            .map(SwapchainCompatibilityError::from_wsi)
+    }) {
+        eprintln!(
+            "TuxScaling evidence event=virtualization_preflight result=direct reason={}",
+            error.reason()
         );
     }
     let mut virtual_preflight_eligible = state.as_ref().is_some_and(|state| {
@@ -1458,7 +1470,11 @@ unsafe fn create_swapchain_inner(
             } {
                 Ok(images) => preallocated_virtual_images = Some(images),
                 Err(error) => {
-                    eprintln!("TuxScaling: logical image preflight failed: {error:?}");
+                    let error = SwapchainCompatibilityError::UnsupportedImageContract(error);
+                    eprintln!(
+                        "TuxScaling evidence event=virtualization_preflight result=direct reason={}",
+                        error.reason()
+                    );
                     virtual_preflight_eligible = false;
                 }
             }
@@ -1531,7 +1547,8 @@ unsafe fn create_swapchain_inner(
             Ok(template) => Some(template),
             Err(error) => {
                 eprintln!(
-                    "TuxScaling evidence event=maintenance1_fallback reason=unsupported_create_chain error={error:?}"
+                    "TuxScaling evidence event=maintenance1_fallback reason={}",
+                    error.reason()
                 );
                 virtual_preflight_eligible = false;
                 None

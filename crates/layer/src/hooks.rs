@@ -29,6 +29,7 @@ pub(crate) mod maintenance;
 pub(crate) mod present_chain;
 mod presentation;
 mod surface;
+pub(crate) mod swapchain_create;
 pub(crate) mod wsi_compatibility;
 use acquire::{
     acquire_next_image_khr, acquire_next_image2_khr, get_swapchain_images_khr,

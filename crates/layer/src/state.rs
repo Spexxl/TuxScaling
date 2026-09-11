@@ -6,9 +6,7 @@ use std::{
 use tuxscaling_runtime::{SetLoaderData, SwapchainRuntime as OverlaySwapchain};
 use tuxscaling_vulkan::Image;
 
-use crate::hooks::maintenance::{
-    MaintenanceCreateError, SwapchainMaintenanceTemplate, supported_swapchain_flags,
-};
+use crate::hooks::swapchain_create::{SwapchainCompatibilityError, SwapchainCreateChain};
 use crate::hooks::wsi_compatibility::DeviceWsiCapabilities;
 use crate::mapping::{LogicalSwapchainHandle, Mapping};
 use crate::recovery::{LogicalSwapchainContract, ReconfigurationLifecycle};
@@ -27,17 +25,14 @@ pub(crate) struct SwapchainTemplate {
     pub(crate) composite_alpha: vk::CompositeAlphaFlagsKHR,
     pub(crate) present_mode: vk::PresentModeKHR,
     pub(crate) clipped: vk::Bool32,
-    pub(crate) maintenance: SwapchainMaintenanceTemplate,
+    pub(crate) create_chain: SwapchainCreateChain,
 }
 
 impl SwapchainTemplate {
     pub(crate) fn from_create_info(
         info: &vk::SwapchainCreateInfoKHR<'_>,
-    ) -> Result<Self, MaintenanceCreateError> {
-        if !supported_swapchain_flags(info.flags) {
-            return Err(MaintenanceCreateError::UnsupportedFlags);
-        }
-        let maintenance = unsafe { SwapchainMaintenanceTemplate::parse(info.p_next) }?;
+    ) -> Result<Self, SwapchainCompatibilityError> {
+        let create_chain = unsafe { SwapchainCreateChain::from_create_info(info) }?;
         let queue_family_indices = if info.image_sharing_mode == vk::SharingMode::CONCURRENT
             && !info.p_queue_family_indices.is_null()
         {
@@ -64,7 +59,7 @@ impl SwapchainTemplate {
             composite_alpha: info.composite_alpha,
             present_mode: info.present_mode,
             clipped: info.clipped,
-            maintenance,
+            create_chain,
         })
     }
 
@@ -75,43 +70,26 @@ impl SwapchainTemplate {
         old_swapchain: vk::SwapchainKHR,
         invoke: impl FnOnce(&vk::SwapchainCreateInfoKHR<'_>) -> R,
     ) -> R {
-        let mut scaling = self.maintenance.scaling.map(|scaling| {
-            vk::SwapchainPresentScalingCreateInfoEXT::default()
-                .scaling_behavior(scaling.behavior)
-                .present_gravity_x(scaling.gravity_x)
-                .present_gravity_y(scaling.gravity_y)
-        });
-        let mut modes =
-            self.maintenance.present_modes.as_ref().map(|modes| {
-                vk::SwapchainPresentModesCreateInfoEXT::default().present_modes(modes)
-            });
-        let mut next = std::ptr::null();
-        if let Some(scaling) = scaling.as_mut() {
-            scaling.p_next = next;
-            next = (scaling as *mut vk::SwapchainPresentScalingCreateInfoEXT<'_>).cast();
-        }
-        if let Some(modes) = modes.as_mut() {
-            modes.p_next = next;
-            next = (modes as *mut vk::SwapchainPresentModesCreateInfoEXT<'_>).cast();
-        }
-        let mut info = vk::SwapchainCreateInfoKHR::default()
-            .flags(self.flags)
-            .surface(surface)
-            .min_image_count(self.min_image_count)
-            .image_format(self.image_format)
-            .image_color_space(self.image_color_space)
-            .image_extent(extent)
-            .image_array_layers(self.image_array_layers)
-            .image_usage(self.image_usage)
-            .image_sharing_mode(self.image_sharing_mode)
-            .queue_family_indices(&self.queue_family_indices)
-            .pre_transform(self.pre_transform)
-            .composite_alpha(self.composite_alpha)
-            .present_mode(self.present_mode)
-            .clipped(self.clipped != 0)
-            .old_swapchain(old_swapchain);
-        info.p_next = next;
-        invoke(&info)
+        self.create_chain.with_p_next(|next| {
+            let mut info = vk::SwapchainCreateInfoKHR::default()
+                .flags(self.flags)
+                .surface(surface)
+                .min_image_count(self.min_image_count)
+                .image_format(self.image_format)
+                .image_color_space(self.image_color_space)
+                .image_extent(extent)
+                .image_array_layers(self.image_array_layers)
+                .image_usage(self.image_usage)
+                .image_sharing_mode(self.image_sharing_mode)
+                .queue_family_indices(&self.queue_family_indices)
+                .pre_transform(self.pre_transform)
+                .composite_alpha(self.composite_alpha)
+                .present_mode(self.present_mode)
+                .clipped(self.clipped != 0)
+                .old_swapchain(old_swapchain);
+            info.p_next = next;
+            invoke(&info)
+        })
     }
 }
 
