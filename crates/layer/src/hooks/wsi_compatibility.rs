@@ -189,6 +189,128 @@ mod tests {
         );
         assert_eq!(extension_support(b"VK_EXT_memory_budget"), None);
     }
+
+    #[test]
+    fn every_pinned_swapchain_command_has_an_explicit_decision() {
+        let expected = [
+            (
+                b"vkCreateSwapchainKHR".as_slice(),
+                WsiCommandSupport::Translated,
+            ),
+            (
+                b"vkDestroySwapchainKHR".as_slice(),
+                WsiCommandSupport::Translated,
+            ),
+            (
+                b"vkGetSwapchainImagesKHR".as_slice(),
+                WsiCommandSupport::Translated,
+            ),
+            (
+                b"vkAcquireNextImageKHR".as_slice(),
+                WsiCommandSupport::Translated,
+            ),
+            (
+                b"vkAcquireNextImage2KHR".as_slice(),
+                WsiCommandSupport::Translated,
+            ),
+            (
+                b"vkQueuePresentKHR".as_slice(),
+                WsiCommandSupport::Translated,
+            ),
+            (
+                b"vkCreateSharedSwapchainsKHR".as_slice(),
+                WsiCommandSupport::Incompatible,
+            ),
+            (
+                b"vkGetSwapchainCounterEXT".as_slice(),
+                WsiCommandSupport::Translated,
+            ),
+            (
+                b"vkGetRefreshCycleDurationGOOGLE".as_slice(),
+                WsiCommandSupport::Translated,
+            ),
+            (
+                b"vkGetPastPresentationTimingGOOGLE".as_slice(),
+                WsiCommandSupport::Translated,
+            ),
+            (
+                b"vkSetHdrMetadataEXT".as_slice(),
+                WsiCommandSupport::Translated,
+            ),
+            (
+                b"vkGetSwapchainStatusKHR".as_slice(),
+                WsiCommandSupport::Translated,
+            ),
+            (
+                b"vkWaitForPresentKHR".as_slice(),
+                WsiCommandSupport::Translated,
+            ),
+            (
+                b"vkAcquireFullScreenExclusiveModeEXT".as_slice(),
+                WsiCommandSupport::Incompatible,
+            ),
+            (
+                b"vkReleaseFullScreenExclusiveModeEXT".as_slice(),
+                WsiCommandSupport::Incompatible,
+            ),
+            (
+                b"vkSetLocalDimmingAMD".as_slice(),
+                WsiCommandSupport::Incompatible,
+            ),
+            (
+                b"vkSetLatencySleepModeNV".as_slice(),
+                WsiCommandSupport::Incompatible,
+            ),
+            (
+                b"vkLatencySleepNV".as_slice(),
+                WsiCommandSupport::Incompatible,
+            ),
+            (
+                b"vkSetLatencyMarkerNV".as_slice(),
+                WsiCommandSupport::Incompatible,
+            ),
+            (
+                b"vkGetLatencyTimingsNV".as_slice(),
+                WsiCommandSupport::Incompatible,
+            ),
+        ];
+        assert_eq!(wsi_command_inventory(), expected.as_slice());
+        for (name, decision) in expected {
+            assert_eq!(wsi_command_support(name), Some(decision), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn non_substring_swapchain_commands_are_not_forwarded_from_virtual_tokens() {
+        assert_eq!(
+            wsi_command_support(b"vkSetLocalDimmingAMD"),
+            Some(WsiCommandSupport::Incompatible)
+        );
+        assert_eq!(
+            wsi_command_support(b"vkSetLatencyMarkerNV"),
+            Some(WsiCommandSupport::Incompatible)
+        );
+    }
+
+    #[test]
+    fn every_untranslated_swapchain_extension_disables_promotion() {
+        for name in [
+            b"VK_AMD_display_native_hdr".as_slice(),
+            b"VK_NV_low_latency2".as_slice(),
+            b"VK_KHR_display_swapchain".as_slice(),
+            b"VK_EXT_full_screen_exclusive".as_slice(),
+        ] {
+            let name = CString::new(name).unwrap();
+            let names = [name.as_ptr()];
+            let info = device_info(&names, std::ptr::null());
+            assert!(
+                unsafe { DeviceWsiCapabilities::from_create_info(&info, vk::API_VERSION_1_3) }
+                    .incompatible
+                    .is_some(),
+                "{name:?}"
+            );
+        }
+    }
 }
 use crate::hooks::maintenance::{Maintenance1Support, maintenance1_support};
 use ash::vk;
@@ -196,6 +318,12 @@ use std::ffi::CStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WsiExtensionSupport {
+    Translated,
+    Incompatible,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WsiCommandSupport {
     Translated,
     Incompatible,
 }
@@ -247,8 +375,60 @@ fn incompatible_reason(name: &[u8]) -> Option<&'static str> {
         }
         b"VK_NV_present_barrier" => Some("present barrier semantics are not translated"),
         b"VK_NV_low_latency2" => Some("swapchain latency markers are not translated"),
+        b"VK_AMD_display_native_hdr" => {
+            Some("native display HDR ownership semantics are not translated")
+        }
         _ => None,
     }
+}
+
+const WSI_COMMAND_INVENTORY: &[(&[u8], WsiCommandSupport)] = &[
+    (b"vkCreateSwapchainKHR", WsiCommandSupport::Translated),
+    (b"vkDestroySwapchainKHR", WsiCommandSupport::Translated),
+    (b"vkGetSwapchainImagesKHR", WsiCommandSupport::Translated),
+    (b"vkAcquireNextImageKHR", WsiCommandSupport::Translated),
+    (b"vkAcquireNextImage2KHR", WsiCommandSupport::Translated),
+    (b"vkQueuePresentKHR", WsiCommandSupport::Translated),
+    (
+        b"vkCreateSharedSwapchainsKHR",
+        WsiCommandSupport::Incompatible,
+    ),
+    (b"vkGetSwapchainCounterEXT", WsiCommandSupport::Translated),
+    (
+        b"vkGetRefreshCycleDurationGOOGLE",
+        WsiCommandSupport::Translated,
+    ),
+    (
+        b"vkGetPastPresentationTimingGOOGLE",
+        WsiCommandSupport::Translated,
+    ),
+    (b"vkSetHdrMetadataEXT", WsiCommandSupport::Translated),
+    (b"vkGetSwapchainStatusKHR", WsiCommandSupport::Translated),
+    (b"vkWaitForPresentKHR", WsiCommandSupport::Translated),
+    (
+        b"vkAcquireFullScreenExclusiveModeEXT",
+        WsiCommandSupport::Incompatible,
+    ),
+    (
+        b"vkReleaseFullScreenExclusiveModeEXT",
+        WsiCommandSupport::Incompatible,
+    ),
+    (b"vkSetLocalDimmingAMD", WsiCommandSupport::Incompatible),
+    (b"vkSetLatencySleepModeNV", WsiCommandSupport::Incompatible),
+    (b"vkLatencySleepNV", WsiCommandSupport::Incompatible),
+    (b"vkSetLatencyMarkerNV", WsiCommandSupport::Incompatible),
+    (b"vkGetLatencyTimingsNV", WsiCommandSupport::Incompatible),
+];
+
+#[cfg(test)]
+pub(crate) fn wsi_command_inventory() -> &'static [(&'static [u8], WsiCommandSupport)] {
+    WSI_COMMAND_INVENTORY
+}
+
+pub(crate) fn wsi_command_support(name: &[u8]) -> Option<WsiCommandSupport> {
+    WSI_COMMAND_INVENTORY
+        .iter()
+        .find_map(|(command, support)| (*command == name).then_some(*support))
 }
 
 pub(crate) fn extension_support(name: &[u8]) -> Option<WsiExtensionSupport> {

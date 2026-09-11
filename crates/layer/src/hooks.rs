@@ -75,9 +75,10 @@ unsafe fn device_downstream(device: vk::Device, name: &CStr) -> vk::PFN_vkVoidFu
 
 fn is_swapchain_related_proc(name: &CStr) -> bool {
     let bytes = name.to_bytes();
-    bytes
-        .windows(b"Swapchain".len())
-        .any(|window| window == b"Swapchain")
+    crate::hooks::wsi_compatibility::wsi_command_support(bytes).is_some()
+        || bytes
+            .windows(b"Swapchain".len())
+            .any(|window| window == b"Swapchain")
         || bytes
             .windows(b"Present".len())
             .any(|window| window == b"Present")
