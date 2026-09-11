@@ -29,6 +29,7 @@ pub(crate) mod maintenance;
 pub(crate) mod present_chain;
 mod presentation;
 mod surface;
+pub(crate) mod wsi_compatibility;
 use acquire::{
     acquire_next_image_khr, acquire_next_image2_khr, get_swapchain_images_khr,
     release_swapchain_images, release_swapchain_images_khr,
@@ -76,46 +77,12 @@ fn is_swapchain_related_proc(name: &CStr) -> bool {
             .any(|window| window == b"Present")
 }
 
-// Only extensions whose swapchain-facing behavior is translated by this
-// layer are allowlisted.  A conservative deny-by-default policy is important
-// here: vendor extensions frequently carry a VkSwapchainKHR without putting
-// "Swapchain" or "Present" in every command name.
-const VIRTUALIZATION_SAFE_EXTENSIONS: &[&[u8]] = &[
-    b"VK_KHR_swapchain",
-    b"VK_KHR_incremental_present",
-    b"VK_EXT_swapchain_colorspace",
-    b"VK_EXT_surface_maintenance1",
-    b"VK_EXT_swapchain_maintenance1",
-    b"VK_KHR_surface_maintenance1",
-    b"VK_KHR_swapchain_maintenance1",
-];
-
-pub(crate) fn virtualization_extension_safe(create_info: &vk::DeviceCreateInfo<'_>) -> bool {
-    if create_info.enabled_extension_count == 0 || create_info.pp_enabled_extension_names.is_null()
-    {
-        return true;
-    }
-    let names = unsafe {
-        std::slice::from_raw_parts(
-            create_info.pp_enabled_extension_names,
-            create_info.enabled_extension_count as usize,
-        )
-    };
-    names.iter().all(|name| {
-        if name.is_null() {
-            return false;
-        }
-        let name = unsafe { CStr::from_ptr(*name) }.to_bytes();
-        VIRTUALIZATION_SAFE_EXTENSIONS.contains(&name)
-    })
-}
-
 fn device_allows_virtualization(device: vk::Device) -> bool {
     devices()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(&device)
-        .is_none_or(|state| state.virtualization_extension_safe)
+        .is_none_or(|state| state.wsi.incompatible.is_none())
 }
 
 unsafe fn extension_proc_or_downstream(
@@ -695,10 +662,11 @@ unsafe extern "system" fn reject_set_hdr_metadata_ext(
 
 #[cfg(test)]
 mod tests {
+    use super::wsi_compatibility::DeviceWsiCapabilities;
     use super::{
         get_device_proc_addr_inner, is_swapchain_related_proc,
         reject_acquire_full_screen_exclusive_mode_ext,
-        reject_release_full_screen_exclusive_mode_ext, virtualization_extension_safe,
+        reject_release_full_screen_exclusive_mode_ext,
     };
     use ash::vk;
     use ash::vk::Handle;
@@ -755,10 +723,18 @@ mod tests {
         let extension_names = [vk::EXT_FULL_SCREEN_EXCLUSIVE_NAME.as_ptr()];
         let info = vk::DeviceCreateInfo::default().enabled_extension_names(&extension_names);
 
-        assert!(!virtualization_extension_safe(&info));
+        assert!(
+            unsafe { DeviceWsiCapabilities::from_create_info(&info, vk::API_VERSION_1_3) }
+                .incompatible
+                .is_some()
+        );
 
         let safe_info = vk::DeviceCreateInfo::default();
-        assert!(virtualization_extension_safe(&safe_info));
+        assert!(
+            unsafe { DeviceWsiCapabilities::from_create_info(&safe_info, vk::API_VERSION_1_3) }
+                .incompatible
+                .is_none()
+        );
     }
 
     #[test]
@@ -767,18 +743,30 @@ mod tests {
         let extension_names = [extension_name.as_ptr()];
         let info = vk::DeviceCreateInfo::default().enabled_extension_names(&extension_names);
 
-        assert!(!virtualization_extension_safe(&info));
+        assert!(
+            unsafe { DeviceWsiCapabilities::from_create_info(&info, vk::API_VERSION_1_3) }
+                .incompatible
+                .is_some()
+        );
     }
 
     #[test]
     fn maintenance_virtualization_accepts_both_extension_aliases() {
         let ext_names = [vk::EXT_SWAPCHAIN_MAINTENANCE1_NAME.as_ptr()];
         let ext_info = vk::DeviceCreateInfo::default().enabled_extension_names(&ext_names);
-        assert!(virtualization_extension_safe(&ext_info));
+        assert!(
+            unsafe { DeviceWsiCapabilities::from_create_info(&ext_info, vk::API_VERSION_1_3) }
+                .incompatible
+                .is_none()
+        );
 
         let khr_names = [super::maintenance::KHR_SWAPCHAIN_MAINTENANCE1_NAME.as_ptr()];
         let khr_info = vk::DeviceCreateInfo::default().enabled_extension_names(&khr_names);
-        assert!(virtualization_extension_safe(&khr_info));
+        assert!(
+            unsafe { DeviceWsiCapabilities::from_create_info(&khr_info, vk::API_VERSION_1_3) }
+                .incompatible
+                .is_none()
+        );
     }
 
     #[test]
@@ -789,7 +777,11 @@ mod tests {
         ];
         let info = vk::DeviceCreateInfo::default().enabled_extension_names(&names);
 
-        assert!(virtualization_extension_safe(&info));
+        assert!(
+            unsafe { DeviceWsiCapabilities::from_create_info(&info, vk::API_VERSION_1_3) }
+                .incompatible
+                .is_none()
+        );
     }
 
     #[test]
@@ -797,6 +789,10 @@ mod tests {
         let extension_names = [std::ptr::null()];
         let info = vk::DeviceCreateInfo::default().enabled_extension_names(&extension_names);
 
-        assert!(!virtualization_extension_safe(&info));
+        assert!(
+            unsafe { DeviceWsiCapabilities::from_create_info(&info, vk::API_VERSION_1_3) }
+                .incompatible
+                .is_some()
+        );
     }
 }

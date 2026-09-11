@@ -1186,22 +1186,30 @@ unsafe fn create_device_inner(
                 *device,
             )
         };
-        let maintenance1 = unsafe { super::maintenance::maintenance1_support(&*create_info) };
-        if maintenance1.enabled {
-            let flavor = match maintenance1.flavor {
+        let wsi = unsafe {
+            super::wsi_compatibility::DeviceWsiCapabilities::from_create_info(
+                &*create_info,
+                vulkan_api_version,
+            )
+        };
+        if wsi.maintenance1.enabled {
+            let flavor = match wsi.maintenance1.flavor {
                 Some(super::maintenance::Maintenance1Flavor::Ext) => "ext",
                 Some(super::maintenance::Maintenance1Flavor::Khr) => "khr",
                 None => "unknown",
             };
             eprintln!("TuxScaling evidence event=maintenance1_device enabled=1 flavor={flavor}");
         }
+        if let Some(incompatible) = &wsi.incompatible {
+            eprintln!(
+                "TuxScaling evidence event=virtualization_preflight result=direct reason=incompatible_wsi_extension extension={}",
+                String::from_utf8_lossy(&incompatible.name),
+            );
+        }
         devices().lock().unwrap_or_else(|e| e.into_inner()).insert(
             unsafe { *device },
             DeviceState {
-                maintenance1,
-                virtualization_extension_safe: super::virtualization_extension_safe(unsafe {
-                    &*create_info
-                }),
+                wsi,
                 vulkan_api_version,
                 queue_families: unsafe {
                     instance.get_physical_device_queue_family_properties(physical_device)
@@ -1394,7 +1402,7 @@ unsafe fn create_swapchain_inner(
         | vk::ImageUsageFlags::COLOR_ATTACHMENT
         | vk::ImageUsageFlags::STORAGE;
     let maintenance_create_is_supported = state.as_ref().is_some_and(|state| {
-        if state.maintenance1.enabled {
+        if state.wsi.maintenance1.enabled {
             maintenance_create_supported(original)
         } else {
             original.p_next.is_null() && original.flags.is_empty()
@@ -1402,7 +1410,7 @@ unsafe fn create_swapchain_inner(
     });
     if state
         .as_ref()
-        .is_some_and(|state| state.maintenance1.enabled)
+        .is_some_and(|state| state.wsi.maintenance1.enabled)
         && !maintenance_create_is_supported
     {
         eprintln!(
@@ -1410,7 +1418,7 @@ unsafe fn create_swapchain_inner(
         );
     }
     let mut virtual_preflight_eligible = state.as_ref().is_some_and(|state| {
-        state.virtualization_extension_safe
+        state.wsi.incompatible.is_none()
             && maintenance_create_is_supported
             && virtual_swapchain_supported(original)
             && tuxscaling_capture::supported_format(

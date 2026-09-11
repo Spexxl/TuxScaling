@@ -7,9 +7,9 @@ use tuxscaling_runtime::{SetLoaderData, SwapchainRuntime as OverlaySwapchain};
 use tuxscaling_vulkan::Image;
 
 use crate::hooks::maintenance::{
-    Maintenance1Support, MaintenanceCreateError, SwapchainMaintenanceTemplate,
-    supported_swapchain_flags,
+    MaintenanceCreateError, SwapchainMaintenanceTemplate, supported_swapchain_flags,
 };
+use crate::hooks::wsi_compatibility::DeviceWsiCapabilities;
 use crate::mapping::{LogicalSwapchainHandle, Mapping};
 use crate::recovery::{LogicalSwapchainContract, ReconfigurationLifecycle};
 
@@ -155,10 +155,7 @@ pub(crate) struct QueueState {
 
 #[derive(Clone)]
 pub(crate) struct DeviceState {
-    pub(crate) maintenance1: Maintenance1Support,
-    /// Virtualization is disabled when an enabled swapchain extension has no
-    /// complete logical-to-physical translation in this Task 2 layer.
-    pub(crate) virtualization_extension_safe: bool,
+    pub(crate) wsi: DeviceWsiCapabilities,
     pub(crate) vulkan_api_version: u32,
     pub(crate) queue_families: Vec<vk::QueueFamilyProperties>,
     pub(crate) set_loader_data: Option<SetLoaderData>,

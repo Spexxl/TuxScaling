@@ -417,7 +417,7 @@ unsafe fn submit_overlay(
             && let Some(overlay) = state.overlay.as_mut()
         {
             overlay.submitted();
-            if device_state.maintenance1.enabled
+            if device_state.wsi.maintenance1.enabled
                 && state.mapping.is_some()
                 && !state.maintenance_overlay_reported
             {
