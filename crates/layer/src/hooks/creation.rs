@@ -530,6 +530,64 @@ fn pending_native_logical_extent(
         .then_some(previous_logical)
 }
 
+/// Detects a window-tracking application adopting a promoted window as its
+/// own rendering resolution: no logical predecessor, promotion active for a
+/// smaller contract, and the request already matches the native target.
+/// Keeping a smaller logical contract would fight the application, so the
+/// caller restores the game's own geometry and suppresses promotion.
+fn app_followed_promotion(
+    requested: vk::Extent2D,
+    native_extent: Option<Extent>,
+    previous_logical: Option<vk::Extent2D>,
+    negotiation: PresentationState,
+    has_borderless_lease: bool,
+    has_logical_predecessor: bool,
+    promotion_suppressed: bool,
+) -> bool {
+    let Some(native_extent) = native_extent else {
+        return false;
+    };
+    let Some(previous_logical) = previous_logical else {
+        return false;
+    };
+    !has_logical_predecessor
+        && !promotion_suppressed
+        && has_borderless_lease
+        && (negotiation == PresentationState::Negotiating
+            || negotiation == PresentationState::Virtualized)
+        && (previous_logical.width != requested.width
+            || previous_logical.height != requested.height)
+        && native_extent.width == requested.width
+        && native_extent.height == requested.height
+}
+
+fn has_live_virtual_swapchain(surface: vk::SurfaceKHR) -> bool {
+    swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .values()
+        .any(|state| {
+            state
+                .lock()
+                .is_ok_and(|state| state.surface == surface && state.mapping.is_some())
+        })
+}
+
+/// Drops a stale logical capability override so capability queries report the
+/// truthful downstream state. Only used when no virtual swapchain is alive on
+/// the surface; the window and lease are left untouched.
+fn clear_surface_logical_override(surface: vk::SurfaceKHR) {
+    if let Some(state) = surfaces()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get_mut(&surface)
+    {
+        state.logical_extent = None;
+        state.logical_capabilities = None;
+        state.negotiation = tuxscaling_display::PresentationNegotiation::direct();
+    }
+}
+
 pub(super) unsafe fn observe_surface_negotiation(
     device_state: &DeviceState,
     surface: vk::SurfaceKHR,
@@ -1713,7 +1771,8 @@ unsafe fn create_swapchain_inner(
         .get(&original.surface)
         .copied();
     let native_target = native_output_target(original.surface, virtual_preflight_eligible);
-    let initial_target = if old_logical.is_some() {
+    let surface_suppressed = surface_snapshot.is_some_and(|surface| surface.promotion_suppressed);
+    let initial_target = if old_logical.is_some() || surface_suppressed {
         None
     } else {
         native_target.filter(|target| {
@@ -1722,7 +1781,55 @@ unsafe fn create_swapchain_inner(
                 || extent.height != original.image_extent.height
         })
     };
-    let continued_logical_extent = if old_logical.is_none() {
+    // A window-tracking application that adopts the promoted window renders
+    // natively from here on. Restoring the game's own geometry ends the
+    // resize feedback loop; suppressing promotion keeps later smaller
+    // requests on an unpromoted 1:1 virtual path instead of fighting the
+    // application again.
+    let followed = app_followed_promotion(
+        original.image_extent,
+        native_target.map(|target| target.monitor.rect.extent()),
+        surface_snapshot.and_then(|surface| surface.logical_extent),
+        surface_snapshot.map_or(PresentationState::Direct, |surface| {
+            surface.negotiation.public_state()
+        }),
+        surface_snapshot.is_some_and(|surface| surface.borderless_lease.is_some()),
+        old_logical.is_some(),
+        surface_suppressed,
+    );
+    if followed {
+        if let Some(previous) = surface_snapshot.and_then(|surface| surface.logical_extent) {
+            eprintln!(
+                "TuxScaling evidence event=promotion_suppressed surface=0x{:x} requested={}x{} logical={}x{}",
+                original.surface.as_raw(),
+                original.image_extent.width,
+                original.image_extent.height,
+                previous.width,
+                previous.height,
+            );
+        }
+        super::lifetime::restore_surface_window(original.surface);
+        if let Some(state) = surfaces()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_mut(&original.surface)
+        {
+            state.promotion_suppressed = true;
+        }
+        virtualization_plan = None;
+        virtual_preflight_eligible = false;
+    }
+    // Re-read the snapshot: follow handling above may have restored it.
+    let surface_snapshot = if followed {
+        surfaces()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&original.surface)
+            .copied()
+    } else {
+        surface_snapshot
+    };
+    let continued_logical_extent = if old_logical.is_none() && !followed {
         pending_native_logical_extent(
             original.image_extent,
             surface_snapshot.and_then(|surface| surface.logical_extent),
@@ -1736,8 +1843,15 @@ unsafe fn create_swapchain_inner(
         None
     };
     let logical_extent = continued_logical_extent.unwrap_or(original.image_extent);
-    let virtual_intent =
-        old_logical.is_some() || initial_target.is_some() || continued_logical_extent.is_some();
+    // Suppressed surfaces never promote again, but fresh requests still
+    // virtualize 1:1 so the overlay and handle translation keep working.
+    let unpromoted_virtual = !followed
+        && old_logical.is_none()
+        && surface_snapshot.is_some_and(|surface| surface.promotion_suppressed);
+    let virtual_intent = old_logical.is_some()
+        || initial_target.is_some()
+        || continued_logical_extent.is_some()
+        || unpromoted_virtual;
     let mut logical_info = *original;
     logical_info.image_extent = logical_extent;
     let mut preallocated_virtual_images = None;
@@ -1769,6 +1883,14 @@ unsafe fn create_swapchain_inner(
     }
     if !virtual_preflight_eligible {
         super::lifetime::restore_surface_window(original.surface);
+    }
+    if virtualization_plan.is_some() && !virtual_intent && old_logical.is_none() {
+        // Eligible but intentionally direct with no virtual successor: drop a
+        // stale logical override so later capability queries stay truthful,
+        // unless a virtual swapchain is still alive on this surface.
+        if !has_live_virtual_swapchain(original.surface) {
+            clear_surface_logical_override(original.surface);
+        }
     }
     if virtual_intent
         && virtual_preflight_eligible
@@ -2233,10 +2355,10 @@ pub(super) unsafe extern "system" fn create_swapchain_khr(
 #[cfg(test)]
 mod tests {
     use super::{
-        initial_physical_extent, logical_image_count, native_generation_failure_can_restore,
-        pending_native_logical_extent, preflight_swapchain_virtualization,
-        temporal_enabled_for_logical_creation, translate_old_swapchain,
-        translate_recreation_create_info, virtual_swapchain_supported,
+        app_followed_promotion, initial_physical_extent, logical_image_count,
+        native_generation_failure_can_restore, pending_native_logical_extent,
+        preflight_swapchain_virtualization, temporal_enabled_for_logical_creation,
+        translate_old_swapchain, translate_recreation_create_info, virtual_swapchain_supported,
     };
     use crate::hooks::swapchain_create::SwapchainCompatibilityError;
     use crate::recovery::{
@@ -2582,6 +2704,122 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn window_tracking_request_adopting_the_promoted_size_is_detected() {
+        let requested = vk::Extent2D {
+            width: 2160,
+            height: 1440,
+        };
+        let previous = vk::Extent2D {
+            width: 1280,
+            height: 720,
+        };
+        let native = Extent::new(2160, 1440);
+
+        assert!(app_followed_promotion(
+            requested,
+            Some(native),
+            Some(previous),
+            PresentationState::Negotiating,
+            true,
+            false,
+            false,
+        ));
+        assert!(app_followed_promotion(
+            requested,
+            Some(native),
+            Some(previous),
+            PresentationState::Virtualized,
+            true,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn promotion_follow_requires_a_smaller_promoted_contract() {
+        let native_request = vk::Extent2D {
+            width: 2160,
+            height: 1440,
+        };
+        let small_request = vk::Extent2D {
+            width: 1280,
+            height: 720,
+        };
+        let previous = vk::Extent2D {
+            width: 1280,
+            height: 720,
+        };
+        let native = Extent::new(2160, 1440);
+
+        // Smaller requests keep virtualizing; they did not follow anyone.
+        assert!(!app_followed_promotion(
+            small_request,
+            Some(native),
+            Some(previous),
+            PresentationState::Negotiating,
+            true,
+            false,
+            false,
+        ));
+        // Logical recreation chains, suppressed surfaces, missing leases,
+        // settled negotiations, and unknown natives never count as follows.
+        assert!(!app_followed_promotion(
+            native_request,
+            Some(native),
+            Some(previous),
+            PresentationState::Negotiating,
+            true,
+            true,
+            false,
+        ));
+        assert!(!app_followed_promotion(
+            native_request,
+            Some(native),
+            Some(previous),
+            PresentationState::Negotiating,
+            true,
+            false,
+            true,
+        ));
+        assert!(!app_followed_promotion(
+            native_request,
+            Some(native),
+            Some(previous),
+            PresentationState::Negotiating,
+            false,
+            false,
+            false,
+        ));
+        assert!(!app_followed_promotion(
+            native_request,
+            Some(native),
+            Some(previous),
+            PresentationState::Direct,
+            true,
+            false,
+            false,
+        ));
+        assert!(!app_followed_promotion(
+            native_request,
+            None,
+            Some(previous),
+            PresentationState::Negotiating,
+            true,
+            false,
+            false,
+        ));
+        assert!(!app_followed_promotion(
+            native_request,
+            Some(native),
+            None,
+            PresentationState::Negotiating,
+            true,
+            false,
+            false,
+        ));
     }
 
     #[test]

@@ -361,6 +361,7 @@ mod tests {
                     monitor: Monitor::new(Rect::new(0, 0, 1, 1)),
                 }),
                 negotiation,
+                promotion_suppressed: false,
             },
         );
 

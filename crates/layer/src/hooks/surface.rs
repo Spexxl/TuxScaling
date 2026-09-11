@@ -12,6 +12,7 @@ fn register_x11_surface(surface: vk::SurfaceKHR, window: u64) {
                 logical_capabilities: None,
                 borderless_lease: None,
                 negotiation: tuxscaling_display::PresentationNegotiation::direct(),
+                promotion_suppressed: false,
             },
         );
 }
