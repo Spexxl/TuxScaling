@@ -158,6 +158,17 @@ impl<'a> PresentChain<'a> {
         }
     }
 
+    pub(crate) unsafe fn ids_slice(&self) -> &'a [u64] {
+        let Some(ids) = self.ids else {
+            return &[];
+        };
+        if ids.swapchain_count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(ids.p_present_ids, ids.swapchain_count as usize) }
+        }
+    }
+
     pub(crate) fn with_rebuilt_chain<R>(
         &self,
         mut modified: vk::PresentInfoKHR<'_>,

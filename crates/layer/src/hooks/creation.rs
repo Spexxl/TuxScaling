@@ -1864,6 +1864,7 @@ unsafe fn create_swapchain_inner(
             generation: 0,
             template,
             contract,
+            present_ids: crate::hooks::present_id::PresentIdHistory::new(),
             lifecycle: crate::recovery::ReconfigurationLifecycle::new(),
         }));
         swapchains()

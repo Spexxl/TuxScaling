@@ -6,6 +6,7 @@ use std::{
 use tuxscaling_runtime::{SetLoaderData, SwapchainRuntime as OverlaySwapchain};
 use tuxscaling_vulkan::Image;
 
+use crate::hooks::present_id::PresentIdHistory;
 use crate::hooks::swapchain_create::{SwapchainCompatibilityError, SwapchainCreateChain};
 use crate::hooks::wsi_compatibility::DeviceWsiCapabilities;
 use crate::mapping::{LogicalSwapchainHandle, Mapping};
@@ -121,6 +122,7 @@ pub(crate) struct SwapchainState {
     pub(crate) generation: u64,
     pub(crate) template: Option<SwapchainTemplate>,
     pub(crate) contract: Option<LogicalSwapchainContract>,
+    pub(crate) present_ids: PresentIdHistory,
     pub(crate) lifecycle: ReconfigurationLifecycle,
 }
 

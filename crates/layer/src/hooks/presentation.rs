@@ -1,5 +1,6 @@
 use super::present_chain::{MappedPresentRegions, PresentChain};
 use super::*;
+use crate::hooks::present_id::PresentIdReservation;
 use crate::mapping::{LogicalSwapchainHandle, rewrite_present_array};
 use crate::recovery::{FrameBinding, PresentationPath};
 use ash::vk::Handle;
@@ -9,6 +10,19 @@ struct PresentTranslation {
     swapchains: Vec<vk::SwapchainKHR>,
     image_indices: Vec<u32>,
     releases: Vec<(Arc<Mutex<SwapchainState>>, u32)>,
+    present_targets: Vec<Option<PresentIdTarget>>,
+    present_ids: Vec<PresentIdReservationRecord>,
+}
+
+struct PresentIdTarget {
+    state: Arc<Mutex<SwapchainState>>,
+    generation: u64,
+    physical: vk::SwapchainKHR,
+}
+
+struct PresentIdReservationRecord {
+    state: Arc<Mutex<SwapchainState>>,
+    reservation: PresentIdReservation,
 }
 
 unsafe fn translate_present(
@@ -31,6 +45,8 @@ unsafe fn translate_present(
         swapchains: Vec::with_capacity(swapchain_handles.len()),
         image_indices: Vec::with_capacity(image_indices.len()),
         releases: Vec::new(),
+        present_targets: Vec::with_capacity(swapchain_handles.len()),
+        present_ids: Vec::new(),
     };
     let mut changed = false;
     for (logical_handle, logical_index) in swapchain_handles.iter().zip(image_indices) {
@@ -46,6 +62,7 @@ unsafe fn translate_present(
             }
             translated.swapchains.push(*logical_handle);
             translated.image_indices.push(*logical_index);
+            translated.present_targets.push(None);
             continue;
         };
         let state_guard = state.lock().unwrap_or_else(|error| error.into_inner());
@@ -55,6 +72,7 @@ unsafe fn translate_present(
         let Some(mapping) = state_guard.mapping.as_ref() else {
             translated.swapchains.push(*logical_handle);
             translated.image_indices.push(*logical_index);
+            translated.present_targets.push(None);
             continue;
         };
         let (physical_swapchain, physical_index) =
@@ -62,9 +80,91 @@ unsafe fn translate_present(
         translated.swapchains.push(physical_swapchain);
         translated.image_indices.push(physical_index);
         translated.releases.push((state.clone(), *logical_index));
+        translated.present_targets.push(Some(PresentIdTarget {
+            state: state.clone(),
+            generation: state_guard.generation,
+            physical: state_guard.physical_handle,
+        }));
         changed = true;
     }
     Ok(changed.then_some(translated))
+}
+
+unsafe fn stage_present_ids(
+    info: &vk::PresentInfoKHR<'_>,
+    chain: &PresentChain<'_>,
+    translation: &mut PresentTranslation,
+) -> Result<(), vk::Result> {
+    let ids = unsafe { chain.ids_slice() };
+    if ids.is_empty() {
+        return Ok(());
+    }
+    if ids.len() != translation.present_targets.len() || info.swapchain_count as usize != ids.len()
+    {
+        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+    }
+    let mut staged = Vec::new();
+    for (target, id) in translation.present_targets.iter().zip(ids) {
+        let Some(target) = target else {
+            continue;
+        };
+        let mut state = target
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.lifecycle.blocks_frame_operations()
+            || state.generation != target.generation
+            || state.physical_handle != target.physical
+        {
+            drop(state);
+            rollback_present_ids(&staged);
+            return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
+        }
+        let reservation = match state.present_ids.stage(
+            target.generation,
+            target.physical,
+            std::slice::from_ref(id),
+        ) {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                drop(state);
+                rollback_present_ids(&staged);
+                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+            }
+        };
+        drop(state);
+        staged.push(PresentIdReservationRecord {
+            state: target.state.clone(),
+            reservation,
+        });
+    }
+    translation.present_ids = staged;
+    Ok(())
+}
+
+fn commit_present_ids(translation: &mut PresentTranslation) {
+    for record in translation.present_ids.drain(..) {
+        let mut state = record
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _ = state.present_ids.commit(record.reservation);
+    }
+}
+
+fn rollback_present_ids(records: &[PresentIdReservationRecord]) {
+    for record in records {
+        let mut state = record
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _ = state.present_ids.rollback(record.reservation.clone());
+    }
+}
+
+fn rollback_translation_present_ids(translation: &mut PresentTranslation) {
+    rollback_present_ids(&translation.present_ids);
+    translation.present_ids.clear();
 }
 
 fn release_presented_images(translation: &PresentTranslation) {
@@ -461,7 +561,7 @@ unsafe fn queue_present_inner(
     let info = unsafe { &*present_info };
     unsafe { observe_presented_surfaces(queue_state, info) };
     let translation = unsafe { translate_present(info) };
-    let translation = match translation {
+    let mut translation = match translation {
         Ok(translation) => translation,
         Err(error) => return error,
     };
@@ -479,6 +579,11 @@ unsafe fn queue_present_inner(
     } else {
         None
     };
+    if let (Some(translation), Some(chain)) = (translation.as_mut(), present_chain.as_ref()) {
+        if let Err(error) = unsafe { stage_present_ids(info, chain, translation) } {
+            return error;
+        }
+    }
     let overlay_complete = crate::handoff::handoff(|handoff| unsafe {
         let _ = submit_overlay(queue, queue_state, info, handoff);
     });
@@ -507,7 +612,8 @@ unsafe fn queue_present_inner(
             );
         }
         if present_committed(result) {
-            if let Some(translation) = &translation {
+            if let Some(translation) = translation.as_mut() {
+                commit_present_ids(translation);
                 release_presented_images(translation);
             }
             if should_retry_native_publication(result) {
@@ -521,6 +627,11 @@ unsafe fn queue_present_inner(
             }
             if let Some(chain) = present_chain.as_ref() {
                 report_maintenance_present(info, chain);
+            }
+        }
+        if !present_committed(result) {
+            if let Some(translation) = translation.as_mut() {
+                rollback_translation_present_ids(translation);
             }
         }
         if result != vk::Result::SUCCESS && !info.p_swapchains.is_null() {

@@ -27,9 +27,11 @@ mod creation;
 mod lifetime;
 pub(crate) mod maintenance;
 pub(crate) mod present_chain;
+pub(crate) mod present_id;
 mod presentation;
 mod surface;
 pub(crate) mod swapchain_create;
+pub(crate) mod swapchain_route;
 pub(crate) mod wsi_compatibility;
 use acquire::{
     acquire_next_image_khr, acquire_next_image2_khr, get_swapchain_images_khr,
@@ -44,6 +46,7 @@ use surface::{
     create_xcb_surface_khr, create_xlib_surface_khr, destroy_surface_khr,
     get_physical_device_surface_capabilities_khr, get_physical_device_surface_capabilities2_khr,
 };
+use swapchain_route::{SwapchainRoute, resolve_swapchain_route};
 
 unsafe fn downstream(instance: vk::Instance, name: &CStr) -> vk::PFN_vkVoidFunction {
     let get_instance_proc_addr = if instance == vk::Instance::null() {
@@ -335,7 +338,7 @@ pub(crate) unsafe fn get_device_proc_addr_inner(
                 device,
                 name,
                 std::mem::transmute::<vk::PFN_vkGetSwapchainStatusKHR, vk::PFN_vkVoidFunction>(
-                    reject_get_swapchain_status_khr as vk::PFN_vkGetSwapchainStatusKHR,
+                    get_swapchain_status_khr as vk::PFN_vkGetSwapchainStatusKHR,
                 ),
             )
         },
@@ -344,7 +347,7 @@ pub(crate) unsafe fn get_device_proc_addr_inner(
                 device,
                 name,
                 std::mem::transmute::<vk::PFN_vkWaitForPresentKHR, vk::PFN_vkVoidFunction>(
-                    reject_wait_for_present_khr as vk::PFN_vkWaitForPresentKHR,
+                    wait_for_present_khr as vk::PFN_vkWaitForPresentKHR,
                 ),
             )
         },
@@ -356,7 +359,7 @@ pub(crate) unsafe fn get_device_proc_addr_inner(
                     vk::PFN_vkGetPastPresentationTimingGOOGLE,
                     vk::PFN_vkVoidFunction,
                 >(
-                    reject_past_presentation_timing_google
+                    get_past_presentation_timing_google
                         as vk::PFN_vkGetPastPresentationTimingGOOGLE,
                 ),
             )
@@ -369,7 +372,7 @@ pub(crate) unsafe fn get_device_proc_addr_inner(
                     vk::PFN_vkGetRefreshCycleDurationGOOGLE,
                     vk::PFN_vkVoidFunction,
                 >(
-                    reject_refresh_cycle_duration_google as vk::PFN_vkGetRefreshCycleDurationGOOGLE
+                    get_refresh_cycle_duration_google as vk::PFN_vkGetRefreshCycleDurationGOOGLE
                 ),
             )
         },
@@ -378,7 +381,7 @@ pub(crate) unsafe fn get_device_proc_addr_inner(
                 device,
                 name,
                 std::mem::transmute::<vk::PFN_vkGetSwapchainCounterEXT, vk::PFN_vkVoidFunction>(
-                    reject_swapchain_counter_ext as vk::PFN_vkGetSwapchainCounterEXT,
+                    get_swapchain_counter_ext as vk::PFN_vkGetSwapchainCounterEXT,
                 ),
             )
         },
@@ -387,7 +390,7 @@ pub(crate) unsafe fn get_device_proc_addr_inner(
                 device,
                 name,
                 std::mem::transmute::<vk::PFN_vkSetHdrMetadataEXT, vk::PFN_vkVoidFunction>(
-                    reject_set_hdr_metadata_ext as vk::PFN_vkSetHdrMetadataEXT,
+                    set_hdr_metadata_ext as vk::PFN_vkSetHdrMetadataEXT,
                 ),
             )
         },
@@ -438,44 +441,6 @@ pub(crate) unsafe fn get_device_proc_addr_inner(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SwapchainTokenKind {
-    Direct,
-    Virtual,
-    UnknownTagged,
-}
-
-fn swapchain_token_kind(swapchain: vk::SwapchainKHR) -> SwapchainTokenKind {
-    let tracked = swapchains()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get(&swapchain)
-        .cloned();
-    if tracked.is_some_and(|state| {
-        state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .mapping
-            .is_some()
-    }) {
-        SwapchainTokenKind::Virtual
-    } else if is_retired_swapchain(swapchain)
-        || LogicalSwapchainHandle::is_reserved(swapchain.as_raw())
-    {
-        SwapchainTokenKind::UnknownTagged
-    } else {
-        SwapchainTokenKind::Direct
-    }
-}
-
-fn reject_extension_token(swapchain: vk::SwapchainKHR) -> Option<vk::Result> {
-    match swapchain_token_kind(swapchain) {
-        SwapchainTokenKind::Direct => None,
-        SwapchainTokenKind::Virtual => Some(vk::Result::ERROR_EXTENSION_NOT_PRESENT),
-        SwapchainTokenKind::UnknownTagged => Some(vk::Result::ERROR_OUT_OF_DATE_KHR),
-    }
-}
-
 unsafe fn downstream_result(
     device: vk::Device,
     name: &CStr,
@@ -488,13 +453,21 @@ unsafe fn downstream_result(
     invoke(proc)
 }
 
-unsafe extern "system" fn reject_get_swapchain_status_khr(
+fn current_physical_swapchain(swapchain: vk::SwapchainKHR) -> Result<vk::SwapchainKHR, vk::Result> {
+    match resolve_swapchain_route(swapchain)? {
+        SwapchainRoute::Direct(physical) => Ok(physical),
+        SwapchainRoute::CurrentVirtual { physical, .. } => Ok(physical),
+    }
+}
+
+unsafe extern "system" fn get_swapchain_status_khr(
     device: vk::Device,
     swapchain: vk::SwapchainKHR,
 ) -> vk::Result {
-    if let Some(error) = reject_extension_token(swapchain) {
-        return error;
-    }
+    let physical = match current_physical_swapchain(swapchain) {
+        Ok(physical) => physical,
+        Err(error) => return error,
+    };
     unsafe {
         downstream_result(
             device,
@@ -502,21 +475,33 @@ unsafe extern "system" fn reject_get_swapchain_status_khr(
             vk::Result::ERROR_EXTENSION_NOT_PRESENT,
             |proc| {
                 let get_status: vk::PFN_vkGetSwapchainStatusKHR = std::mem::transmute(proc);
-                get_status(device, swapchain)
+                get_status(device, physical)
             },
         )
     }
 }
 
-unsafe extern "system" fn reject_wait_for_present_khr(
+unsafe extern "system" fn wait_for_present_khr(
     device: vk::Device,
     swapchain: vk::SwapchainKHR,
     present_id: u64,
     timeout: u64,
 ) -> vk::Result {
-    if let Some(error) = reject_extension_token(swapchain) {
-        return error;
-    }
+    let physical = match resolve_swapchain_route(swapchain) {
+        Ok(SwapchainRoute::Direct(physical)) => physical,
+        Ok(SwapchainRoute::CurrentVirtual { state, .. }) => {
+            let route = state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .present_ids
+                .resolve(present_id);
+            let Some(route) = route else {
+                return vk::Result::ERROR_OUT_OF_DATE_KHR;
+            };
+            route.physical()
+        }
+        Err(error) => return error,
+    };
     unsafe {
         downstream_result(
             device,
@@ -524,21 +509,22 @@ unsafe extern "system" fn reject_wait_for_present_khr(
             vk::Result::ERROR_EXTENSION_NOT_PRESENT,
             |proc| {
                 let wait: vk::PFN_vkWaitForPresentKHR = std::mem::transmute(proc);
-                wait(device, swapchain, present_id, timeout)
+                wait(device, physical, present_id, timeout)
             },
         )
     }
 }
 
-unsafe extern "system" fn reject_past_presentation_timing_google(
+unsafe extern "system" fn get_past_presentation_timing_google(
     device: vk::Device,
     swapchain: vk::SwapchainKHR,
     count: *mut u32,
     timings: *mut vk::PastPresentationTimingGOOGLE,
 ) -> vk::Result {
-    if let Some(error) = reject_extension_token(swapchain) {
-        return error;
-    }
+    let physical = match current_physical_swapchain(swapchain) {
+        Ok(physical) => physical,
+        Err(error) => return error,
+    };
     unsafe {
         downstream_result(
             device,
@@ -546,20 +532,21 @@ unsafe extern "system" fn reject_past_presentation_timing_google(
             vk::Result::ERROR_EXTENSION_NOT_PRESENT,
             |proc| {
                 let get: vk::PFN_vkGetPastPresentationTimingGOOGLE = std::mem::transmute(proc);
-                get(device, swapchain, count, timings)
+                get(device, physical, count, timings)
             },
         )
     }
 }
 
-unsafe extern "system" fn reject_refresh_cycle_duration_google(
+unsafe extern "system" fn get_refresh_cycle_duration_google(
     device: vk::Device,
     swapchain: vk::SwapchainKHR,
     properties: *mut vk::RefreshCycleDurationGOOGLE,
 ) -> vk::Result {
-    if let Some(error) = reject_extension_token(swapchain) {
-        return error;
-    }
+    let physical = match current_physical_swapchain(swapchain) {
+        Ok(physical) => physical,
+        Err(error) => return error,
+    };
     unsafe {
         downstream_result(
             device,
@@ -567,21 +554,22 @@ unsafe extern "system" fn reject_refresh_cycle_duration_google(
             vk::Result::ERROR_EXTENSION_NOT_PRESENT,
             |proc| {
                 let get: vk::PFN_vkGetRefreshCycleDurationGOOGLE = std::mem::transmute(proc);
-                get(device, swapchain, properties)
+                get(device, physical, properties)
             },
         )
     }
 }
 
-unsafe extern "system" fn reject_swapchain_counter_ext(
+unsafe extern "system" fn get_swapchain_counter_ext(
     device: vk::Device,
     swapchain: vk::SwapchainKHR,
     counter: vk::SurfaceCounterFlagsEXT,
     value: *mut u64,
 ) -> vk::Result {
-    if let Some(error) = reject_extension_token(swapchain) {
-        return error;
-    }
+    let physical = match current_physical_swapchain(swapchain) {
+        Ok(physical) => physical,
+        Err(error) => return error,
+    };
     unsafe {
         downstream_result(
             device,
@@ -589,7 +577,7 @@ unsafe extern "system" fn reject_swapchain_counter_ext(
             vk::Result::ERROR_EXTENSION_NOT_PRESENT,
             |proc| {
                 let get: vk::PFN_vkGetSwapchainCounterEXT = std::mem::transmute(proc);
-                get(device, swapchain, counter, value)
+                get(device, physical, counter, value)
             },
         )
     }
@@ -599,9 +587,10 @@ unsafe extern "system" fn reject_acquire_full_screen_exclusive_mode_ext(
     device: vk::Device,
     swapchain: vk::SwapchainKHR,
 ) -> vk::Result {
-    if let Some(error) = reject_extension_token(swapchain) {
-        return error;
-    }
+    let physical = match current_physical_swapchain(swapchain) {
+        Ok(physical) => physical,
+        Err(error) => return error,
+    };
     unsafe {
         downstream_result(
             device,
@@ -610,7 +599,7 @@ unsafe extern "system" fn reject_acquire_full_screen_exclusive_mode_ext(
             |proc| {
                 let acquire: vk::PFN_vkAcquireFullScreenExclusiveModeEXT =
                     std::mem::transmute(proc);
-                acquire(device, swapchain)
+                acquire(device, physical)
             },
         )
     }
@@ -620,9 +609,10 @@ unsafe extern "system" fn reject_release_full_screen_exclusive_mode_ext(
     device: vk::Device,
     swapchain: vk::SwapchainKHR,
 ) -> vk::Result {
-    if let Some(error) = reject_extension_token(swapchain) {
-        return error;
-    }
+    let physical = match current_physical_swapchain(swapchain) {
+        Ok(physical) => physical,
+        Err(error) => return error,
+    };
     unsafe {
         downstream_result(
             device,
@@ -631,13 +621,13 @@ unsafe extern "system" fn reject_release_full_screen_exclusive_mode_ext(
             |proc| {
                 let release: vk::PFN_vkReleaseFullScreenExclusiveModeEXT =
                     std::mem::transmute(proc);
-                release(device, swapchain)
+                release(device, physical)
             },
         )
     }
 }
 
-unsafe extern "system" fn reject_set_hdr_metadata_ext(
+unsafe extern "system" fn set_hdr_metadata_ext(
     device: vk::Device,
     swapchain_count: u32,
     swapchains_ptr: *const vk::SwapchainKHR,
@@ -648,17 +638,25 @@ unsafe extern "system" fn reject_set_hdr_metadata_ext(
     }
     let swapchains_slice =
         unsafe { std::slice::from_raw_parts(swapchains_ptr, swapchain_count as usize) };
-    if swapchains_slice
+    let physical_swapchains = swapchains_slice
         .iter()
-        .any(|swapchain| reject_extension_token(*swapchain).is_some())
-    {
+        .map(|swapchain| current_physical_swapchain(*swapchain))
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(physical_swapchains) = physical_swapchains else {
         return;
-    }
+    };
     let Some(proc) = (unsafe { device_downstream(device, c"vkSetHdrMetadataEXT") }) else {
         return;
     };
     let set: vk::PFN_vkSetHdrMetadataEXT = unsafe { std::mem::transmute(proc) };
-    unsafe { set(device, swapchain_count, swapchains_ptr, metadata) };
+    unsafe {
+        set(
+            device,
+            swapchain_count,
+            physical_swapchains.as_ptr(),
+            metadata,
+        )
+    };
 }
 
 #[cfg(test)]
