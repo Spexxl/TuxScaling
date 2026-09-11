@@ -45,7 +45,7 @@ use creation::{
 use lifetime::{destroy_device, destroy_instance, destroy_swapchain_khr};
 use presentation::queue_present_khr;
 use surface::{
-    create_xcb_surface_khr, create_xlib_surface_khr, destroy_surface_khr,
+    create_win32_surface_khr, create_xcb_surface_khr, create_xlib_surface_khr, destroy_surface_khr,
     get_physical_device_surface_capabilities_khr, get_physical_device_surface_capabilities2_khr,
 };
 use swapchain_route::{SwapchainRoute, resolve_swapchain_route};
@@ -188,6 +188,11 @@ pub(crate) unsafe fn get_instance_proc_addr_inner(
         b"vkCreateXcbSurfaceKHR" => unsafe {
             std::mem::transmute::<vk::PFN_vkCreateXcbSurfaceKHR, vk::PFN_vkVoidFunction>(
                 create_xcb_surface_khr as vk::PFN_vkCreateXcbSurfaceKHR,
+            )
+        },
+        b"vkCreateWin32SurfaceKHR" => unsafe {
+            std::mem::transmute::<vk::PFN_vkCreateWin32SurfaceKHR, vk::PFN_vkVoidFunction>(
+                create_win32_surface_khr as vk::PFN_vkCreateWin32SurfaceKHR,
             )
         },
         b"vkDestroySurfaceKHR" => unsafe {

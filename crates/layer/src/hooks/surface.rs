@@ -1,5 +1,64 @@
 use super::*;
 
+fn register_x11_surface(surface: vk::SurfaceKHR, window: u64) {
+    surfaces()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(
+            surface,
+            X11Surface {
+                window,
+                logical_extent: None,
+                logical_capabilities: None,
+                borderless_lease: None,
+                negotiation: tuxscaling_display::PresentationNegotiation::direct(),
+            },
+        );
+}
+
+/// Window id used while a Wine/Proton Win32 surface has no associated X11
+/// window yet. The entry stays tracked so a later swapchain creation can retry
+/// the process-window association without treating an unknown surface as X11.
+pub(crate) const PENDING_WIN32_WINDOW: u64 = 0;
+
+/// Retry the process-window association for a pending Win32 surface.
+/// Returns the associated X11 window when one is known. Unknown non-Win32
+/// surfaces are left untouched so native Wayland handles stay direct.
+pub(crate) fn refresh_pending_win32_surface(surface: vk::SurfaceKHR) -> Option<u64> {
+    let pending = surfaces()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&surface)
+        .is_some_and(|state| state.window == PENDING_WIN32_WINDOW);
+    if !pending {
+        return surfaces()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&surface)
+            .map(|state| state.window)
+            .filter(|window| *window != PENDING_WIN32_WINDOW);
+    }
+    let window = tuxscaling_display::X11Display::connect()
+        .ok()
+        .and_then(|display| display.window_for_process(std::process::id()).ok())?;
+    if let Some(state) = surfaces()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get_mut(&surface)
+    {
+        state.window = window;
+    }
+    Some(window)
+}
+
+/// Surface window for virtualization decisions. Pending Win32 entries resolve
+/// to `None` until their X11 window appears; every other tracked surface
+/// resolves to its stored window id.
+pub(crate) fn surface_window(surface: vk::SurfaceKHR) -> Option<u64> {
+    let window = refresh_pending_win32_surface(surface)?;
+    (window != PENDING_WIN32_WINDOW).then_some(window)
+}
+
 unsafe fn create_xlib_surface_inner(
     instance: vk::Instance,
     create_info: *const vk::XlibSurfaceCreateInfoKHR<'_>,
@@ -12,19 +71,7 @@ unsafe fn create_xlib_surface_inner(
     let create: vk::PFN_vkCreateXlibSurfaceKHR = unsafe { std::mem::transmute(proc) };
     let result = unsafe { create(instance, create_info, allocation_callbacks, surface) };
     if result == vk::Result::SUCCESS && !create_info.is_null() && !surface.is_null() {
-        surfaces()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(
-                unsafe { *surface },
-                X11Surface {
-                    window: unsafe { (*create_info).window },
-                    logical_extent: None,
-                    logical_capabilities: None,
-                    borderless_lease: None,
-                    negotiation: tuxscaling_display::PresentationNegotiation::direct(),
-                },
-            );
+        register_x11_surface(unsafe { *surface }, unsafe { (*create_info).window });
     }
     result
 }
@@ -53,19 +100,7 @@ unsafe fn create_xcb_surface_inner(
     let create: vk::PFN_vkCreateXcbSurfaceKHR = unsafe { std::mem::transmute(proc) };
     let result = unsafe { create(instance, create_info, allocation_callbacks, surface) };
     if result == vk::Result::SUCCESS && !create_info.is_null() && !surface.is_null() {
-        surfaces()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(
-                unsafe { *surface },
-                X11Surface {
-                    window: unsafe { (*create_info).window as u64 },
-                    logical_extent: None,
-                    logical_capabilities: None,
-                    borderless_lease: None,
-                    negotiation: tuxscaling_display::PresentationNegotiation::direct(),
-                },
-            );
+        register_x11_surface(unsafe { *surface }, unsafe { (*create_info).window as u64 });
     }
     result
 }
@@ -207,6 +242,60 @@ pub(super) unsafe extern "system" fn create_xcb_surface_khr(
 ) -> vk::Result {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         create_xcb_surface_inner(instance, create_info, allocation_callbacks, surface)
+    }))
+    .unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED)
+}
+
+unsafe fn create_win32_surface_inner(
+    instance: vk::Instance,
+    create_info: *const vk::Win32SurfaceCreateInfoKHR<'_>,
+    allocation_callbacks: *const vk::AllocationCallbacks<'_>,
+    surface: *mut vk::SurfaceKHR,
+) -> vk::Result {
+    let Some(proc) = (unsafe { downstream(instance, c"vkCreateWin32SurfaceKHR") }) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let create: vk::PFN_vkCreateWin32SurfaceKHR = unsafe { std::mem::transmute(proc) };
+    let result = unsafe { create(instance, create_info, allocation_callbacks, surface) };
+    if result != vk::Result::SUCCESS || create_info.is_null() || surface.is_null() {
+        return result;
+    }
+    let created = unsafe { *surface };
+    // Wine/Proton Win32 surfaces are backed by an X11 window owned by this
+    // process. Associate by process id without inspecting executables, app
+    // ids, or window titles. When the window does not exist yet, keep a
+    // pending entry so swapchain creation can retry the association.
+    let window = tuxscaling_display::X11Display::connect()
+        .ok()
+        .and_then(|display| display.window_for_process(std::process::id()).ok());
+    match window {
+        Some(window) => {
+            register_x11_surface(created, window);
+            eprintln!(
+                "TuxScaling evidence event=win32_surface_mapped surface=0x{:x} window={}",
+                created.as_raw(),
+                window,
+            );
+        }
+        None => {
+            register_x11_surface(created, PENDING_WIN32_WINDOW);
+            eprintln!(
+                "TuxScaling evidence event=win32_surface_pending surface=0x{:x}",
+                created.as_raw(),
+            );
+        }
+    }
+    result
+}
+
+pub(super) unsafe extern "system" fn create_win32_surface_khr(
+    instance: vk::Instance,
+    create_info: *const vk::Win32SurfaceCreateInfoKHR<'_>,
+    allocation_callbacks: *const vk::AllocationCallbacks<'_>,
+    surface: *mut vk::SurfaceKHR,
+) -> vk::Result {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        create_win32_surface_inner(instance, create_info, allocation_callbacks, surface)
     }))
     .unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED)
 }

@@ -77,6 +77,8 @@ Present IDs are routed to the physical generation that accepted them, including 
 
 Contracts that cannot be translated select direct presentation before a logical handle is published. This includes shared-presentable and display swapchains, external full-screen ownership, low-latency or present-barrier contracts, device-group swapchain structures, unsupported flags, malformed or unknown swapchain-facing `pNext` nodes, and unsupported image contracts. Diagnostics use stable reasons such as `malformed_extension_names`, `incompatible_wsi_extension`, `unsupported_flags`, `unsupported_pnext`, or `unsupported_image_contract`; no valid flag or `pNext` node is silently stripped.
 
+Wine/Proton Win32 surfaces (`vkCreateWin32SurfaceKHR`) are translated as a generic WSI contract without executable, Steam app, Wine prefix, or game detection. The layer associates the surface with the calling process X11 window through `_NET_WM_PID`, preferring the largest valid window when several belong to the process. When no window exists yet, the surface stays pending and swapchain creation retries the association; unrelated unknown surfaces (including native Wayland) remain direct presentation.
+
 Run `cargo xtask wsi-compatibility --backend fsr_3_1_4` for the portable mutable-format, present-wait, HDR-replacement, display-timing, and incompatible-direct scenarios. It requires a display-backed X11/XWayland session and Vulkan validation; the native extent is read from the active monitor at runtime. If the required display-timing or display-control extension is unavailable, that scenario is reported as `unverified` rather than passed. The current milestone covers X11/XWayland only; native Wayland remains direct presentation.
 
 The default profile is equivalent to:

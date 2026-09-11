@@ -374,6 +374,20 @@ pub struct X11Display {
     root: Window,
 }
 
+fn select_window_for_pid(windows: &[(u64, Option<u32>, Rect)], pid: u32) -> Option<u64> {
+    windows
+        .iter()
+        .filter(|(_, window_pid, rect)| *window_pid == Some(pid) && rect.is_valid())
+        .max_by_key(|(window, _, rect)| {
+            (
+                u64::from(rect.width) * u64::from(rect.height),
+                // Tie-break toward the smallest window id for determinism.
+                std::cmp::Reverse(*window),
+            )
+        })
+        .map(|(window, _, _)| *window)
+}
+
 impl X11Display {
     pub fn connect() -> Result<Self, DisplayError> {
         let (connection, screen) = x11rb::connect(None).map_err(operation)?;
@@ -398,6 +412,41 @@ impl X11Display {
         let window = self.describe_window(window)?;
         let monitor = self.monitor_for_window(window.id)?;
         Ok(DisplayTarget::new(window, monitor))
+    }
+
+    pub fn window_for_process(&self, pid: u32) -> Result<u64, DisplayError> {
+        let pid_atom = self
+            .connection
+            .intern_atom(false, b"_NET_WM_PID")
+            .map_err(operation)?
+            .reply()
+            .map_err(operation)?
+            .atom;
+        let mut pending = vec![self.root];
+        let mut windows = Vec::new();
+        while let Some(parent) = pending.pop() {
+            let children = self
+                .connection
+                .query_tree(parent)
+                .map_err(operation)?
+                .reply()
+                .map_err(operation)?
+                .children;
+            for window in children {
+                let window_pid = self
+                    .connection
+                    .get_property(false, window, pid_atom, AtomEnum::CARDINAL, 0, 1)
+                    .ok()
+                    .and_then(|cookie| cookie.reply().ok())
+                    .and_then(|property| property.value32()?.next());
+                let rect = self
+                    .window_rect(window as u64)
+                    .unwrap_or(Rect::new(0, 0, 0, 0));
+                windows.push((window as u64, window_pid, rect));
+                pending.push(window);
+            }
+        }
+        select_window_for_pid(&windows, pid).ok_or(DisplayError::Geometry)
     }
 
     pub fn window_rect(&self, window: u64) -> Result<Rect, DisplayError> {
@@ -656,7 +705,7 @@ mod tests {
     use super::{
         BorderlessLease, DisplayTarget, Extent, Monitor, NegotiationFailure,
         PresentationNegotiation, PresentationState, Rect, SurfaceExtent, WindowSnapshot, X11Window,
-        select_monitor,
+        select_monitor, select_window_for_pid,
     };
     use std::time::{Duration, Instant};
 
@@ -669,6 +718,20 @@ mod tests {
         let window = Rect::new(1800, 100, 1200, 800);
 
         assert_eq!(select_monitor(window, &monitors), Some(monitors[1]));
+    }
+
+    #[test]
+    fn selects_the_largest_valid_window_for_process() {
+        let windows = [
+            (41, Some(7), Rect::new(0, 0, 1280, 720)),
+            (42, Some(9), Rect::new(0, 0, 640, 480)),
+            (43, Some(9), Rect::new(0, 0, 1280, 720)),
+            (44, Some(9), Rect::new(0, 0, 0, 0)),
+        ];
+
+        assert_eq!(select_window_for_pid(&windows, 9), Some(43));
+        assert_eq!(select_window_for_pid(&windows, 7), Some(41));
+        assert_eq!(select_window_for_pid(&windows, 10), None);
     }
 
     #[test]

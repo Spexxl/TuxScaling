@@ -458,12 +458,10 @@ fn native_output_target(
     ) {
         return None;
     }
-    let window = surfaces()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get(&surface)
-        .copied()?
-        .window;
+    // Pending Wine/Proton Win32 surfaces retry their process-window
+    // association here, when the X11 window may exist even though it did not
+    // at surface-creation time. Other unknown surfaces stay unresolved.
+    let window = super::surface::surface_window(surface)?;
     let display = tuxscaling_display::X11Display::connect().ok()?;
     let target = display.target_for_window(window).ok()?;
     let target_extent = target.monitor.rect.extent();
@@ -496,6 +494,7 @@ pub(super) unsafe fn observe_surface_negotiation(
     surface: vk::SurfaceKHR,
     now: Instant,
 ) -> tuxscaling_display::PresentationState {
+    let _ = super::surface::refresh_pending_win32_surface(surface);
     let Some(snapshot) = surfaces()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -504,6 +503,9 @@ pub(super) unsafe fn observe_surface_negotiation(
     else {
         return tuxscaling_display::PresentationState::Direct;
     };
+    if snapshot.window == super::surface::PENDING_WIN32_WINDOW {
+        return snapshot.negotiation.public_state();
+    }
     let Ok(display) = tuxscaling_display::X11Display::connect() else {
         return snapshot.negotiation.public_state();
     };
@@ -1660,6 +1662,9 @@ unsafe fn create_swapchain_inner(
         }
     });
     let mut virtual_preflight_eligible = virtualization_plan.is_some();
+    // Refresh a pending Wine/Proton Win32 association before snapshotting so
+    // the first swapchain creation after the X11 window appears can virtualize.
+    let _ = super::surface::refresh_pending_win32_surface(original.surface);
     let surface_snapshot = surfaces()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -1910,7 +1915,8 @@ unsafe fn create_swapchain_inner(
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(&original.surface)
-            .map(|surface| surface.window);
+            .map(|surface| surface.window)
+            .filter(|window| *window != super::surface::PENDING_WIN32_WINDOW);
         let persisted_negotiation = surface_snapshot.map(|surface| surface.negotiation);
         let monitor = initial_target.map(|target| {
             let rect = target.monitor.rect;
