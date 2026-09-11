@@ -2476,22 +2476,28 @@ mod tests {
         ));
         assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
         assert!(!negotiation.observe(
-            target,
+            Rect::new(-1920, 0, 1920, 1040),
             true,
-            SurfaceExtent::fixed(Extent::new(1920, 1080)),
+            SurfaceExtent::fixed(Extent::new(1920, 1040)),
             now + Duration::from_millis(2),
         ));
-        assert!(negotiation.observe(
+        assert!(!negotiation.observe(
             target,
             true,
             SurfaceExtent::fixed(Extent::new(1920, 1080)),
             now + Duration::from_millis(3),
         ));
-        assert!(negotiation.output_recreated(
+        assert!(negotiation.observe(
             target,
             true,
             SurfaceExtent::fixed(Extent::new(1920, 1080)),
             now + Duration::from_millis(4),
+        ));
+        assert!(negotiation.output_recreated(
+            target,
+            true,
+            SurfaceExtent::fixed(Extent::new(1920, 1080)),
+            now + Duration::from_millis(5),
         ));
         assert_eq!(negotiation.public_state(), PresentationState::Virtualized);
     }

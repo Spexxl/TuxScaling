@@ -270,8 +270,13 @@ impl PresentationNegotiation {
     }
 }
 
-fn is_native(target: Rect, window: Rect, fullscreen: bool, surface: SurfaceExtent) -> bool {
-    window == target && fullscreen && surface.accepts(target.extent())
+fn is_native(target: Rect, window: Rect, _fullscreen: bool, surface: SurfaceExtent) -> bool {
+    // Exact geometry match is borderless fullscreen by observation: the
+    // EWMH flag is not required. Wine-owned windows never retain an
+    // externally requested _NET_WM_STATE_FULLSCREEN, and borderless-windowed
+    // native windows may not carry it either. The flag parameter is kept so
+    // existing call sites stay unchanged.
+    window == target && surface.accepts(target.extent())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -968,13 +973,15 @@ mod tests {
     }
 
     #[test]
-    fn negotiation_requires_ewmh_fullscreen_before_recreation() {
+    fn exact_geometry_counts_as_native_without_the_ewmh_flag() {
         let target = Rect::new(0, 0, 1920, 1080);
         let mut negotiation = PresentationNegotiation::direct();
         let started = Instant::now();
 
         negotiation.request_borderless(target, started);
         negotiation.borderless_requested(started);
+        // Wine-owned windows never retain an externally requested
+        // _NET_WM_STATE_FULLSCREEN; geometry equality alone must suffice.
         assert!(!negotiation.observe(
             target,
             false,
@@ -983,23 +990,25 @@ mod tests {
         ));
         assert_eq!(negotiation.public_state(), PresentationState::Negotiating);
 
-        assert!(!negotiation.observe(
+        assert!(negotiation.observe(
             target,
-            true,
+            false,
             SurfaceExtent::fixed(target.extent()),
             started + Duration::from_secs(2),
         ));
-        assert!(negotiation.observe(
+        assert!(negotiation.output_recreated(
             target,
-            true,
+            false,
             SurfaceExtent::fixed(target.extent()),
-            started + Duration::from_secs(3),
+            started + Duration::from_secs(2),
         ));
+        assert_eq!(negotiation.public_state(), PresentationState::Virtualized);
     }
 
     #[test]
-    fn negotiation_revalidates_geometry_fullscreen_and_extent_during_recreation() {
+    fn negotiation_revalidates_geometry_and_extent_during_recreation() {
         let target = Rect::new(-1920, 0, 1920, 1080);
+        let drifted = Rect::new(-1920, 0, 1920, 1040);
         let mut negotiation = PresentationNegotiation::direct();
         let started = Instant::now();
 
@@ -1013,9 +1022,9 @@ mod tests {
         ));
 
         assert!(!negotiation.observe(
-            target,
-            false,
-            SurfaceExtent::fixed(target.extent()),
+            drifted,
+            true,
+            SurfaceExtent::fixed(drifted.extent()),
             started + Duration::from_secs(2),
         ));
         assert!(!negotiation.output_recreated(
