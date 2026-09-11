@@ -439,9 +439,8 @@ struct InitialOutputTarget {
     monitor: tuxscaling_display::Monitor,
 }
 
-fn initial_output_target(
+fn native_output_target(
     surface: vk::SurfaceKHR,
-    game_extent: vk::Extent2D,
     preflight_eligible: bool,
 ) -> Option<InitialOutputTarget> {
     if !preflight_eligible {
@@ -468,12 +467,28 @@ fn initial_output_target(
     let display = tuxscaling_display::X11Display::connect().ok()?;
     let target = display.target_for_window(window).ok()?;
     let target_extent = target.monitor.rect.extent();
-    (target_extent.is_valid()
-        && target_extent != Extent::new(game_extent.width, game_extent.height))
-    .then_some(InitialOutputTarget {
+    target_extent.is_valid().then_some(InitialOutputTarget {
         window,
         monitor: target.monitor,
     })
+}
+
+fn pending_native_logical_extent(
+    requested: vk::Extent2D,
+    previous_logical: Option<vk::Extent2D>,
+    native_extent: Option<Extent>,
+    negotiation: PresentationState,
+    has_borderless_lease: bool,
+) -> Option<vk::Extent2D> {
+    let previous_logical = previous_logical?;
+    let native_extent = native_extent?;
+    (has_borderless_lease
+        && negotiation == PresentationState::Negotiating
+        && (previous_logical.width != requested.width
+            || previous_logical.height != requested.height)
+        && native_extent.width == requested.width
+        && native_extent.height == requested.height)
+        .then_some(previous_logical)
 }
 
 pub(super) unsafe fn observe_surface_negotiation(
@@ -1645,13 +1660,46 @@ unsafe fn create_swapchain_inner(
         }
     });
     let mut virtual_preflight_eligible = virtualization_plan.is_some();
+    let surface_snapshot = surfaces()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&original.surface)
+        .copied();
+    let native_target = native_output_target(original.surface, virtual_preflight_eligible);
+    let initial_target = if old_logical.is_some() {
+        None
+    } else {
+        native_target.filter(|target| {
+            let extent = target.monitor.rect.extent();
+            extent.width != original.image_extent.width
+                || extent.height != original.image_extent.height
+        })
+    };
+    let continued_logical_extent = if old_logical.is_none() {
+        pending_native_logical_extent(
+            original.image_extent,
+            surface_snapshot.and_then(|surface| surface.logical_extent),
+            native_target.map(|target| target.monitor.rect.extent()),
+            surface_snapshot.map_or(PresentationState::Direct, |surface| {
+                surface.negotiation.public_state()
+            }),
+            surface_snapshot.is_some_and(|surface| surface.borderless_lease.is_some()),
+        )
+    } else {
+        None
+    };
+    let logical_extent = continued_logical_extent.unwrap_or(original.image_extent);
+    let virtual_intent =
+        old_logical.is_some() || initial_target.is_some() || continued_logical_extent.is_some();
+    let mut logical_info = *original;
+    logical_info.image_extent = logical_extent;
     let mut preallocated_virtual_images = None;
     if let Some(plan) = virtualization_plan.as_ref() {
         if let Some(count) = preflight_logical_image_count(original.min_image_count) {
             match unsafe {
                 allocate_logical_images(
                     state.as_ref().expect("eligible state must exist"),
-                    &modified,
+                    &logical_info,
                     plan,
                     count,
                 )
@@ -1675,7 +1723,10 @@ unsafe fn create_swapchain_inner(
     if !virtual_preflight_eligible {
         super::lifetime::restore_surface_window(original.surface);
     }
-    if virtual_preflight_eligible && let Some(capabilities) = logical_capabilities {
+    if virtual_intent
+        && virtual_preflight_eligible
+        && let Some(capabilities) = logical_capabilities
+    {
         modified.image_extent =
             initial_physical_extent(original.image_extent, surface_extent(capabilities), true);
     }
@@ -1685,15 +1736,6 @@ unsafe fn create_swapchain_inner(
     if old_logical.is_some() && !virtual_preflight_eligible {
         return vk::Result::ERROR_FEATURE_NOT_PRESENT;
     }
-    let initial_target = if old_logical.is_some() {
-        None
-    } else {
-        initial_output_target(
-            original.surface,
-            original.image_extent,
-            virtual_preflight_eligible,
-        )
-    };
     if let Some(target) = initial_target {
         eprintln!(
             "TuxScaling evidence event=borderless_target extent={}x{} origin={}+{}",
@@ -1832,7 +1874,7 @@ unsafe fn create_swapchain_inner(
             Ok(images) => images,
             Err(_) => return result,
         };
-        let mut virtual_eligible = (old_logical.is_some() || initial_target.is_some())
+        let mut virtual_eligible = virtual_intent
             && virtual_preflight_eligible
             && virtual_swapchain_supported(original)
             && preallocated_virtual_images.is_some();
@@ -1860,7 +1902,7 @@ unsafe fn create_swapchain_inner(
             |images| images.iter().map(|image| image.handle).collect(),
         );
         let game_extent = if virtual_images.is_some() {
-            original.image_extent
+            logical_extent
         } else {
             info.extent
         };
@@ -1869,11 +1911,7 @@ unsafe fn create_swapchain_inner(
             .unwrap_or_else(|error| error.into_inner())
             .get(&original.surface)
             .map(|surface| surface.window);
-        let persisted_negotiation = surfaces()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&original.surface)
-            .map(|surface| surface.negotiation);
+        let persisted_negotiation = surface_snapshot.map(|surface| surface.negotiation);
         let monitor = initial_target.map(|target| {
             let rect = target.monitor.rect;
             [rect.x, rect.y, rect.width as i32, rect.height as i32]
@@ -1926,12 +1964,14 @@ unsafe fn create_swapchain_inner(
         let mut negotiation = if let Some(old) = old_logical.as_ref() {
             old.negotiation
         } else if virtual_eligible {
-            initial_target.map_or_else(PresentationNegotiation::direct, |_| {
-                let mut negotiation = PresentationNegotiation::direct();
-                let _ = negotiation
-                    .request_borderless(initial_target.unwrap().monitor.rect, Instant::now());
-                negotiation
-            })
+            let mut negotiation =
+                persisted_negotiation.unwrap_or_else(PresentationNegotiation::direct);
+            if let Some(target) = initial_target
+                && negotiation.public_state() == PresentationState::Direct
+            {
+                let _ = negotiation.request_borderless(target.monitor.rect, Instant::now());
+            }
+            negotiation
         } else {
             persisted_negotiation.unwrap_or_else(PresentationNegotiation::direct)
         };
@@ -1944,7 +1984,7 @@ unsafe fn create_swapchain_inner(
             logical_capabilities_for_extent(
                 prior_logical_capabilities,
                 logical_capabilities,
-                original.image_extent,
+                logical_extent,
             )
         } else {
             logical_capabilities
@@ -1953,7 +1993,7 @@ unsafe fn create_swapchain_inner(
             LogicalSwapchainContract::new(
                 logical_handle,
                 images.iter().map(|image| image.handle).collect(),
-                original.image_extent,
+                logical_extent,
                 PhysicalGeneration::new(0, handle, info.extent, output_images.len()),
                 negotiation.public_state(),
             )
@@ -1996,8 +2036,8 @@ unsafe fn create_swapchain_inner(
             "TuxScaling evidence event=logical_swapchain_created logical_handle=0x{:x} physical_handle=0x{:x} logical={}x{} physical={}x{} virtual={} mutable_format={} view_formats={} negotiation={}",
             logical_handle.as_raw(),
             handle.as_raw(),
-            original.image_extent.width,
-            original.image_extent.height,
+            logical_extent.width,
+            logical_extent.height,
             info.extent.width,
             info.extent.height,
             u8::from(virtual_eligible),
@@ -2043,7 +2083,15 @@ unsafe fn create_swapchain_inner(
                         return result;
                     }
                 };
-                let lease = match display.promote_borderless(target.window) {
+                let existing_lease = surface_snapshot
+                    .and_then(|surface| surface.borderless_lease)
+                    .filter(|lease| {
+                        lease.window == target.window && lease.monitor == target.monitor
+                    });
+                let lease = match existing_lease
+                    .map(Ok)
+                    .unwrap_or_else(|| display.promote_borderless(target.window))
+                {
                     Ok(lease) => lease,
                     Err(_) => {
                         if let Some(state) = swapchains()
@@ -2077,7 +2125,7 @@ unsafe fn create_swapchain_inner(
                 {
                     let mut surfaces = surfaces().lock().unwrap_or_else(|error| error.into_inner());
                     if let Some(surface) = surfaces.get_mut(&original.surface) {
-                        surface.logical_extent = Some(original.image_extent);
+                        surface.logical_extent = Some(logical_extent);
                         surface.logical_capabilities = advertised_logical_capabilities;
                         surface.negotiation = negotiation;
                         surface.borderless_lease = Some(lease);
@@ -2088,8 +2136,8 @@ unsafe fn create_swapchain_inner(
                 eprintln!(
                     "TuxScaling evidence event=virtual_swapchain_negotiating logical_handle=0x{:x} logical={}x{} physical={}x{}",
                     logical_handle.as_raw(),
-                    original.image_extent.width,
-                    original.image_extent.height,
+                    logical_extent.width,
+                    logical_extent.height,
                     info.extent.width,
                     info.extent.height,
                 );
@@ -2097,7 +2145,7 @@ unsafe fn create_swapchain_inner(
                 {
                     let mut surfaces = surfaces().lock().unwrap_or_else(|error| error.into_inner());
                     if let Some(surface) = surfaces.get_mut(&original.surface) {
-                        surface.logical_extent = Some(original.image_extent);
+                        surface.logical_extent = Some(logical_extent);
                         surface.logical_capabilities = advertised_logical_capabilities;
                         surface.negotiation = negotiation;
                     }
@@ -2107,8 +2155,8 @@ unsafe fn create_swapchain_inner(
                 eprintln!(
                     "TuxScaling evidence event=logical_swapchain_recreated logical_handle=0x{:x} logical={}x{} physical={}x{}",
                     logical_handle.as_raw(),
-                    original.image_extent.width,
-                    original.image_extent.height,
+                    logical_extent.width,
+                    logical_extent.height,
                     info.extent.width,
                     info.extent.height,
                 );
@@ -2138,8 +2186,9 @@ pub(super) unsafe extern "system" fn create_swapchain_khr(
 mod tests {
     use super::{
         initial_physical_extent, logical_image_count, native_generation_failure_can_restore,
-        preflight_swapchain_virtualization, temporal_enabled_for_logical_creation,
-        translate_old_swapchain, translate_recreation_create_info, virtual_swapchain_supported,
+        pending_native_logical_extent, preflight_swapchain_virtualization,
+        temporal_enabled_for_logical_creation, translate_old_swapchain,
+        translate_recreation_create_info, virtual_swapchain_supported,
     };
     use crate::hooks::swapchain_create::SwapchainCompatibilityError;
     use crate::recovery::{
@@ -2435,6 +2484,49 @@ mod tests {
         assert_eq!(
             initial_physical_extent(requested, SurfaceExtent::fixed(native), false),
             requested
+        );
+    }
+
+    #[test]
+    fn pending_native_request_continues_the_previous_logical_contract_without_old_swapchain() {
+        let previous_logical = vk::Extent2D {
+            width: 1280,
+            height: 720,
+        };
+        let native = Extent::new(3440, 1440);
+
+        assert_eq!(
+            pending_native_logical_extent(
+                vk::Extent2D {
+                    width: 3440,
+                    height: 1440,
+                },
+                Some(previous_logical),
+                Some(native),
+                PresentationState::Negotiating,
+                true,
+            ),
+            Some(previous_logical)
+        );
+    }
+
+    #[test]
+    fn native_request_does_not_continue_without_an_owned_borderless_lease() {
+        assert_eq!(
+            pending_native_logical_extent(
+                vk::Extent2D {
+                    width: 3440,
+                    height: 1440,
+                },
+                Some(vk::Extent2D {
+                    width: 1280,
+                    height: 720,
+                }),
+                Some(Extent::new(3440, 1440)),
+                PresentationState::Negotiating,
+                false,
+            ),
+            None
         );
     }
 

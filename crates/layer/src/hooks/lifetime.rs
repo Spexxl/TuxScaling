@@ -25,7 +25,17 @@ struct SwapchainTeardown {
     overlay: Option<OverlaySwapchain>,
 }
 
-fn take_swapchain_teardown(state: &Arc<Mutex<SwapchainState>>) -> SwapchainTeardown {
+fn should_restore_surface_on_destroy(
+    negotiation: tuxscaling_display::PresentationState,
+    force_restore: bool,
+) -> bool {
+    force_restore || negotiation != tuxscaling_display::PresentationState::Negotiating
+}
+
+fn take_swapchain_teardown(
+    state: &Arc<Mutex<SwapchainState>>,
+    force_restore: bool,
+) -> SwapchainTeardown {
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
     let virtualized = state.mapping.is_some();
     SwapchainTeardown {
@@ -33,7 +43,9 @@ fn take_swapchain_teardown(state: &Arc<Mutex<SwapchainState>>) -> SwapchainTeard
             state.physical_handle,
             &state.retired_physical_generations,
         ),
-        restore_surface: virtualized.then_some(state.surface),
+        restore_surface: virtualized.then_some(state.surface).filter(|_| {
+            should_restore_surface_on_destroy(state.negotiation.public_state(), force_restore)
+        }),
         virtualized,
         overlay: state.overlay.take(),
     }
@@ -75,7 +87,7 @@ unsafe fn destroy_swapchain_inner(
     }
     let teardown = state
         .as_ref()
-        .map(take_swapchain_teardown)
+        .map(|state| take_swapchain_teardown(state, false))
         .unwrap_or_else(|| SwapchainTeardown {
             physical_handles: vec![swapchain],
             restore_surface: None,
@@ -199,7 +211,7 @@ unsafe fn destroy_device_inner(
                 .into_iter()
                 .filter_map(|handle| {
                     let state = swapchains.remove(&handle)?;
-                    let teardown = take_swapchain_teardown(&state);
+                    let teardown = take_swapchain_teardown(&state, true);
                     if teardown.virtualized {
                         retire_swapchain(handle);
                     }
@@ -308,7 +320,8 @@ pub(super) unsafe extern "system" fn destroy_instance(
 #[cfg(test)]
 mod tests {
     use super::{
-        restore_surface_window, suppress_unknown_swapchain_destroy, unique_physical_handles,
+        restore_surface_window, should_restore_surface_on_destroy,
+        suppress_unknown_swapchain_destroy, unique_physical_handles,
     };
     use crate::state::{X11Surface, surfaces};
     use ash::vk;
@@ -375,5 +388,21 @@ mod tests {
             unique_physical_handles(current, &retired),
             vec![current, retired[0]]
         );
+    }
+
+    #[test]
+    fn pending_negotiation_defers_surface_restore_until_owner_shutdown() {
+        assert!(!should_restore_surface_on_destroy(
+            tuxscaling_display::PresentationState::Negotiating,
+            false,
+        ));
+        assert!(should_restore_surface_on_destroy(
+            tuxscaling_display::PresentationState::Virtualized,
+            false,
+        ));
+        assert!(should_restore_surface_on_destroy(
+            tuxscaling_display::PresentationState::Negotiating,
+            true,
+        ));
     }
 }
