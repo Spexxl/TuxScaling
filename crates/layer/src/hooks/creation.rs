@@ -31,10 +31,97 @@ fn preflight_logical_image_count(requested: u32) -> Option<usize> {
     (count != 0).then_some(count)
 }
 
+#[derive(Clone)]
+pub(crate) struct SwapchainVirtualizationPlan {
+    pub(crate) template: crate::state::SwapchainTemplate,
+    pub(crate) image_flags: vk::ImageCreateFlags,
+    pub(crate) view_formats: Vec<vk::Format>,
+}
+
+fn preflight_swapchain_virtualization(
+    wsi: &crate::hooks::wsi_compatibility::DeviceWsiCapabilities,
+    info: &vk::SwapchainCreateInfoKHR<'_>,
+    capabilities: Option<vk::SurfaceCapabilitiesKHR>,
+    format_features: vk::FormatFeatureFlags,
+) -> Result<SwapchainVirtualizationPlan, SwapchainCompatibilityError> {
+    if let Some(incompatible) = wsi.incompatible.as_ref() {
+        return Err(SwapchainCompatibilityError::from_wsi(incompatible));
+    }
+    if info.image_array_layers != 1
+        || (info.image_sharing_mode == vk::SharingMode::CONCURRENT
+            && (info.queue_family_index_count < 2 || info.p_queue_family_indices.is_null()))
+    {
+        return Err(SwapchainCompatibilityError::UnsupportedImageContract(
+            vk::Result::ERROR_FEATURE_NOT_PRESENT,
+        ));
+    }
+    if !supported_swapchain_flags(info.flags) {
+        return Err(SwapchainCompatibilityError::UnsupportedFlags {
+            bits: info.flags.as_raw(),
+        });
+    }
+    if info
+        .flags
+        .contains(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT)
+        && !wsi.mutable_format
+    {
+        return Err(SwapchainCompatibilityError::UnsupportedImageContract(
+            vk::Result::ERROR_EXTENSION_NOT_PRESENT,
+        ));
+    }
+    if !tuxscaling_capture::supported_format(info.image_format, info.image_color_space)
+        || matches!(
+            info.present_mode,
+            vk::PresentModeKHR::SHARED_DEMAND_REFRESH
+                | vk::PresentModeKHR::SHARED_CONTINUOUS_REFRESH
+        )
+    {
+        return Err(SwapchainCompatibilityError::UnsupportedImageContract(
+            vk::Result::ERROR_FORMAT_NOT_SUPPORTED,
+        ));
+    }
+    let capabilities =
+        capabilities.ok_or(SwapchainCompatibilityError::UnsupportedImageContract(
+            vk::Result::ERROR_INITIALIZATION_FAILED,
+        ))?;
+    let required_usage = vk::ImageUsageFlags::TRANSFER_SRC
+        | vk::ImageUsageFlags::TRANSFER_DST
+        | vk::ImageUsageFlags::COLOR_ATTACHMENT
+        | vk::ImageUsageFlags::STORAGE;
+    if !capabilities.supported_usage_flags.contains(required_usage)
+        || !format_features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::BLIT_DST)
+        || preflight_logical_image_count(info.min_image_count).is_none()
+    {
+        return Err(SwapchainCompatibilityError::UnsupportedImageContract(
+            vk::Result::ERROR_FEATURE_NOT_PRESENT,
+        ));
+    }
+    let template = crate::state::SwapchainTemplate::from_create_info(info)?;
+    let image_flags = if info
+        .flags
+        .contains(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT)
+    {
+        vk::ImageCreateFlags::MUTABLE_FORMAT
+    } else {
+        vk::ImageCreateFlags::empty()
+    };
+    let view_formats = template
+        .create_chain
+        .view_formats
+        .clone()
+        .unwrap_or_default();
+    Ok(SwapchainVirtualizationPlan {
+        template,
+        image_flags,
+        view_formats,
+    })
+}
+
 unsafe fn allocate_logical_images(
     state: &DeviceState,
     info: &vk::SwapchainCreateInfoKHR<'_>,
-    create_chain: &SwapchainCreateChain,
+    plan: &SwapchainVirtualizationPlan,
     count: usize,
 ) -> Result<Vec<tuxscaling_vulkan::Image>, vk::Result> {
     let memory = unsafe {
@@ -58,17 +145,9 @@ unsafe fn allocate_logical_images(
     } else {
         &[]
     };
-    let image_flags = if info
-        .flags
-        .contains(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT)
-    {
-        vk::ImageCreateFlags::MUTABLE_FORMAT
-    } else {
-        vk::ImageCreateFlags::empty()
-    };
     let options = tuxscaling_vulkan::ImageCreateOptions {
-        image_flags,
-        view_formats: create_chain.view_formats.as_deref().unwrap_or(&[]),
+        image_flags: plan.image_flags,
+        view_formats: &plan.view_formats,
         queue_family_indices: queue_families,
     };
     (0..count)
@@ -1415,83 +1494,60 @@ unsafe fn create_swapchain_inner(
         | vk::ImageUsageFlags::TRANSFER_DST
         | vk::ImageUsageFlags::COLOR_ATTACHMENT
         | vk::ImageUsageFlags::STORAGE;
-    let maintenance_create_is_supported =
-        unsafe { SwapchainCreateChain::from_create_info(original) }.is_ok();
-    if state
-        .as_ref()
-        .is_some_and(|state| state.wsi.maintenance1.enabled)
-        && !maintenance_create_is_supported
+    let mut capture_enabled = false;
+    if let Some(state) = &state
+        && logical_capabilities.is_some_and(|caps| caps.supported_usage_flags.contains(needed))
     {
-        eprintln!(
-            "TuxScaling evidence event=maintenance1_fallback reason=unsupported_create_chain"
-        );
+        let features = unsafe {
+            state
+                .instance
+                .get_physical_device_format_properties(state.physical_device, original.image_format)
+        }
+        .optimal_tiling_features;
+        if features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::BLIT_DST)
+        {
+            modified.image_usage |= needed;
+            capture_enabled = true;
+        }
     }
-    if let Some(error) = state.as_ref().and_then(|state| {
-        state
-            .wsi
-            .incompatible
-            .as_ref()
-            .map(SwapchainCompatibilityError::from_wsi)
-    }) {
-        eprintln!(
-            "TuxScaling evidence event=virtualization_preflight result=direct reason={}",
-            error.reason()
-        );
-    }
-    let mut virtual_preflight_eligible = state.as_ref().is_some_and(|state| {
-        state.wsi.incompatible.is_none()
-            && maintenance_create_is_supported
-            && virtual_swapchain_supported(original)
-            && tuxscaling_capture::supported_format(
-                original.image_format,
-                original.image_color_space,
-            )
-            && original.image_array_layers == 1
-            && supported_swapchain_flags(original.flags)
-            && !matches!(
-                original.present_mode,
-                vk::PresentModeKHR::SHARED_DEMAND_REFRESH
-                    | vk::PresentModeKHR::SHARED_CONTINUOUS_REFRESH
-            )
-            && logical_capabilities.is_some_and(|caps| {
-                caps.supported_usage_flags.contains(needed)
-                    && unsafe {
-                        state.instance.get_physical_device_format_properties(
-                            state.physical_device,
-                            original.image_format,
-                        )
-                    }
-                    .optimal_tiling_features
-                    .contains(
-                        vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::BLIT_DST,
-                    )
-            })
-    });
-    let logical_create_chain = if virtual_preflight_eligible {
-        match unsafe { SwapchainCreateChain::from_create_info(original) } {
-            Ok(chain) => Some(chain),
+    let format_features = state
+        .as_ref()
+        .map_or(vk::FormatFeatureFlags::empty(), |state| {
+            unsafe {
+                state.instance.get_physical_device_format_properties(
+                    state.physical_device,
+                    original.image_format,
+                )
+            }
+            .optimal_tiling_features
+        });
+    let mut virtualization_plan = state.as_ref().and_then(|state| {
+        match preflight_swapchain_virtualization(
+            &state.wsi,
+            &modified,
+            logical_capabilities,
+            format_features,
+        ) {
+            Ok(plan) => Some(plan),
             Err(error) => {
                 eprintln!(
                     "TuxScaling evidence event=virtualization_preflight result=direct reason={}",
                     error.reason()
                 );
-                virtual_preflight_eligible = false;
                 None
             }
         }
-    } else {
-        None
-    };
+    });
+    let mut virtual_preflight_eligible = virtualization_plan.is_some();
     let mut preallocated_virtual_images = None;
-    if virtual_preflight_eligible {
+    if let Some(plan) = virtualization_plan.as_ref() {
         if let Some(count) = preflight_logical_image_count(original.min_image_count) {
             match unsafe {
                 allocate_logical_images(
                     state.as_ref().expect("eligible state must exist"),
-                    original,
-                    logical_create_chain
-                        .as_ref()
-                        .expect("eligible create chain must exist"),
+                    &modified,
+                    plan,
                     count,
                 )
             } {
@@ -1502,10 +1558,12 @@ unsafe fn create_swapchain_inner(
                         "TuxScaling evidence event=virtualization_preflight result=direct reason={}",
                         error.reason()
                     );
+                    virtualization_plan = None;
                     virtual_preflight_eligible = false;
                 }
             }
         } else {
+            virtualization_plan = None;
             virtual_preflight_eligible = false;
         }
     }
@@ -1531,60 +1589,6 @@ unsafe fn create_swapchain_inner(
             virtual_preflight_eligible,
         )
     };
-    let mut capture_enabled = false;
-    if let Some(state) = &state
-        && tuxscaling_capture::supported_format(original.image_format, original.image_color_space)
-        && original.image_array_layers == 1
-        && supported_swapchain_flags(original.flags)
-        && !matches!(
-            original.present_mode,
-            vk::PresentModeKHR::SHARED_DEMAND_REFRESH
-                | vk::PresentModeKHR::SHARED_CONTINUOUS_REFRESH
-        )
-        && let Some(proc) = unsafe {
-            downstream(
-                state.instance.handle(),
-                c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
-            )
-        }
-    {
-        let get: vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR =
-            unsafe { std::mem::transmute(proc) };
-        let mut caps = vk::SurfaceCapabilitiesKHR::default();
-        if unsafe { get(state.physical_device, original.surface, &mut caps) } == vk::Result::SUCCESS
-            && caps.supported_usage_flags.contains(needed)
-        {
-            let features = unsafe {
-                state.instance.get_physical_device_format_properties(
-                    state.physical_device,
-                    original.image_format,
-                )
-            }
-            .optimal_tiling_features;
-            if features
-                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::BLIT_DST)
-            {
-                modified.image_usage |= needed;
-                capture_enabled = true;
-            }
-        }
-    }
-    let owned_template = if virtual_preflight_eligible {
-        match crate::state::SwapchainTemplate::from_create_info(&modified) {
-            Ok(template) => Some(template),
-            Err(error) => {
-                eprintln!(
-                    "TuxScaling evidence event=maintenance1_fallback reason={}",
-                    error.reason()
-                );
-                virtual_preflight_eligible = false;
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let recreation_template = old_logical.as_ref().and(owned_template.as_ref());
     if let Some(old) = old_logical.as_ref() {
         let Some(device_state) = state.as_ref() else {
             return vk::Result::ERROR_INITIALIZATION_FAILED;
@@ -1594,7 +1598,7 @@ unsafe fn create_swapchain_inner(
         else {
             return vk::Result::ERROR_INITIALIZATION_FAILED;
         };
-        let Some(_template) = recreation_template.as_ref() else {
+        let Some(_plan) = virtualization_plan.as_ref() else {
             return vk::Result::ERROR_INITIALIZATION_FAILED;
         };
         let (physical_extent, physical_old_swapchain) = match translate_recreation_create_info(
@@ -1622,7 +1626,7 @@ unsafe fn create_swapchain_inner(
             create_swapchain,
             device,
             allocation_callbacks,
-            recreation_template,
+            virtualization_plan.as_ref().map(|plan| &plan.template),
             &modified,
             PhysicalCreateTarget {
                 surface: original.surface,
@@ -1638,24 +1642,36 @@ unsafe fn create_swapchain_inner(
     {
         capture_enabled = false;
         modified.image_usage = original.image_usage;
-        let retry_template = if recreation_template.is_some() {
-            match crate::state::SwapchainTemplate::from_create_info(&modified) {
-                Ok(template) => Some(template),
-                Err(_) => {
-                    result = vk::Result::ERROR_FEATURE_NOT_PRESENT;
-                    None
+        let retry_plan = if virtualization_plan.is_some() {
+            state.as_ref().and_then(|state| {
+                match preflight_swapchain_virtualization(
+                    &state.wsi,
+                    &modified,
+                    logical_capabilities,
+                    format_features,
+                ) {
+                    Ok(plan) => Some(plan),
+                    Err(error) => {
+                        eprintln!(
+                            "TuxScaling evidence event=virtualization_preflight result=direct reason={}",
+                            error.reason()
+                        );
+                        None
+                    }
                 }
-            }
+            })
         } else {
             None
         };
-        if result != vk::Result::ERROR_FEATURE_NOT_PRESENT {
+        if virtualization_plan.is_some() && retry_plan.is_none() {
+            result = vk::Result::ERROR_FEATURE_NOT_PRESENT;
+        } else if result != vk::Result::ERROR_FEATURE_NOT_PRESENT {
             result = unsafe {
                 create_physical_swapchain(
                     create_swapchain,
                     device,
                     allocation_callbacks,
-                    retry_template.as_ref(),
+                    retry_plan.as_ref().map(|plan| &plan.template),
                     &modified,
                     PhysicalCreateTarget {
                         surface: original.surface,
@@ -1665,6 +1681,9 @@ unsafe fn create_swapchain_inner(
                     swapchain,
                 )
             };
+            if result == vk::Result::SUCCESS {
+                virtualization_plan = retry_plan;
+            }
         }
     }
     if result != vk::Result::SUCCESS {
@@ -1784,9 +1803,11 @@ unsafe fn create_swapchain_inner(
             return result;
         };
         let template = virtual_eligible.then(|| {
-            owned_template
+            virtualization_plan
+                .as_ref()
+                .expect("virtual preflight owns a valid template")
+                .template
                 .clone()
-                .expect("virtual preflight owns a valid maintenance template")
         });
         let mut negotiation = if let Some(old) = old_logical.as_ref() {
             old.negotiation
@@ -1856,7 +1877,7 @@ unsafe fn create_swapchain_inner(
             retire_swapchain(original.old_swapchain);
         }
         eprintln!(
-            "TuxScaling evidence event=logical_swapchain_created logical_handle=0x{:x} physical_handle=0x{:x} logical={}x{} physical={}x{} virtual={} negotiation={}",
+            "TuxScaling evidence event=logical_swapchain_created logical_handle=0x{:x} physical_handle=0x{:x} logical={}x{} physical={}x{} virtual={} mutable_format={} view_formats={} negotiation={}",
             logical_handle.as_raw(),
             handle.as_raw(),
             original.image_extent.width,
@@ -1864,6 +1885,20 @@ unsafe fn create_swapchain_inner(
             info.extent.width,
             info.extent.height,
             u8::from(virtual_eligible),
+            u8::from(
+                virtual_eligible
+                    && virtualization_plan.as_ref().is_some_and(|plan| {
+                        plan.image_flags
+                            .contains(vk::ImageCreateFlags::MUTABLE_FORMAT)
+                    }),
+            ),
+            if virtual_eligible {
+                virtualization_plan
+                    .as_ref()
+                    .map_or(0, |plan| plan.view_formats.len())
+            } else {
+                0
+            },
             if virtual_eligible {
                 "negotiating"
             } else {
@@ -1987,9 +2022,10 @@ pub(super) unsafe extern "system" fn create_swapchain_khr(
 mod tests {
     use super::{
         initial_physical_extent, logical_image_count, native_generation_failure_can_restore,
-        temporal_enabled_for_logical_creation, translate_old_swapchain,
-        translate_recreation_create_info, virtual_swapchain_supported,
+        preflight_swapchain_virtualization, temporal_enabled_for_logical_creation,
+        translate_old_swapchain, translate_recreation_create_info, virtual_swapchain_supported,
     };
+    use crate::hooks::swapchain_create::SwapchainCompatibilityError;
     use crate::recovery::{
         LogicalSwapchainContract, PhysicalGeneration, ReconfigurationLifecycle,
         ReconfigurationTicket,
@@ -2002,6 +2038,174 @@ mod tests {
     use tuxscaling_display::{
         Extent, PresentationNegotiation, PresentationState, Rect, SurfaceExtent,
     };
+
+    fn extent(width: u32, height: u32) -> vk::Extent2D {
+        vk::Extent2D { width, height }
+    }
+
+    fn virtualization_capabilities() -> vk::SurfaceCapabilitiesKHR {
+        vk::SurfaceCapabilitiesKHR {
+            current_extent: extent(3440, 1440),
+            min_image_extent: extent(1, 1),
+            max_image_extent: extent(8192, 8192),
+            supported_usage_flags: vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::STORAGE,
+            ..Default::default()
+        }
+    }
+
+    fn with_mutable_create_info<R>(
+        formats: &[vk::Format],
+        invoke: impl FnOnce(&vk::SwapchainCreateInfoKHR<'_>) -> R,
+    ) -> R {
+        let mut list = vk::ImageFormatListCreateInfo::default().view_formats(formats);
+        let info = vk::SwapchainCreateInfoKHR::default()
+            .flags(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT)
+            .min_image_count(2)
+            .image_format(formats[0])
+            .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
+            .image_extent(extent(1280, 720))
+            .image_array_layers(1)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut list);
+        invoke(&info)
+    }
+
+    fn compatible_wsi() -> crate::hooks::wsi_compatibility::DeviceWsiCapabilities {
+        crate::hooks::wsi_compatibility::DeviceWsiCapabilities {
+            mutable_format: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn broad_unrelated_extensions_and_valid_mutable_chain_publish_a_plan() {
+        let names = [
+            c"VK_KHR_swapchain".as_ptr(),
+            c"VK_KHR_swapchain_mutable_format".as_ptr(),
+            c"VK_EXT_memory_budget".as_ptr(),
+        ];
+        let device_info = vk::DeviceCreateInfo::default().enabled_extension_names(&names);
+        let wsi = unsafe {
+            crate::hooks::wsi_compatibility::DeviceWsiCapabilities::from_create_info(
+                &device_info,
+                vk::API_VERSION_1_2,
+            )
+        };
+        let formats = [vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB];
+        let plan = with_mutable_create_info(&formats, |info| {
+            preflight_swapchain_virtualization(
+                &wsi,
+                info,
+                Some(virtualization_capabilities()),
+                vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::BLIT_DST,
+            )
+        })
+        .unwrap();
+
+        assert_eq!(plan.view_formats, formats);
+        assert_eq!(plan.image_flags, vk::ImageCreateFlags::MUTABLE_FORMAT);
+        assert_eq!(plan.template.image_format, formats[0]);
+    }
+
+    #[test]
+    fn incompatible_wsi_is_rejected_before_logical_reservation() {
+        let formats = [vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB];
+        let wsi = crate::hooks::wsi_compatibility::DeviceWsiCapabilities {
+            incompatible: Some(crate::hooks::wsi_compatibility::IncompatibleWsiExtension {
+                name: b"VK_KHR_shared_presentable_image".to_vec(),
+                reason: "shared presentable image semantics are not translated",
+            }),
+            ..compatible_wsi()
+        };
+
+        assert!(matches!(
+            with_mutable_create_info(&formats, |info| {
+                preflight_swapchain_virtualization(
+                    &wsi,
+                    info,
+                    Some(virtualization_capabilities()),
+                    vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::BLIT_DST,
+                )
+            }),
+            Err(SwapchainCompatibilityError::IncompatibleWsiExtension { name, reason })
+                if name == b"VK_KHR_shared_presentable_image" && reason
+                    == "shared presentable image semantics are not translated"
+        ));
+    }
+
+    #[test]
+    fn initial_and_replacement_generations_share_the_owned_contract() {
+        let formats = [vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB];
+        let plan = with_mutable_create_info(&formats, |info| {
+            preflight_swapchain_virtualization(
+                &compatible_wsi(),
+                info,
+                Some(virtualization_capabilities()),
+                vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::BLIT_DST,
+            )
+        })
+        .unwrap();
+        let mut observed = Vec::new();
+        for (extent, old_swapchain) in [
+            (extent(1280, 720), vk::SwapchainKHR::null()),
+            (extent(3440, 1440), vk::SwapchainKHR::from_raw(41)),
+        ] {
+            plan.template.with_create_info(
+                vk::SurfaceKHR::from_raw(7),
+                extent,
+                old_swapchain,
+                |info| {
+                    observed.push((
+                        info.flags,
+                        info.image_format,
+                        info.image_color_space,
+                        info.image_usage,
+                        info.image_sharing_mode,
+                        info.p_next,
+                        info.image_extent,
+                        info.old_swapchain,
+                    ));
+                },
+            );
+        }
+
+        assert_eq!(observed[0].0, observed[1].0);
+        assert_eq!(observed[0].1, observed[1].1);
+        assert_eq!(observed[0].2, observed[1].2);
+        assert_eq!(observed[0].3, observed[1].3);
+        assert_eq!(observed[0].4, observed[1].4);
+        assert_ne!(observed[0].5, std::ptr::null());
+        assert_ne!(observed[1].5, std::ptr::null());
+        assert_eq!(observed[0].6, extent(1280, 720));
+        assert_eq!(observed[1].6, extent(3440, 1440));
+        assert_eq!(observed[0].7, vk::SwapchainKHR::null());
+        assert_eq!(observed[1].7, vk::SwapchainKHR::from_raw(41));
+    }
+
+    #[test]
+    fn failed_image_contract_preflight_returns_before_a_logical_handle_exists() {
+        let formats = [vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB];
+        let result = with_mutable_create_info(&formats, |info| {
+            preflight_swapchain_virtualization(
+                &compatible_wsi(),
+                info,
+                Some(virtualization_capabilities()),
+                vk::FormatFeatureFlags::empty(),
+            )
+        });
+
+        assert!(matches!(
+            result,
+            Err(SwapchainCompatibilityError::UnsupportedImageContract(
+                vk::Result::ERROR_FEATURE_NOT_PRESENT,
+            ))
+        ));
+        assert!(result.is_err());
+    }
 
     #[test]
     fn rejects_mutable_format_virtual_swapchains() {
