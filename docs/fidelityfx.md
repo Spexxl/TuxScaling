@@ -56,6 +56,11 @@ the SHA-256 manifest.
 upscaler = "fsr_3_1_4"
 ```
 
+Selecting `Off` (config `upscaler = "off"` or the overlay selector) disables
+temporal upscaling and every simulation stage: frames take a plain
+aspect-fit blit plus the overlay composite until another upscaler is
+selected, which resumes the full pipeline.
+
 The egui overlay exposes the same selector and reports both the requested and
 active backend. A failed load, context creation, dispatch, or secondary
 recording leaves presentation alive and falls back without submitting the

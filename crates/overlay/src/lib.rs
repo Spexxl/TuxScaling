@@ -129,7 +129,9 @@ pub fn render_diagnostics(
                     egui::ComboBox::from_label("Upscaler")
                         .selected_text(format_upscaler(diagnostics.upscaler))
                         .show_ui(ui, |ui| {
-                            for upscaler in [Upscaler::Reference, Upscaler::Fsr314] {
+                            for upscaler in
+                                [Upscaler::Reference, Upscaler::Fsr314, Upscaler::Off]
+                            {
                                 if ui
                                     .selectable_value(
                                         &mut diagnostics.upscaler,
@@ -340,6 +342,7 @@ fn format_upscaler(upscaler: Upscaler) -> &'static str {
     match upscaler {
         Upscaler::Reference => "Reference",
         Upscaler::Fsr314 => "FSR 3.1.4",
+        Upscaler::Off => "Off",
     }
 }
 
@@ -490,5 +493,14 @@ mod tests {
             super::upscaler_request(Upscaler::Fsr314, Upscaler::Fsr314),
             None
         );
+    }
+
+    #[test]
+    fn selecting_off_requests_disabled_upscaling() {
+        assert_eq!(
+            super::upscaler_request(Upscaler::Fsr314, Upscaler::Off),
+            Some(Upscaler::Off)
+        );
+        assert_eq!(super::format_upscaler(Upscaler::Off), "Off");
     }
 }

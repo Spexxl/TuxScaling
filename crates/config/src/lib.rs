@@ -10,6 +10,10 @@ pub enum Upscaler {
     Reference,
     #[serde(rename = "fsr_3_1_4")]
     Fsr314,
+    /// Disables temporal upscaling and every simulation stage. Frames are
+    /// presented with a plain aspect-fit blit plus the overlay until another
+    /// upscaler is selected.
+    Off,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -164,6 +168,14 @@ mod tests {
             Upscaler::Fsr314
         );
         assert_eq!(Config::default().upscaler, Upscaler::Reference);
+    }
+
+    #[test]
+    fn parses_disabled_upscaler_selection() {
+        assert_eq!(
+            Config::parse("upscaler = 'off'").unwrap().upscaler,
+            Upscaler::Off
+        );
     }
 
     #[test]

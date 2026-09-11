@@ -4,7 +4,7 @@ use std::{collections::VecDeque, mem, time::Instant};
 use tuxscaling_capture::Capture;
 use tuxscaling_config::{DebugView, Upscaler};
 use tuxscaling_motion::MotionQuality;
-use tuxscaling_overlay::FrameDiagnostics;
+use tuxscaling_overlay::{FrameDiagnostics, OverlayFrame};
 use tuxscaling_overlay_vulkan::{OverlayRenderer, SwapchainInfo};
 use tuxscaling_temporal::{DepthSemantics, FrameExtent, GuidanceReset, SignalState};
 use tuxscaling_upscaler::{
@@ -201,10 +201,29 @@ fn mode_name(mode: u32) -> &'static str {
     .unwrap_or("Original")
 }
 
+/// Decides how a frame is recorded while the Off upscaler is involved.
+/// `Resume` falls through to the normal path so simulations restart on this
+/// very frame; `Disabled` skips every simulation stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisabledDecision {
+    Disabled,
+    Resume,
+    Normal,
+}
+
+fn disabled_decision(active: Upscaler, pending: Option<Upscaler>) -> DisabledDecision {
+    match (active, pending) {
+        (Upscaler::Off, Some(selection)) if selection != Upscaler::Off => DisabledDecision::Resume,
+        (Upscaler::Off, _) | (_, Some(Upscaler::Off)) => DisabledDecision::Disabled,
+        _ => DisabledDecision::Normal,
+    }
+}
+
 fn upscaler_name(upscaler: Upscaler) -> &'static str {
     match upscaler {
         Upscaler::Reference => "Reference",
         Upscaler::Fsr314 => "FSR 3.1.4",
+        Upscaler::Off => "Off",
     }
 }
 
@@ -1140,6 +1159,41 @@ impl SwapchainRuntime {
             *state = "Unavailable".into();
         }
         self.diagnostics.depth_semantics = "FlatFallback".into();
+        // A pending switch back to a real upscaler falls through to the
+        // normal path below so simulations resume on this very frame. Every
+        // other disabled state skips all simulation stages: no capture
+        // scaling, no motion, no guidance, no resolver, no backend.
+        if disabled_decision(
+            self.temporal.active_upscaler,
+            self.temporal.pending_upscaler,
+        ) == DisabledDecision::Disabled
+        {
+            if self.temporal.pending_upscaler == Some(Upscaler::Off) {
+                self.temporal.pending_upscaler = None;
+                self.temporal.disable_upscaler();
+                self.diagnostics.upscaler = Upscaler::Off;
+                self.diagnostics.active_upscaler = Upscaler::Off;
+            }
+            if self.temporal.active_upscaler == Upscaler::Off {
+                self.diagnostics.state = "Upscaler disabled; direct presentation".into();
+                let command = slot.command;
+                let fence = slot.fence;
+                let render_complete = slot.semaphore;
+                return unsafe {
+                    self.prepare_disabled(
+                        queue,
+                        family,
+                        game_image,
+                        output_layout,
+                        index,
+                        command,
+                        fence,
+                        render_complete,
+                        &frame,
+                    )
+                };
+            }
+        }
         let raw_guidance_view = match (&self.temporal.guidance, &self.temporal.motion) {
             (Some(guidance), Some(motion)) => {
                 let mut view = guidance.view(
@@ -1596,6 +1650,105 @@ impl SwapchainRuntime {
         })
     }
 
+    /// Presents with every simulation stage disabled: a plain aspect-fit
+    /// blit plus the overlay composite. Used while the Off upscaler is
+    /// active; selecting another upscaler resumes the full pipeline.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn prepare_disabled(
+        &mut self,
+        queue: vk::Queue,
+        family: u32,
+        game_image: vk::Image,
+        output_layout: vk::ImageLayout,
+        index: usize,
+        command: vk::CommandBuffer,
+        fence: vk::Fence,
+        render_complete: vk::Semaphore,
+        frame: &OverlayFrame,
+    ) -> Result<FrameSubmission, vk::Result> {
+        if !self.enabled {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        unsafe { self.initialize(queue, family) }?;
+        unsafe { self.device.wait_for_fences(&[fence], true, u64::MAX)? };
+        for timing in [
+            &mut self.diagnostics.capture_ms,
+            &mut self.diagnostics.luma_ms,
+            &mut self.diagnostics.pyramid_ms,
+            &mut self.diagnostics.forward_flow_ms,
+            &mut self.diagnostics.backward_flow_ms,
+            &mut self.diagnostics.confidence_ms,
+            &mut self.diagnostics.stats_ms,
+            &mut self.diagnostics.scene_ms,
+            &mut self.diagnostics.invalidate_ms,
+            &mut self.diagnostics.motion_ms,
+            &mut self.diagnostics.reactive_ms,
+            &mut self.diagnostics.exposure_ms,
+            &mut self.diagnostics.depth_ms,
+            &mut self.diagnostics.guidance_ms,
+            &mut self.diagnostics.guidance_total_ms,
+            &mut self.diagnostics.reconstruction_ms,
+            &mut self.diagnostics.overlay_ms,
+            &mut self.diagnostics.full_injected_ms,
+            &mut self.diagnostics.capture_cpu_ms,
+            &mut self.diagnostics.motion_cpu_ms,
+            &mut self.diagnostics.guidance_cpu_ms,
+            &mut self.diagnostics.reconstruction_cpu_ms,
+        ] {
+            *timing = 0.0;
+        }
+        unsafe {
+            self.device
+                .reset_command_buffer(command, vk::CommandBufferResetFlags::empty())?;
+            self.device.begin_command_buffer(
+                command,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            if game_image != self.output_images[index] {
+                record_spatial_blit(
+                    &self.device,
+                    command,
+                    game_image,
+                    self.temporal.resolution.game_extent,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    self.output_images[index],
+                    output_layout,
+                    self.temporal.resolution.output_extent,
+                );
+            } else {
+                image_barrier(
+                    &self.device,
+                    command,
+                    self.output_images[index],
+                    output_layout,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                );
+            }
+            self.overlay
+                .as_mut()
+                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
+                .record(command, index, frame)?;
+            image_barrier(
+                &self.device,
+                command,
+                self.output_images[index],
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+            );
+            self.device.end_command_buffer(command)?;
+        }
+        if game_image != self.output_images[index] {
+            self.pending_output = Some(index);
+        }
+        self.temporal.query_ready[index] = false;
+        Ok(FrameSubmission {
+            command_buffer: command,
+            render_complete,
+            fence,
+        })
+    }
+
     pub unsafe fn prepare_spatial_fallback(
         &mut self,
         queue: vk::Queue,
@@ -1971,5 +2124,36 @@ mod tests {
 
         assert_eq!(result, Err("backend"));
         assert_eq!(*events.borrow(), ["begin", "record", "reset", "fallback"]);
+    }
+
+    #[test]
+    fn disabled_upscaler_decision_covers_switch_and_resume() {
+        use super::{DisabledDecision, disabled_decision};
+        use tuxscaling_config::Upscaler;
+
+        assert_eq!(
+            disabled_decision(Upscaler::Off, None),
+            DisabledDecision::Disabled
+        );
+        assert_eq!(
+            disabled_decision(Upscaler::Reference, Some(Upscaler::Off)),
+            DisabledDecision::Disabled
+        );
+        assert_eq!(
+            disabled_decision(Upscaler::Off, Some(Upscaler::Reference)),
+            DisabledDecision::Resume
+        );
+        assert_eq!(
+            disabled_decision(Upscaler::Off, Some(Upscaler::Off)),
+            DisabledDecision::Disabled
+        );
+        assert_eq!(
+            disabled_decision(Upscaler::Reference, Some(Upscaler::Fsr314)),
+            DisabledDecision::Normal
+        );
+        assert_eq!(
+            disabled_decision(Upscaler::Reference, None),
+            DisabledDecision::Normal
+        );
     }
 }

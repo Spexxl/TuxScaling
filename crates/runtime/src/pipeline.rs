@@ -63,6 +63,11 @@ pub(crate) unsafe fn create_upscaler(
                 return Err(BackendError::Unavailable);
             }
         }
+        Upscaler::Off => {
+            // Disabled upscaling owns no backend. Every caller selects the
+            // disabled presentation path before reaching backend creation.
+            return Err(BackendError::Unavailable);
+        }
     };
     backend.configure(config)?;
     Ok(backend)
@@ -322,6 +327,11 @@ impl TemporalPipeline {
                     eprintln!(
                         "TuxScaling: reconstruction disabled because guidance resolve is unavailable"
                     );
+                } else if config.upscaler == Upscaler::Off {
+                    // Disabled upscaling owns no backend; frames take the
+                    // disabled presentation path until another upscaler is
+                    // selected.
+                    active_upscaler = Upscaler::Off;
                 } else {
                     let backend_config = backend_config(info, resolution, backend_view);
                     let environment = BackendEnvironment::new_with_api_version(
@@ -508,38 +518,42 @@ impl TemporalPipeline {
                 device,
                 self.vulkan_api_version,
             );
-            let replacement_backend = match unsafe {
-                create_upscaler(
-                    self.active_upscaler,
-                    &environment,
-                    backend_config(info, resolution, backend_view),
-                    capture.source.color.view,
-                    backend_view,
-                    image_count,
-                )
-            } {
-                Ok(value) => Some(value),
-                Err(error) if self.active_upscaler != Upscaler::Reference => {
-                    eprintln!(
-                        "TuxScaling: {} backend unavailable after guidance resize ({error}); using reference",
-                        upscaler_name(self.active_upscaler)
-                    );
-                    self.active_upscaler = Upscaler::Reference;
-                    unsafe {
-                        create_upscaler(
-                            Upscaler::Reference,
-                            &environment,
-                            backend_config(info, resolution, backend_view),
-                            capture.source.color.view,
-                            backend_view,
-                            image_count,
-                        )
+            let replacement_backend = if self.active_upscaler == Upscaler::Off {
+                None
+            } else {
+                match unsafe {
+                    create_upscaler(
+                        self.active_upscaler,
+                        &environment,
+                        backend_config(info, resolution, backend_view),
+                        capture.source.color.view,
+                        backend_view,
+                        image_count,
+                    )
+                } {
+                    Ok(value) => Some(value),
+                    Err(error) if self.active_upscaler != Upscaler::Reference => {
+                        eprintln!(
+                            "TuxScaling: {} backend unavailable after guidance resize ({error}); using reference",
+                            upscaler_name(self.active_upscaler)
+                        );
+                        self.active_upscaler = Upscaler::Reference;
+                        unsafe {
+                            create_upscaler(
+                                Upscaler::Reference,
+                                &environment,
+                                backend_config(info, resolution, backend_view),
+                                capture.source.color.view,
+                                backend_view,
+                                image_count,
+                            )
+                        }
+                        .ok()
                     }
-                    .ok()
-                }
-                Err(error) => {
-                    eprintln!("TuxScaling: backend disabled after guidance resize: {error}");
-                    None
+                    Err(error) => {
+                        eprintln!("TuxScaling: backend disabled after guidance resize: {error}");
+                        None
+                    }
                 }
             };
 
@@ -569,6 +583,16 @@ impl TemporalPipeline {
         }
     }
 
+    /// Tears down the backend and every simulation stage. They only come back
+    /// when another upscaler is selected and applied.
+    pub(crate) fn disable_upscaler(&mut self) {
+        self.upscaler = None;
+        self.active_upscaler = Upscaler::Off;
+        self.unavailable_upscaler = None;
+        self.config.upscaler = Upscaler::Off;
+        self.reset_history(GuidanceReset::PresetChanged);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn apply_pending_upscaler(
         &mut self,
@@ -584,6 +608,22 @@ impl TemporalPipeline {
         };
         if selection == self.active_upscaler {
             return Ok(false);
+        }
+        if selection == Upscaler::Off {
+            // Disabling tears down the backend and every simulation stage.
+            // They only come back when another upscaler is selected.
+            self.disable_upscaler();
+            return Ok(true);
+        }
+        if selection == Upscaler::Off {
+            // Disabling tears down the backend and every simulation stage.
+            // They only come back when another upscaler is selected.
+            self.upscaler = None;
+            self.active_upscaler = Upscaler::Off;
+            self.unavailable_upscaler = None;
+            self.config.upscaler = Upscaler::Off;
+            self.reset_history(GuidanceReset::PresetChanged);
+            return Ok(true);
         }
         let environment = BackendEnvironment::new_with_api_version(
             instance,
@@ -681,6 +721,7 @@ fn upscaler_name(upscaler: Upscaler) -> &'static str {
     match upscaler {
         Upscaler::Reference => "Reference",
         Upscaler::Fsr314 => "FSR 3.1.4",
+        Upscaler::Off => "Off",
     }
 }
 
@@ -950,5 +991,43 @@ mod tests {
 
         assert!(matches!(error, BackendError::Internal(_)));
         assert_eq!(backend.records, 1);
+    }
+
+    #[test]
+    fn disabling_requests_and_tears_down_the_backend() {
+        use tuxscaling_config::Upscaler;
+
+        let mut pipeline = TemporalPipeline::for_test(tuxscaling_upscaler::ResolutionPlan::new(
+            vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            },
+            1.0,
+        ));
+        pipeline.upscaler = Some(Box::new(RecordSpy {
+            records: 0,
+            failure: false,
+        }));
+
+        pipeline.request_upscaler(Upscaler::Off);
+        assert_eq!(pipeline.pending_upscaler, Some(Upscaler::Off));
+
+        pipeline.disable_upscaler();
+        assert!(pipeline.upscaler.is_none());
+        assert_eq!(pipeline.active_upscaler, Upscaler::Off);
+        assert_eq!(pipeline.config.upscaler, Upscaler::Off);
+        assert_eq!(pipeline.reset_reason, GuidanceReset::PresetChanged);
+
+        // Requesting the active selection again stages nothing.
+        pipeline.request_upscaler(Upscaler::Off);
+        assert_eq!(pipeline.pending_upscaler, None);
+
+        // Selecting another upscaler stages a resume.
+        pipeline.request_upscaler(Upscaler::Reference);
+        assert_eq!(pipeline.pending_upscaler, Some(Upscaler::Reference));
     }
 }
