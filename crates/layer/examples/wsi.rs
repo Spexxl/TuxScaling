@@ -22,9 +22,19 @@ fn game_extent() -> vk::Extent2D {
 fn game_extent_for(scenario: Option<&str>) -> vk::Extent2D {
     match scenario {
         Some(
-            "upscale" | "windowed_promote" | "already_borderless" | "monitor_origin"
-            | "promotion_failure" | "temporal_failure" | "guidance_resolve" | "maintenance1"
-            | "mutable_format",
+            "upscale"
+            | "windowed_promote"
+            | "already_borderless"
+            | "monitor_origin"
+            | "promotion_failure"
+            | "temporal_failure"
+            | "guidance_resolve"
+            | "maintenance1"
+            | "mutable_format"
+            | "present_wait_generation"
+            | "hdr_replacement"
+            | "display_timing"
+            | "incompatible_direct",
         ) => vk::Extent2D {
             width: 1280,
             height: 720,
@@ -160,6 +170,22 @@ fn wait_for_window_restore(
     }
 }
 
+fn wait_for_native_window(window: u64) -> tuxscaling_display::X11Display {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let display = tuxscaling_display::X11Display::connect().unwrap();
+        let native = display
+            .monitor_for_window(window)
+            .ok()
+            .and_then(|monitor| display.window_rect(window).ok().map(|rect| (monitor, rect)))
+            .is_some_and(|(monitor, rect)| rect == monitor.rect && display.is_fullscreen(window));
+        if native || Instant::now() >= deadline {
+            return display;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[link(name = "X11")]
 unsafe extern "C" {
     fn XOpenDisplay(name: *const c_char) -> *mut c_void;
@@ -287,6 +313,10 @@ fn device_extension_version(
         let name = unsafe { CStr::from_ptr(property.extension_name.as_ptr()) };
         (name == expected).then_some(property.spec_version)
     })
+}
+
+fn supported_device_extension(properties: &[vk::ExtensionProperties], expected: &CStr) -> bool {
+    device_extension_version(properties, expected).is_some()
 }
 
 fn maintenance1_flavor(
@@ -513,6 +543,7 @@ unsafe fn replace(
     extent: vk::Extent2D,
     maintenance: Option<&MaintenanceConfig>,
     mutable_formats: Option<MutableFormatPair>,
+    direct_fallback: bool,
 ) {
     unsafe {
         context.device.device_wait_idle().unwrap();
@@ -561,7 +592,8 @@ unsafe fn replace(
                 .as_deref()
                 == Some("1")
                 && !promotion_failure_recreate
-                && !native_aa_direct)
+                && !native_aa_direct
+                && !direct_fallback)
         {
             extent
         } else {
@@ -629,6 +661,13 @@ unsafe fn replace(
             .map(|formats| vk::ImageFormatListCreateInfo::default().view_formats(formats));
         if let Some(format_list) = format_list.as_mut() {
             info = info.push_next(format_list);
+        }
+        let mut device_group_info = direct_fallback.then(|| {
+            vk::DeviceGroupSwapchainCreateInfoKHR::default()
+                .modes(vk::DeviceGroupPresentModeFlagsKHR::LOCAL)
+        });
+        if let Some(device_group_info) = device_group_info.as_mut() {
+            info = info.push_next(device_group_info);
         }
         let new = context.swapchains.create_swapchain(&info, None).unwrap();
         for s in chain.ready.drain(..) {
@@ -763,6 +802,83 @@ unsafe fn prepare_present_fence(device: &ash::Device, fence: vk::Fence) {
     }
 }
 
+unsafe fn query_swapchain_status(
+    instance: &ash::Instance,
+    device: vk::Device,
+    swapchain: vk::SwapchainKHR,
+) -> vk::Result {
+    let Some(proc) =
+        (unsafe { instance.get_device_proc_addr(device, c"vkGetSwapchainStatusKHR".as_ptr()) })
+    else {
+        return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
+    };
+    let get: vk::PFN_vkGetSwapchainStatusKHR = unsafe { std::mem::transmute(proc) };
+    unsafe { get(device, swapchain) }
+}
+
+unsafe fn query_counter(
+    display_control: &ash::ext::display_control::Device,
+    swapchain: vk::SwapchainKHR,
+    counter: vk::SurfaceCounterFlagsEXT,
+) -> vk::Result {
+    let mut value = 0;
+    unsafe {
+        (display_control.fp().get_swapchain_counter_ext)(
+            display_control.device(),
+            swapchain,
+            counter,
+            &mut value,
+        )
+    }
+}
+
+unsafe fn query_timing_count_and_data(
+    instance: &ash::Instance,
+    device: vk::Device,
+    swapchain: vk::SwapchainKHR,
+) -> Result<(), vk::Result> {
+    let Some(proc) = (unsafe {
+        instance.get_device_proc_addr(device, c"vkGetPastPresentationTimingGOOGLE".as_ptr())
+    }) else {
+        return Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT);
+    };
+    let get: vk::PFN_vkGetPastPresentationTimingGOOGLE = unsafe { std::mem::transmute(proc) };
+    let mut count = 0;
+    let result = unsafe { get(device, swapchain, &mut count, std::ptr::null_mut()) };
+    if result != vk::Result::SUCCESS && result != vk::Result::INCOMPLETE {
+        return Err(result);
+    }
+    let mut records = vec![vk::PastPresentationTimingGOOGLE::default(); count as usize];
+    let mut capacity = count;
+    let result = unsafe { get(device, swapchain, &mut capacity, records.as_mut_ptr()) };
+    if result != vk::Result::SUCCESS && result != vk::Result::INCOMPLETE {
+        return Err(result);
+    }
+    Ok(())
+}
+
+fn sample_hdr_metadata() -> vk::HdrMetadataEXT<'static> {
+    vk::HdrMetadataEXT::default()
+        .display_primary_red(vk::XYColorEXT::default().x(0.68).y(0.32))
+        .display_primary_green(vk::XYColorEXT::default().x(0.265).y(0.69))
+        .display_primary_blue(vk::XYColorEXT::default().x(0.15).y(0.06))
+        .white_point(vk::XYColorEXT::default().x(0.3127).y(0.3290))
+        .max_luminance(1_000.0)
+        .min_luminance(0.1)
+        .max_content_light_level(1_000.0)
+        .max_frame_average_light_level(400.0)
+}
+
+fn prepend_present_id<'a>(
+    info: &mut vk::PresentInfoKHR<'a>,
+    present_ids: &'a [u64],
+    id_info: &mut vk::PresentIdKHR<'a>,
+) {
+    *id_info = vk::PresentIdKHR::default().present_ids(present_ids);
+    id_info.p_next = info.p_next;
+    info.p_next = (id_info as *const vk::PresentIdKHR<'_>).cast();
+}
+
 unsafe fn acquire_for_release(
     device: &ash::Device,
     swapchains: &ash::khr::swapchain::Device,
@@ -804,13 +920,32 @@ unsafe fn finish_environment_skip(
     surface_loader: &ash::khr::surface::Instance,
     surfaces: &[vk::SurfaceKHR],
     windows: &[c_ulong],
+    scenario: &str,
     reason: &str,
 ) -> WsiOutcome {
-    eprintln!("TuxScaling WSI environment skip scenario=mutable_format reason={reason}");
+    eprintln!(
+        "TuxScaling evidence event=wsi_scenario scenario={scenario} result=unverified reason=extension_unavailable detail={reason}"
+    );
     for &surface in surfaces {
         unsafe { surface_loader.destroy_surface(surface, None) };
     }
     unsafe { instance.destroy_instance(None) };
+    for &window in windows {
+        unsafe { XDestroyWindow(display, window) };
+    }
+    unsafe { XCloseDisplay(display) };
+    WsiOutcome::EnvironmentSkip
+}
+
+unsafe fn finish_instance_environment_skip(
+    display: *mut c_void,
+    windows: &[c_ulong],
+    scenario: &str,
+    reason: &str,
+) -> WsiOutcome {
+    eprintln!(
+        "TuxScaling evidence event=wsi_scenario scenario={scenario} result=unverified reason=extension_unavailable detail={reason}"
+    );
     for &window in windows {
         unsafe { XDestroyWindow(display, window) };
     }
@@ -833,8 +968,25 @@ unsafe fn run() -> WsiOutcome {
         };
         let scenario = std::env::var("TUXSCALING_TEST_SCENARIO").ok();
         let scenario_active = scenario.is_some();
+        let scenario_name = scenario.as_deref().unwrap_or("default");
         let maintenance_scenario = scenario.as_deref() == Some("maintenance1");
         let mutable_scenario = scenario.as_deref() == Some("mutable_format");
+        let present_wait_scenario = scenario.as_deref() == Some("present_wait_generation");
+        let hdr_scenario = scenario.as_deref() == Some("hdr_replacement");
+        let timing_scenario = scenario.as_deref() == Some("display_timing");
+        let incompatible_scenario = scenario.as_deref() == Some("incompatible_direct");
+        let portable_wsi_scenario = mutable_scenario
+            || present_wait_scenario
+            || hdr_scenario
+            || timing_scenario
+            || incompatible_scenario;
+        if scenario_active {
+            let requested = game_extent();
+            eprintln!(
+                "TuxScaling evidence event=wsi_scenario_request scenario={scenario_name} requested={}x{}",
+                requested.width, requested.height,
+            );
+        }
         let borderless_monitor = starts_borderless().then(native_monitor_rect).flatten();
         let placement_monitor =
             borderless_monitor.or_else(|| maintenance_scenario.then(native_monitor_rect).flatten());
@@ -866,7 +1018,7 @@ unsafe fn run() -> WsiOutcome {
                 );
                 XStoreName(display, w, c"TuxScaling WSI validation".as_ptr());
                 XFlush(display);
-                if scenario_active && !maintenance_scenario {
+                if scenario_active && !maintenance_scenario && !portable_wsi_scenario {
                     let (connection, _) = x11rb::connect(None).unwrap();
                     connection
                         .change_window_attributes(
@@ -878,7 +1030,7 @@ unsafe fn run() -> WsiOutcome {
                         .unwrap();
                     connection.flush().unwrap();
                 }
-                if maintenance_scenario {
+                if maintenance_scenario || portable_wsi_scenario {
                     suppress_window_decorations(w);
                 }
                 XMapWindow(display, w);
@@ -887,6 +1039,11 @@ unsafe fn run() -> WsiOutcome {
             })
             .collect::<Vec<_>>();
         XFlush(display);
+        if portable_wsi_scenario {
+            // Let the window manager finish its initial decoration pass before
+            // taking the lease snapshot that teardown must restore exactly.
+            thread::sleep(Duration::from_millis(100));
+        }
         let display_probe = tuxscaling_display::X11Display::connect().unwrap();
         let original_windows = windows
             .iter()
@@ -901,6 +1058,19 @@ unsafe fn run() -> WsiOutcome {
         let entry = ash::Entry::load().unwrap();
         let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
         let instance_properties = entry.enumerate_instance_extension_properties(None).unwrap();
+        if timing_scenario
+            && (!supported_device_extension(
+                &instance_properties,
+                ash::ext::display_surface_counter::NAME,
+            ) || !supported_device_extension(&instance_properties, ash::khr::display::NAME))
+        {
+            return finish_instance_environment_skip(
+                display,
+                &windows,
+                scenario_name,
+                "VK_EXT_display_surface_counter or VK_KHR_display is unavailable",
+            );
+        }
         let surface_maintenance_name = if maintenance_scenario {
             let khr =
                 device_extension_version(&instance_properties, c"VK_KHR_surface_maintenance1")
@@ -937,6 +1107,10 @@ unsafe fn run() -> WsiOutcome {
                     .expect("surface maintenance name is selected")
                     .as_ptr(),
             );
+        }
+        if timing_scenario {
+            extensions.push(ash::khr::display::NAME.as_ptr());
+            extensions.push(ash::ext::display_surface_counter::NAME.as_ptr());
         }
         let instance = entry
             .create_instance(
@@ -977,6 +1151,7 @@ unsafe fn run() -> WsiOutcome {
                     &surface_loader,
                     &surfaces,
                     &windows,
+                    scenario_name,
                     "VK_KHR_swapchain_mutable_format is unavailable",
                 );
             }
@@ -992,6 +1167,7 @@ unsafe fn run() -> WsiOutcome {
                                 &surface_loader,
                                 &surfaces,
                                 &windows,
+                                scenario_name,
                                 &format!("surface format query failed: {error:?}"),
                             );
                         }
@@ -1003,6 +1179,7 @@ unsafe fn run() -> WsiOutcome {
                         &surface_loader,
                         &surfaces,
                         &windows,
+                        scenario_name,
                         "surface does not expose a compatible UNORM/SRGB pair",
                     );
                 };
@@ -1013,6 +1190,7 @@ unsafe fn run() -> WsiOutcome {
                         &surface_loader,
                         &surfaces,
                         &windows,
+                        scenario_name,
                         "surfaces expose different mutable format pairs",
                     );
                 }
@@ -1037,6 +1215,102 @@ unsafe fn run() -> WsiOutcome {
         } else {
             None
         };
+        if present_wait_scenario
+            && (!supported_device_extension(&device_properties, ash::khr::present_id::NAME)
+                || !supported_device_extension(&device_properties, ash::khr::present_wait::NAME))
+        {
+            return finish_environment_skip(
+                display,
+                &instance,
+                &surface_loader,
+                &surfaces,
+                &windows,
+                scenario_name,
+                "VK_KHR_present_id or VK_KHR_present_wait is unavailable",
+            );
+        }
+        if hdr_scenario
+            && !supported_device_extension(&device_properties, ash::ext::hdr_metadata::NAME)
+        {
+            return finish_environment_skip(
+                display,
+                &instance,
+                &surface_loader,
+                &surfaces,
+                &windows,
+                scenario_name,
+                "VK_EXT_hdr_metadata is unavailable",
+            );
+        }
+        if timing_scenario
+            && (!supported_device_extension(&device_properties, ash::google::display_timing::NAME)
+                || !supported_device_extension(&device_properties, ash::ext::display_control::NAME))
+        {
+            return finish_environment_skip(
+                display,
+                &instance,
+                &surface_loader,
+                &surfaces,
+                &windows,
+                scenario_name,
+                "display timing or display control is unavailable",
+            );
+        }
+        let incompatible_extension = if incompatible_scenario {
+            [
+                c"VK_KHR_shared_presentable_image",
+                c"VK_EXT_full_screen_exclusive",
+                c"VK_NV_low_latency2",
+                c"VK_NV_present_barrier",
+            ]
+            .into_iter()
+            .find(|name| supported_device_extension(&device_properties, name))
+        } else {
+            None
+        };
+        let incompatible_device_group = incompatible_scenario
+            && supported_device_extension(&device_properties, ash::khr::device_group::NAME);
+        if incompatible_scenario && incompatible_extension.is_none() && !incompatible_device_group {
+            return finish_environment_skip(
+                display,
+                &instance,
+                &surface_loader,
+                &surfaces,
+                &windows,
+                scenario_name,
+                "no audited incompatible WSI extension or device-group contract is available",
+            );
+        }
+        let counter_flag = if timing_scenario {
+            let counter_instance =
+                ash::ext::display_surface_counter::Instance::new(&entry, &instance);
+            let mut capabilities = vk::SurfaceCapabilities2EXT::default();
+            let result = (counter_instance
+                .fp()
+                .get_physical_device_surface_capabilities2_ext)(
+                physical,
+                surfaces[0],
+                &mut capabilities,
+            );
+            if result != vk::Result::SUCCESS
+                || !capabilities
+                    .supported_surface_counters
+                    .contains(vk::SurfaceCounterFlagsEXT::VBLANK)
+            {
+                return finish_environment_skip(
+                    display,
+                    &instance,
+                    &surface_loader,
+                    &surfaces,
+                    &windows,
+                    scenario_name,
+                    "VBLANK surface counter is unavailable",
+                );
+            }
+            Some(vk::SurfaceCounterFlagsEXT::VBLANK)
+        } else {
+            None
+        };
         let physical_features = instance.get_physical_device_features(physical);
         let features = vk::PhysicalDeviceFeatures {
             shader_int16: physical_features.shader_int16,
@@ -1047,10 +1321,17 @@ unsafe fn run() -> WsiOutcome {
         let mut supported_vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut supported_maintenance =
             vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
+        let mut supported_present_id = vk::PhysicalDevicePresentIdFeaturesKHR::default();
+        let mut supported_present_wait = vk::PhysicalDevicePresentWaitFeaturesKHR::default();
         let mut supported_features2 =
             vk::PhysicalDeviceFeatures2::default().push_next(&mut supported_vulkan12);
         if maintenance_scenario {
             supported_features2 = supported_features2.push_next(&mut supported_maintenance);
+        }
+        if present_wait_scenario {
+            supported_features2 = supported_features2
+                .push_next(&mut supported_present_id)
+                .push_next(&mut supported_present_wait);
         }
         instance.get_physical_device_features2(physical, &mut supported_features2);
         if maintenance_scenario {
@@ -1058,6 +1339,20 @@ unsafe fn run() -> WsiOutcome {
                 supported_maintenance.swapchain_maintenance1,
                 vk::TRUE,
                 "maintenance1 feature is not supported by the selected device"
+            );
+        }
+        if present_wait_scenario
+            && (supported_present_id.present_id != vk::TRUE
+                || supported_present_wait.present_wait != vk::TRUE)
+        {
+            return finish_environment_skip(
+                display,
+                &instance,
+                &surface_loader,
+                &surfaces,
+                &windows,
+                scenario_name,
+                "present ID or present wait feature is unavailable",
             );
         }
         let mut enabled_vulkan12 = vk::PhysicalDeviceVulkan12Features::default()
@@ -1088,11 +1383,32 @@ unsafe fn run() -> WsiOutcome {
         if mutable_scenario {
             device_extensions.push(ash::khr::swapchain_mutable_format::NAME.as_ptr());
         }
+        if present_wait_scenario {
+            device_extensions.push(ash::khr::present_id::NAME.as_ptr());
+            device_extensions.push(ash::khr::present_wait::NAME.as_ptr());
+        }
+        if hdr_scenario {
+            device_extensions.push(ash::ext::hdr_metadata::NAME.as_ptr());
+        }
+        if timing_scenario {
+            device_extensions.push(ash::google::display_timing::NAME.as_ptr());
+            device_extensions.push(ash::ext::display_control::NAME.as_ptr());
+        }
+        if let Some(extension) = incompatible_extension {
+            device_extensions.push(extension.as_ptr());
+        }
+        if incompatible_device_group {
+            device_extensions.push(ash::khr::device_group::NAME.as_ptr());
+        }
         if let Some(flavor) = maintenance_flavor {
             device_extensions.push(flavor.name().as_ptr());
         }
         let mut enabled_maintenance = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default()
             .swapchain_maintenance1(true);
+        let mut enabled_present_id =
+            vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+        let mut enabled_present_wait =
+            vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
         let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&device_extensions)
@@ -1100,6 +1416,11 @@ unsafe fn run() -> WsiOutcome {
             .push_next(&mut enabled_vulkan12);
         if maintenance_scenario {
             device_info = device_info.push_next(&mut enabled_maintenance);
+        }
+        if present_wait_scenario {
+            device_info = device_info
+                .push_next(&mut enabled_present_id)
+                .push_next(&mut enabled_present_wait);
         }
         let device = instance
             .create_device(physical, &device_info, None)
@@ -1115,6 +1436,14 @@ unsafe fn run() -> WsiOutcome {
             })
             .collect::<Vec<_>>();
         let swapchains = ash::khr::swapchain::Device::new(&instance, &device);
+        let present_wait =
+            present_wait_scenario.then(|| ash::khr::present_wait::Device::new(&instance, &device));
+        let hdr_metadata =
+            hdr_scenario.then(|| ash::ext::hdr_metadata::Device::new(&instance, &device));
+        let display_control =
+            timing_scenario.then(|| ash::ext::display_control::Device::new(&instance, &device));
+        let display_timing =
+            timing_scenario.then(|| ash::google::display_timing::Device::new(&instance, &device));
         let replacement = SwapchainContext {
             physical,
             device: &device,
@@ -1187,6 +1516,7 @@ unsafe fn run() -> WsiOutcome {
                 game_extent(),
                 maintenance.as_ref(),
                 mutable_formats,
+                incompatible_scenario,
             );
         }
         let mutable_views_validated = if let Some(pair) = mutable_formats {
@@ -1209,14 +1539,20 @@ unsafe fn run() -> WsiOutcome {
             // manager applies it to the active fullscreen state.
             pin_fullscreen_monitor(&windows);
         }
+        if portable_wsi_scenario && !incompatible_scenario {
+            for &window in &windows {
+                wait_for_native_window(window);
+            }
+        }
         let start = Instant::now();
         if scenario_active && !maintenance_scenario {
             let display = tuxscaling_display::X11Display::connect().unwrap();
             for &window in &windows {
                 let rect = display.window_rect(window).unwrap();
-                let expected = if std::env::var("TUXSCALING_TEST_SCENARIO").ok().as_deref()
-                    == Some("native_aa")
-                {
+                let expected = if matches!(
+                    std::env::var("TUXSCALING_TEST_SCENARIO").ok().as_deref(),
+                    Some("native_aa" | "incompatible_direct")
+                ) {
                     game_extent()
                 } else {
                     let monitor = display_probe.monitor_for_window(window).unwrap();
@@ -1247,6 +1583,56 @@ unsafe fn run() -> WsiOutcome {
             .unwrap_or(4);
         let mut maintenance_released = false;
         let mut maintenance_recreated = false;
+        let mut present_wait_current = false;
+        let mut present_wait_old = false;
+        let mut next_present_id = 1_u64;
+        let mut hdr_before = false;
+        let mut hdr_after = false;
+        let mut timing_count = false;
+        let mut timing_data = false;
+        let mut status_query = false;
+        let mut counter_query = false;
+        let mut refresh_query = false;
+        if hdr_scenario {
+            let metadata = [sample_hdr_metadata()];
+            let hdr_metadata = hdr_metadata.as_ref().expect("HDR device is enabled");
+            hdr_metadata.set_hdr_metadata(&[chains[0].handle], &metadata);
+            hdr_before = true;
+        }
+        if timing_scenario {
+            let chain = chains.first().expect("timing scenario needs one swapchain");
+            let status = query_swapchain_status(&instance, device.handle(), chain.handle);
+            assert!(
+                matches!(
+                    status,
+                    vk::Result::SUCCESS
+                        | vk::Result::SUBOPTIMAL_KHR
+                        | vk::Result::ERROR_OUT_OF_DATE_KHR
+                ),
+                "status query failed: {status:?}"
+            );
+            status_query = true;
+            let counter = counter_flag.expect("timing scenario selected a surface counter");
+            let counter_result = query_counter(
+                display_control
+                    .as_ref()
+                    .expect("display control device is enabled"),
+                chain.handle,
+                counter,
+            );
+            assert_eq!(counter_result, vk::Result::SUCCESS, "counter query failed");
+            counter_query = true;
+            let refresh = display_timing
+                .as_ref()
+                .expect("display timing device is enabled")
+                .get_refresh_cycle_duration(chain.handle);
+            assert!(refresh.is_ok(), "refresh-cycle query failed: {refresh:?}");
+            refresh_query = true;
+            query_timing_count_and_data(&instance, device.handle(), chain.handle)
+                .expect("initial display timing count/data query failed");
+            timing_count = true;
+            timing_data = true;
+        }
         if let (Some(flavor), Some(chain)) = (maintenance_flavor, chains.first_mut()) {
             let released_index = acquire_for_release(&device, &swapchains, chain.handle);
             assert_eq!(
@@ -1281,6 +1667,7 @@ unsafe fn run() -> WsiOutcome {
                 game_extent(),
                 maintenance.as_ref(),
                 mutable_formats,
+                incompatible_scenario,
             );
             maintenance_recreated = true;
         }
@@ -1320,6 +1707,7 @@ unsafe fn run() -> WsiOutcome {
                         extent,
                         maintenance.as_ref(),
                         mutable_formats,
+                        incompatible_scenario,
                     );
                 }
                 resizes += 1;
@@ -1359,6 +1747,7 @@ unsafe fn run() -> WsiOutcome {
                             },
                             maintenance.as_ref(),
                             mutable_formats,
+                            incompatible_scenario,
                         );
                         swapchains
                             .acquire_next_image(
@@ -1425,6 +1814,16 @@ unsafe fn run() -> WsiOutcome {
             if chains.len() > 1 && frame.is_multiple_of(3) {
                 let handles = chains.iter().map(|chain| chain.handle).collect::<Vec<_>>();
                 let mut results = vec![vk::Result::SUCCESS; chains.len()];
+                let present_ids = present_wait_scenario.then(|| {
+                    let ids = (0..chains.len())
+                        .map(|_| {
+                            let id = next_present_id;
+                            next_present_id += 1;
+                            id
+                        })
+                        .collect::<Vec<_>>();
+                    ids
+                });
                 let present_fences = chains
                     .iter()
                     .map(|chain| chain.present_fence)
@@ -1450,8 +1849,26 @@ unsafe fn run() -> WsiOutcome {
                     info.p_next =
                         (&mut fence_info as *mut vk::SwapchainPresentFenceInfoEXT<'_>).cast();
                 }
+                let mut present_id_info = vk::PresentIdKHR::default();
+                if let Some(present_ids) = present_ids.as_ref() {
+                    prepend_present_id(&mut info, present_ids, &mut present_id_info);
+                }
                 let result = present(queue0, &info);
                 assert!(result == vk::Result::SUCCESS || result == vk::Result::SUBOPTIMAL_KHR);
+                if let Some(present_ids) = present_ids {
+                    for (chain, present_id) in chains.iter().zip(present_ids) {
+                        let wait_result = present_wait
+                            .as_ref()
+                            .expect("present wait device is enabled")
+                            .wait_for_present(chain.handle, present_id, u64::MAX);
+                        assert!(wait_result.is_ok(), "present wait failed: {wait_result:?}");
+                        if frame == 0 {
+                            present_wait_old = true;
+                        } else {
+                            present_wait_current = true;
+                        }
+                    }
+                }
                 grouped += 1;
             } else {
                 for i in 0..chains.len() {
@@ -1473,11 +1890,45 @@ unsafe fn run() -> WsiOutcome {
                         info.p_next =
                             (&mut fence_info as *mut vk::SwapchainPresentFenceInfoEXT<'_>).cast();
                     }
+                    let present_id = present_wait_scenario.then(|| {
+                        let id = next_present_id;
+                        next_present_id += 1;
+                        id
+                    });
+                    let present_ids = present_id.map(|present_id| [present_id]);
+                    let mut present_id_info = vk::PresentIdKHR::default();
+                    if let Some(present_ids) = present_ids.as_ref() {
+                        prepend_present_id(&mut info, present_ids, &mut present_id_info);
+                    }
                     let result = present(queue_handles[i], &info);
                     assert!(result == vk::Result::SUCCESS || result == vk::Result::SUBOPTIMAL_KHR);
+                    if let Some([present_id]) = present_ids {
+                        let wait_result = present_wait
+                            .as_ref()
+                            .expect("present wait device is enabled")
+                            .wait_for_present(chains[i].handle, present_id, u64::MAX);
+                        assert!(wait_result.is_ok(), "present wait failed: {wait_result:?}");
+                        if frame == 0 {
+                            present_wait_old = true;
+                        } else {
+                            present_wait_current = true;
+                        }
+                    }
                 }
             }
             frame += 1;
+            if hdr_scenario && frame == 1 {
+                let metadata = [sample_hdr_metadata()];
+                hdr_metadata
+                    .as_ref()
+                    .expect("HDR device is enabled")
+                    .set_hdr_metadata(&[chains[0].handle], &metadata);
+                hdr_after = true;
+            }
+            if timing_scenario && frame == 1 {
+                query_timing_count_and_data(&instance, device.handle(), chains[0].handle)
+                    .expect("post-replacement display timing count/data query failed");
+            }
         }
         if maintenance_scenario {
             assert!(maintenance_released);
@@ -1496,6 +1947,53 @@ unsafe fn run() -> WsiOutcome {
             assert!(frame > 0, "mutable format scenario did not present a frame");
             eprintln!(
                 "TuxScaling WSI evidence scenario=mutable_format alternate_views=1 reconstructed=1"
+            );
+        }
+        if present_wait_scenario {
+            assert!(
+                present_wait_old,
+                "present wait did not route an old generation"
+            );
+            assert!(
+                present_wait_current,
+                "present wait did not route the current generation"
+            );
+        }
+        if hdr_scenario {
+            assert!(hdr_before, "HDR metadata was not set before replacement");
+            assert!(hdr_after, "HDR metadata was not set after replacement");
+        }
+        if timing_scenario {
+            assert!(status_query);
+            assert!(counter_query);
+            assert!(refresh_query);
+            assert!(timing_count);
+            assert!(timing_data);
+        }
+        if mutable_scenario || present_wait_scenario || hdr_scenario || timing_scenario {
+            let scenario_fields = match scenario_name {
+                "mutable_format" => {
+                    "alternate_views=1 present_wait_current=0 present_wait_old=0 hdr_before=0 hdr_after=0 queries=none timing=none direct=0"
+                }
+                "present_wait_generation" => {
+                    "alternate_views=0 present_wait_current=1 present_wait_old=1 hdr_before=0 hdr_after=0 queries=none timing=none direct=0"
+                }
+                "hdr_replacement" => {
+                    "alternate_views=0 present_wait_current=0 present_wait_old=0 hdr_before=1 hdr_after=1 queries=none timing=none direct=0"
+                }
+                "display_timing" => {
+                    "alternate_views=0 present_wait_current=0 present_wait_old=0 hdr_before=0 hdr_after=0 queries=status,counter,refresh timing=count,data direct=0"
+                }
+                _ => unreachable!("scenario marker only applies to portable WSI scenarios"),
+            };
+            eprintln!(
+                "TuxScaling evidence event=wsi_scenario scenario={scenario_name} result=verified {scenario_fields} recreations_after_publish=0"
+            );
+        }
+        if incompatible_scenario {
+            assert_eq!(chains.len(), 1);
+            eprintln!(
+                "TuxScaling evidence event=wsi_scenario scenario=incompatible_direct result=verified direct=1"
             );
         }
         device.device_wait_idle().unwrap();

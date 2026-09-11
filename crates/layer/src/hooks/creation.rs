@@ -306,7 +306,10 @@ fn translate_recreation_create_info(
     {
         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
     }
-    Ok((physical_extent, old_contract.generation().handle()))
+    // Keep the previous physical generation active.  Passing it as
+    // `oldSwapchain` would retire it in the driver and make present-wait
+    // queries for IDs submitted to that generation invalid.
+    Ok((physical_extent, vk::SwapchainKHR::null()))
 }
 
 #[derive(Clone, Copy)]
@@ -767,7 +770,7 @@ pub(super) unsafe fn publish_native_generation(
     let result = snapshot.template.with_create_info(
         surface,
         target_extent,
-        snapshot.old_physical,
+        vk::SwapchainKHR::null(),
         |create_info| unsafe {
             create(
                 device_state.device.handle(),
@@ -807,22 +810,22 @@ pub(super) unsafe fn publish_native_generation(
             return false;
         }
     };
-    if let Some(metadata) = snapshot.hdr_metadata {
-        if !unsafe {
+    if let Some(metadata) = snapshot.hdr_metadata
+        && !unsafe {
             super::apply_hdr_metadata(device_state.device.handle(), new_physical, metadata)
-        } {
-            unsafe {
-                finish_native_generation_failure(
-                    device_state,
-                    snapshot,
-                    runtime,
-                    new_physical,
-                    &loader,
-                    true,
-                )
-            };
-            return false;
         }
+    {
+        unsafe {
+            finish_native_generation_failure(
+                device_state,
+                snapshot,
+                runtime,
+                new_physical,
+                &loader,
+                true,
+            )
+        };
+        return false;
     }
     let info = SwapchainInfo {
         format: snapshot.template.image_format,
@@ -1609,6 +1612,15 @@ unsafe fn create_swapchain_inner(
             virtual_preflight_eligible,
         )
     };
+    if let Some(target) = initial_target {
+        eprintln!(
+            "TuxScaling evidence event=borderless_target extent={}x{} origin={}+{}",
+            target.monitor.rect.width,
+            target.monitor.rect.height,
+            target.monitor.rect.x,
+            target.monitor.rect.y,
+        );
+    }
     if let Some(old) = old_logical.as_ref() {
         let Some(device_state) = state.as_ref() else {
             return vk::Result::ERROR_INITIALIZATION_FAILED;
@@ -2413,7 +2425,7 @@ mod tests {
                 height: 1440,
             }
         );
-        assert_eq!(recorded_old_swapchain, old_physical);
+        assert_eq!(recorded_old_swapchain, vk::SwapchainKHR::null());
         assert_eq!(new_contract.handle(), new_logical);
         assert_eq!(new_contract.logical_images(), new_logical_images.as_slice());
         assert_eq!(new_contract.game_extent(), logical_extent);
@@ -2465,7 +2477,7 @@ mod tests {
 
         assert_eq!(physical_extent.width, 3440);
         assert_eq!(physical_extent.height, 1440);
-        assert_eq!(physical_old_swapchain, old_physical);
+        assert_eq!(physical_old_swapchain, vk::SwapchainKHR::null());
     }
 
     #[test]

@@ -513,22 +513,22 @@ unsafe fn submit_overlay(
             }
             break;
         }
-        let maintenance_report = if let Ok(mut state) = state.lock()
+        let (overlay_report, maintenance_report) = if let Ok(mut state) = state.lock()
             && let Some(overlay) = state.overlay.as_mut()
         {
             overlay.submitted();
-            if device_state.wsi.maintenance1.enabled
-                && state.mapping.is_some()
-                && !state.maintenance_overlay_reported
-            {
+            let overlay_report = state.mapping.is_some() && !state.maintenance_overlay_reported;
+            let maintenance_report = device_state.wsi.maintenance1.enabled && overlay_report;
+            if overlay_report {
                 state.maintenance_overlay_reported = true;
-                true
-            } else {
-                false
             }
+            (overlay_report, maintenance_report)
         } else {
-            false
+            (false, false)
         };
+        if overlay_report {
+            eprintln!("TuxScaling evidence event=overlay_submitted virtual=1");
+        }
         if maintenance_report {
             eprintln!("TuxScaling evidence event=overlay_submitted maintenance1=1");
         }
@@ -579,10 +579,10 @@ unsafe fn queue_present_inner(
     } else {
         None
     };
-    if let (Some(translation), Some(chain)) = (translation.as_mut(), present_chain.as_ref()) {
-        if let Err(error) = unsafe { stage_present_ids(info, chain, translation) } {
-            return error;
-        }
+    if let (Some(translation), Some(chain)) = (translation.as_mut(), present_chain.as_ref())
+        && let Err(error) = unsafe { stage_present_ids(info, chain, translation) }
+    {
+        return error;
     }
     let overlay_complete = crate::handoff::handoff(|handoff| unsafe {
         let _ = submit_overlay(queue, queue_state, info, handoff);
@@ -629,10 +629,10 @@ unsafe fn queue_present_inner(
                 report_maintenance_present(info, chain);
             }
         }
-        if !present_committed(result) {
-            if let Some(translation) = translation.as_mut() {
-                rollback_translation_present_ids(translation);
-            }
+        if !present_committed(result)
+            && let Some(translation) = translation.as_mut()
+        {
+            rollback_translation_present_ids(translation);
         }
         if result != vk::Result::SUCCESS && !info.p_swapchains.is_null() {
             let presented = unsafe {

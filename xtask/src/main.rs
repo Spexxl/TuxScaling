@@ -7,6 +7,13 @@ use std::{
 };
 
 const VKCUBE_LAYER_EVIDENCE_MARKER: &str = "TuxScaling swapchain:";
+const PORTABLE_WSI_SCENARIOS: [&str; 5] = [
+    "mutable_format",
+    "present_wait_generation",
+    "hdr_replacement",
+    "display_timing",
+    "incompatible_direct",
+];
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct MaintenanceEvidence {
@@ -98,6 +105,240 @@ impl BackendSelection {
             Self::Reference => "reference",
             Self::Fsr314 => "fsr_3_1_4",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WsiExtent {
+    width: u32,
+    height: u32,
+}
+
+fn parse_wsi_extent(value: &str) -> Option<WsiExtent> {
+    let (width, height) = value.split_once('x')?;
+    Some(WsiExtent {
+        width: width.parse().ok()?,
+        height: height.parse().ok()?,
+    })
+}
+
+fn wsi_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+    line.split_whitespace().find_map(|token| {
+        token
+            .strip_prefix(field)
+            .and_then(|value| value.strip_prefix('='))
+    })
+}
+
+fn wsi_positive_field(line: &str, field: &str) -> bool {
+    wsi_field(line, field)
+        .is_some_and(|value| value == "1" || value.parse::<u32>().is_ok_and(|v| v > 0))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WsiCompatibilityEvidence {
+    requested: Option<WsiExtent>,
+    native_target: Option<WsiExtent>,
+    logical_created: Option<WsiExtent>,
+    published_logical: Option<WsiExtent>,
+    published_physical: Option<WsiExtent>,
+    virtual_created: Option<bool>,
+    virtual_active: bool,
+    mutable_format: bool,
+    view_formats: u32,
+    native_published: bool,
+    fsr_dispatch: bool,
+    reconstructed_present: bool,
+    overlay_submitted: bool,
+    scenario_verified: bool,
+    alternate_views: bool,
+    present_wait_current: bool,
+    present_wait_old: bool,
+    present_wait_generations: Vec<u64>,
+    hdr_before: bool,
+    hdr_after: bool,
+    status_query: bool,
+    counter_query: bool,
+    refresh_query: bool,
+    timing_count: bool,
+    timing_data: bool,
+    direct_fallback: bool,
+    direct_fallback_reason: Option<String>,
+    validation_error: bool,
+    unverified: bool,
+    panic: bool,
+    virtual_zero: bool,
+    post_publish_recreation: bool,
+}
+
+fn parse_wsi_compatibility_evidence(stdout: &str, stderr: &str) -> WsiCompatibilityEvidence {
+    let mut evidence = WsiCompatibilityEvidence::default();
+    for line in format!("{stdout}\n{stderr}").lines() {
+        let lowercase = line.to_ascii_lowercase();
+        if lowercase.contains("validation error")
+            || lowercase.contains("vuid-")
+            || lowercase.contains("validation failed")
+        {
+            evidence.validation_error = true;
+        }
+        if lowercase.contains("panic") || lowercase.contains("panicked") {
+            evidence.panic = true;
+        }
+        if lowercase.contains("result=unverified") {
+            evidence.unverified = true;
+        }
+        if lowercase
+            .split_whitespace()
+            .any(|field| field == "virtual=0")
+        {
+            evidence.virtual_zero = true;
+        }
+        let Some(event) = wsi_field(&lowercase, "event") else {
+            continue;
+        };
+        match event {
+            "wsi_scenario_request" => {
+                evidence.requested = wsi_field(&lowercase, "requested").and_then(parse_wsi_extent);
+            }
+            "borderless_target" => {
+                evidence.native_target = wsi_field(&lowercase, "extent").and_then(parse_wsi_extent);
+            }
+            "logical_swapchain_created" => {
+                evidence.logical_created =
+                    wsi_field(&lowercase, "logical").and_then(parse_wsi_extent);
+                evidence.virtual_created =
+                    wsi_field(&lowercase, "virtual").and_then(|value| match value {
+                        "0" => Some(false),
+                        "1" => Some(true),
+                        _ => None,
+                    });
+                evidence.virtual_zero |= wsi_field(&lowercase, "virtual") == Some("0");
+                evidence.mutable_format = wsi_field(&lowercase, "mutable_format") == Some("1");
+                evidence.view_formats = wsi_field(&lowercase, "view_formats")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_default();
+            }
+            "virtual_swapchain_active" => {
+                evidence.virtual_active = true;
+                evidence.published_logical =
+                    wsi_field(&lowercase, "logical").and_then(parse_wsi_extent);
+                evidence.published_physical =
+                    wsi_field(&lowercase, "physical").and_then(parse_wsi_extent);
+            }
+            "native_generation_published" => {
+                evidence.published_logical =
+                    wsi_field(&lowercase, "logical").and_then(parse_wsi_extent);
+                evidence.published_physical =
+                    wsi_field(&lowercase, "physical").and_then(parse_wsi_extent);
+                evidence.native_published = true;
+            }
+            "fsr_dispatch" => {
+                evidence.fsr_dispatch = wsi_field(&lowercase, "backend") == Some("fsr_3_1_4");
+            }
+            "present_wait" => {
+                if wsi_field(&lowercase, "translated") == Some("1")
+                    && let Some(generation) =
+                        wsi_field(&lowercase, "generation").and_then(|value| value.parse().ok())
+                {
+                    evidence.present_wait_generations.push(generation);
+                }
+            }
+            "reconstructed_present" => evidence.reconstructed_present = true,
+            "overlay_submitted" => evidence.overlay_submitted = true,
+            "virtualization_preflight" => {
+                if wsi_field(&lowercase, "result") == Some("direct") {
+                    evidence.direct_fallback = true;
+                    evidence.direct_fallback_reason =
+                        wsi_field(&lowercase, "reason").map(str::to_owned);
+                }
+            }
+            "wsi_scenario" => {
+                evidence.scenario_verified = wsi_field(&lowercase, "result") == Some("verified");
+                evidence.alternate_views = wsi_positive_field(&lowercase, "alternate_views");
+                evidence.present_wait_current =
+                    wsi_positive_field(&lowercase, "present_wait_current");
+                evidence.present_wait_old = wsi_positive_field(&lowercase, "present_wait_old");
+                evidence.hdr_before = wsi_positive_field(&lowercase, "hdr_before");
+                evidence.hdr_after = wsi_positive_field(&lowercase, "hdr_after");
+                let queries = wsi_field(&lowercase, "queries").unwrap_or_default();
+                evidence.status_query = queries.split(',').any(|query| query == "status");
+                evidence.counter_query = queries.split(',').any(|query| query == "counter");
+                evidence.refresh_query = queries.split(',').any(|query| query == "refresh");
+                let timing = wsi_field(&lowercase, "timing").unwrap_or_default();
+                evidence.timing_count = timing.split(',').any(|value| value == "count");
+                evidence.timing_data = timing.split(',').any(|value| value == "data");
+                evidence.post_publish_recreation =
+                    wsi_positive_field(&lowercase, "recreations_after_publish");
+            }
+            _ => {}
+        }
+    }
+    evidence
+}
+
+fn wsi_compatibility_output_is_valid(
+    stdout: &str,
+    stderr: &str,
+    scenario: &str,
+    backend: BackendSelection,
+) -> bool {
+    let evidence = parse_wsi_compatibility_evidence(stdout, stderr);
+    if evidence.validation_error || evidence.panic || evidence.unverified {
+        return false;
+    }
+    if !evidence.scenario_verified {
+        return false;
+    }
+    if scenario == "incompatible_direct" {
+        return evidence.requested.is_some()
+            && evidence.direct_fallback
+            && matches!(
+                evidence.direct_fallback_reason.as_deref(),
+                Some("incompatible_wsi_extension" | "unsupported_pnext")
+            )
+            && evidence.virtual_created == Some(false)
+            && evidence.virtual_zero;
+    }
+    if evidence.virtual_created != Some(true)
+        || evidence.virtual_zero
+        || evidence.direct_fallback
+        || !evidence.virtual_active
+        || evidence.requested.is_none()
+        || evidence.logical_created != evidence.requested
+        || evidence.published_logical != evidence.requested
+        || evidence.native_target != evidence.published_physical
+        || !evidence.native_published
+        || !evidence.reconstructed_present
+        || !evidence.overlay_submitted
+        || evidence.post_publish_recreation
+    {
+        return false;
+    }
+    if backend == BackendSelection::Fsr314 && !evidence.fsr_dispatch {
+        return false;
+    }
+    match scenario {
+        "mutable_format" => {
+            evidence.mutable_format && evidence.view_formats >= 2 && evidence.alternate_views
+        }
+        "present_wait_generation" => {
+            evidence.present_wait_current
+                && evidence.present_wait_old
+                && evidence.present_wait_generations.contains(&0)
+                && evidence
+                    .present_wait_generations
+                    .iter()
+                    .any(|generation| *generation > 0)
+        }
+        "hdr_replacement" => evidence.hdr_before && evidence.hdr_after,
+        "display_timing" => {
+            evidence.status_query
+                && evidence.counter_query
+                && evidence.refresh_query
+                && evidence.timing_count
+                && evidence.timing_data
+        }
+        _ => false,
     }
 }
 
@@ -472,6 +713,141 @@ fn report(result: std::io::Result<Output>) -> bool {
             false
         }
     }
+}
+
+fn command_output_with_timeout(
+    mut command: Command,
+    seconds: u64,
+) -> std::io::Result<(Output, bool)> {
+    let mut child = command.spawn()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::other(
+            "WSI scenario stdout was not captured",
+        ));
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::other(
+            "WSI scenario stderr was not captured",
+        ));
+    };
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.read_to_end(&mut bytes);
+        (result, bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stderr.read_to_end(&mut bytes);
+        (result, bytes)
+    });
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let (status, timed_out) = loop {
+        match child.try_wait()? {
+            Some(status) => break (status, false),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                break (child.wait()?, true);
+            }
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    };
+    let (stdout_result, stdout) = stdout_reader
+        .join()
+        .map_err(|_| std::io::Error::other("WSI scenario stdout reader panicked"))?;
+    let (stderr_result, stderr) = stderr_reader
+        .join()
+        .map_err(|_| std::io::Error::other("WSI scenario stderr reader panicked"))?;
+    stdout_result?;
+    stderr_result?;
+    Ok((
+        Output {
+            status,
+            stdout,
+            stderr,
+        },
+        timed_out,
+    ))
+}
+
+fn run_wsi_compatibility(root: &Path, backend: BackendSelection) -> bool {
+    if !run(
+        "cargo",
+        &[
+            "build",
+            "-p",
+            "tuxscaling-layer",
+            "--lib",
+            "--example",
+            "wsi",
+            "--release",
+        ],
+    ) {
+        return false;
+    }
+    let config = root.join("target/wsi-compatibility.toml");
+    if std::fs::write(
+        &config,
+        generated_config_with_backend("native", 1.0, Some("ultra"), backend),
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let inherited = std::env::var_os("LD_LIBRARY_PATH").unwrap_or_default();
+    let libraries = std::iter::once(root.join("target/release"))
+        .chain(std::env::split_paths(&inherited))
+        .collect::<Vec<_>>();
+    let mut all_passed = true;
+    for scenario in PORTABLE_WSI_SCENARIOS {
+        let mut command = Command::new(root.join("target/release/examples/wsi"));
+        validation(&mut command)
+            .env("VK_ADD_LAYER_PATH", root.join("assets/vulkan-layer"))
+            .env("LD_LIBRARY_PATH", std::env::join_paths(&libraries).unwrap())
+            .env(
+                "VK_INSTANCE_LAYERS",
+                "VK_LAYER_TUXSCALING_overlay:VK_LAYER_KHRONOS_validation",
+            )
+            .env("TUXSCALING_VIEW", "reconstructed")
+            .env("TUXSCALING_CONFIG", &config)
+            .env("TUXSCALING_TEST_SCENARIO", scenario)
+            .env("TUXSCALING_TEST_RESIZE_INTERVAL", "0")
+            .env("TUXSCALING_TEST_FORCE_VIRTUAL", "1")
+            .env("TUXSCALING_TEST_SECONDS", "3")
+            .env("TUXSCALING_TEST_SINGLE_WINDOW", "1")
+            .env("TUXSCALING_TEST_FORCE_TEMPORAL_FAILURE", "0")
+            .env("TUXSCALING_TEST_FORCE_RESIZE_FAILURE", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let result = command_output_with_timeout(command, 10);
+        let (output, timed_out) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("cargo xtask wsi-compatibility: {scenario} could not start: {error}");
+                all_passed = false;
+                continue;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        print!("{stdout}");
+        eprint!("{stderr}");
+        if timed_out {
+            eprintln!("cargo xtask wsi-compatibility: {scenario} result=unverified reason=timeout");
+            all_passed = false;
+            continue;
+        }
+        let valid = output.status.success()
+            && wsi_compatibility_output_is_valid(&stdout, &stderr, scenario, backend);
+        if !valid {
+            eprintln!("cargo xtask wsi-compatibility: {scenario} evidence gate failed");
+            all_passed = false;
+        }
+    }
+    all_passed
 }
 
 fn generated_config(output_resolution: &str, guidance_scale: f32, quality: Option<&str>) -> String {
@@ -896,6 +1272,19 @@ fn main() -> ExitCode {
             }
             result.success()
         }
+        "wsi-compatibility" => {
+            let arguments = std::env::args().skip(2).collect::<Vec<_>>();
+            let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+            let backend = match parse_backend_args(&arguments) {
+                Ok(backend) => backend,
+                Err(error) => {
+                    eprintln!("cargo xtask wsi-compatibility: {error}");
+                    return ExitCode::from(2);
+                }
+            };
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+            run_wsi_compatibility(root, backend)
+        }
         "check" => {
             run("cargo", &["fmt", "--all", "--", "--check"])
                 && run("cargo", &["test", "--workspace"])
@@ -913,7 +1302,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "Usage: cargo xtask <benchmark|check|fidelityfx-check|gpu-check|smoke|vkcube>"
+                "Usage: cargo xtask <benchmark|check|fidelityfx-check|gpu-check|smoke|vkcube|wsi-compatibility>"
             );
             return ExitCode::from(2);
         }
@@ -932,9 +1321,28 @@ mod tests {
         benchmark_output_is_operationally_valid, classify_vkcube_exit, classify_vkcube_output,
         generated_config, maintenance_evidence_complete, maintenance_output_is_valid,
         parse_backend_args, parse_maintenance_evidence, parse_vkcube_args, quality_fixture_passes,
-        vkcube_launch,
+        vkcube_launch, wsi_compatibility_output_is_valid,
     };
     use std::path::Path;
+
+    fn portable_wsi_fixture(scenario: &str) -> String {
+        format!(
+            concat!(
+                "TuxScaling evidence event=wsi_scenario_request scenario={scenario} requested=1280x720\n",
+                "TuxScaling evidence event=borderless_target extent=3440x1440\n",
+                "TuxScaling evidence event=logical_swapchain_created logical_handle=0x1 physical_handle=0x2 logical=1280x720 physical=1280x720 virtual=1 mutable_format=1 view_formats=2 negotiation=negotiating\n",
+                "TuxScaling evidence event=virtual_swapchain_active logical_handle=0x1 logical=1280x720 physical=3440x1440 generation=1\n",
+                "TuxScaling evidence event=native_generation_published logical=1280x720 physical=3440x1440 backend=FSR_3_1_4 images=3\n",
+                "TuxScaling evidence event=fsr_dispatch backend=fsr_3_1_4 logical=1280x720 physical=3440x1440\n",
+                "TuxScaling evidence event=present_wait translated=1 generation=0\n",
+                "TuxScaling evidence event=present_wait translated=1 generation=1\n",
+                "TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=1\n",
+                "TuxScaling evidence event=overlay_submitted scenario={scenario}\n",
+                "TuxScaling evidence event=wsi_scenario scenario={scenario} result=verified alternate_views=1 present_wait_current=1 present_wait_old=1 hdr_before=1 hdr_after=1 queries=status,counter,refresh timing=count,data direct=0 recreations_after_publish=0\n",
+            ),
+            scenario = scenario,
+        )
+    }
 
     #[test]
     fn benchmark_matrix_covers_each_quality_and_presentation_mode() {
@@ -1150,5 +1558,134 @@ mod tests {
         );
         assert!(validation.validation_error);
         assert!(!maintenance_evidence_complete(&validation));
+    }
+
+    #[test]
+    fn wsi_compatibility_accepts_each_portable_scenario() {
+        for scenario in [
+            "mutable_format",
+            "present_wait_generation",
+            "hdr_replacement",
+            "display_timing",
+        ] {
+            let output = portable_wsi_fixture(scenario);
+            assert!(
+                wsi_compatibility_output_is_valid(&output, "", scenario, BackendSelection::Fsr314,),
+                "{scenario}"
+            );
+        }
+    }
+
+    #[test]
+    fn wsi_compatibility_rejects_missing_semantic_fields() {
+        let output = portable_wsi_fixture("hdr_replacement");
+        let output = output.replace("hdr_after=1", "hdr_after=0");
+        assert!(!wsi_compatibility_output_is_valid(
+            &output,
+            "",
+            "hdr_replacement",
+            BackendSelection::Fsr314,
+        ));
+    }
+
+    #[test]
+    fn wsi_compatibility_rejects_virtual_fallback_for_compatible_scenarios() {
+        let output = portable_wsi_fixture("mutable_format").replace("virtual=1", "virtual=0");
+        assert!(!wsi_compatibility_output_is_valid(
+            &output,
+            "",
+            "mutable_format",
+            BackendSelection::Fsr314,
+        ));
+
+        let output = format!(
+            "{}TuxScaling evidence event=virtualization_preflight result=direct reason=unexpected\n",
+            portable_wsi_fixture("mutable_format")
+        );
+        assert!(!wsi_compatibility_output_is_valid(
+            &output,
+            "",
+            "mutable_format",
+            BackendSelection::Fsr314,
+        ));
+    }
+
+    #[test]
+    fn wsi_compatibility_accepts_only_audited_direct_fallback_reasons() {
+        let output = concat!(
+            "TuxScaling evidence event=wsi_scenario_request scenario=incompatible_direct requested=1280x720\n",
+            "TuxScaling evidence event=virtualization_preflight result=direct reason=unsupported_pnext stype=DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR\n",
+            "TuxScaling evidence event=logical_swapchain_created logical_handle=0x2 physical_handle=0x3 logical=3440x1440 physical=3440x1440 virtual=0 mutable_format=0 view_formats=0 negotiation=direct\n",
+            "TuxScaling evidence event=wsi_scenario scenario=incompatible_direct result=verified direct=1\n",
+        );
+        assert!(wsi_compatibility_output_is_valid(
+            output,
+            "",
+            "incompatible_direct",
+            BackendSelection::Fsr314,
+        ));
+
+        let output = output.replace("reason=unsupported_pnext", "reason=unexpected");
+        assert!(!wsi_compatibility_output_is_valid(
+            &output,
+            "",
+            "incompatible_direct",
+            BackendSelection::Fsr314,
+        ));
+    }
+
+    #[test]
+    fn wsi_compatibility_derives_native_extent_instead_of_hard_coding_it() {
+        let output = portable_wsi_fixture("display_timing").replace(
+            "event=borderless_target extent=3440x1440",
+            "event=borderless_target extent=2560x1440",
+        );
+        assert!(!wsi_compatibility_output_is_valid(
+            &output,
+            "",
+            "display_timing",
+            BackendSelection::Fsr314,
+        ));
+    }
+
+    #[test]
+    fn wsi_compatibility_rejects_validation_errors_and_panics() {
+        let output = portable_wsi_fixture("present_wait_generation");
+        for diagnostic in [
+            "Validation Error: VUID-VkSwapchainCreateInfoKHR-pNext-07781",
+            "panic: assertion failed",
+            "VUID-VkPresentInfoKHR-pSwapchains-01296",
+        ] {
+            assert!(!wsi_compatibility_output_is_valid(
+                &output,
+                diagnostic,
+                "present_wait_generation",
+                BackendSelection::Fsr314,
+            ));
+        }
+    }
+
+    #[test]
+    fn wsi_compatibility_accepts_only_an_explicit_incompatible_direct_fallback() {
+        let output = concat!(
+            "TuxScaling evidence event=wsi_scenario_request scenario=incompatible_direct requested=1280x720\n",
+            "TuxScaling evidence event=virtualization_preflight result=direct reason=incompatible_wsi_extension extension=VK_NV_present_barrier\n",
+            "TuxScaling evidence event=logical_swapchain_created logical_handle=0x2 physical_handle=0x3 logical=3440x1440 physical=3440x1440 virtual=0 mutable_format=0 view_formats=0 negotiation=direct\n",
+            "TuxScaling evidence event=wsi_scenario scenario=incompatible_direct result=verified direct=1\n",
+        );
+        assert!(wsi_compatibility_output_is_valid(
+            output,
+            "",
+            "incompatible_direct",
+            BackendSelection::Fsr314,
+        ));
+
+        let output = output.replace("incompatible_wsi_extension", "unexpected");
+        assert!(!wsi_compatibility_output_is_valid(
+            &output,
+            "",
+            "incompatible_direct",
+            BackendSelection::Fsr314,
+        ));
     }
 }

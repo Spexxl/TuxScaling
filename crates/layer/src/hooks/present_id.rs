@@ -8,7 +8,6 @@ pub(crate) struct PresentIdRoute {
 }
 
 impl PresentIdRoute {
-    #[cfg(test)]
     pub(crate) const fn generation(self) -> u64 {
         self.generation
     }

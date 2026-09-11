@@ -474,6 +474,7 @@ pub(super) unsafe fn apply_hdr_metadata(
     let set: vk::PFN_vkSetHdrMetadataEXT = unsafe { std::mem::transmute(proc) };
     let metadata = metadata.to_vk();
     unsafe { set(device, 1, &swapchain, &metadata) };
+    eprintln!("TuxScaling evidence event=hdr_metadata translated=1 reapplied=1");
     true
 }
 
@@ -515,6 +516,10 @@ unsafe extern "system" fn wait_for_present_khr(
             let Some(route) = route else {
                 return vk::Result::ERROR_OUT_OF_DATE_KHR;
             };
+            eprintln!(
+                "TuxScaling evidence event=present_wait translated=1 generation={}",
+                route.generation(),
+            );
             route.physical()
         }
         Err(error) => return error,
@@ -777,6 +782,9 @@ unsafe extern "system" fn set_hdr_metadata_ext(
     for (state, metadata) in virtual_metadata {
         let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
         state.hdr_metadata = Some(metadata);
+    }
+    if !physical_swapchains.is_empty() {
+        eprintln!("TuxScaling evidence event=hdr_metadata translated=1");
     }
 }
 
