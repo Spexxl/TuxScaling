@@ -69,6 +69,16 @@ The layer currently supports SDR swapchains with transfer and sampling usage. On
 
 Unsupported formats and unsupported maintenance create chains select direct presentation before a logical handle is published. Unknown or malformed maintenance data on an already-published logical swapchain returns an explicit Vulkan error and is never silently removed from the forwarded chain. Backend failures remain fail-open through the spatial bypass, and borderless-window cleanup is centralized and idempotent. The maintenance path does not add a queued frame or per-frame idle/fence wait, and the existing egui controls and persistence behavior are unchanged.
 
+### Vulkan WSI compatibility contract
+
+Virtualization eligibility is decided by an audited, semantic WSI registry. Unrelated device extensions are ignored. Translated contracts include mutable-format swapchains and owned view-format lists, incremental present, present IDs and waits, HDR metadata, display timing, display control, swapchain/surface maintenance aliases, and swapchain colorspace. The logical image contract preserves the application format, usage, sharing mode, mutable-image flag, and view-format list; every physical generation receives the owned downstream create contract.
+
+Present IDs are routed to the physical generation that accepted them, including retained generations after native-output replacement. HDR metadata is copied as plain owned data and reapplied before a replacement generation is published. Display-timing queries merge retained-generation results by present ID and preserve Vulkan count/data and `VK_INCOMPLETE` semantics. Application synchronization objects remain application-owned.
+
+Contracts that cannot be translated select direct presentation before a logical handle is published. This includes shared-presentable and display swapchains, external full-screen ownership, low-latency or present-barrier contracts, device-group swapchain structures, unsupported flags, malformed or unknown swapchain-facing `pNext` nodes, and unsupported image contracts. Diagnostics use stable reasons such as `malformed_extension_names`, `incompatible_wsi_extension`, `unsupported_flags`, `unsupported_pnext`, or `unsupported_image_contract`; no valid flag or `pNext` node is silently stripped.
+
+Run `cargo xtask wsi-compatibility --backend fsr_3_1_4` for the portable mutable-format, present-wait, HDR-replacement, display-timing, and incompatible-direct scenarios. It requires a display-backed X11/XWayland session and Vulkan validation; the native extent is read from the active monitor at runtime. If the required display-timing or display-control extension is unavailable, that scenario is reported as `unverified` rather than passed. The current milestone covers X11/XWayland only; native Wayland remains direct presentation.
+
 The default profile is equivalent to:
 
 ```toml

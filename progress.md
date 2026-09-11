@@ -1,17 +1,64 @@
 # Progress
 
-## Recovery 1: Vulkan swapchain compatibility
+## Plan inventory
 
-- Status: Tasks 1-9 are implemented locally. The portable WSI gate is partially verified; `display_timing` remains explicitly unverified because the current RADV device does not expose `VK_GOOGLE_display_timing`. Tasks 10 and 11 have not started.
-- Scope: semantic WSI compatibility decisions, owned swapchain contracts, equivalent logical images, stable logical tokens, physical generations, generation-aware synchronization and metadata routing, and portable X11/XWayland acceptance scenarios.
-- Verified locally: unrelated extensions remain compatible; mutable-format views, present-ID waits across generations, HDR metadata replacement, and audited direct fallback through `DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR` pass under Vulkan validation with FSR 3.1.4. The native-generation failure path now preserves the previous physical generation and runtime when recovery is possible, and destroys only temporary resources.
-- Unverified locally: the display-timing scenario reports `result=unverified reason=extension_unavailable` because `VK_GOOGLE_display_timing` is absent on the selected device. This is an environment limitation, not a successful gate.
-- Commits: `aea0619`, `74f0803`, `eb1acc5`, `3b1adaf`, `0b2213d`, `37039f2`, and `df5932f` implement the compatibility layers; `9ca5c4f` adds the complete-decision parser tests; `aa4678d` adds the portable WSI scenarios and runtime evidence gate; `15f5f5b` removes workspace warnings; the latest corrective commit preserves the old generation during recoverable native-publication failures.
+The Vulkan swapchain compatibility plan contains 11 tasks. Tasks 1-9 are
+implemented locally. Task 10 was executed against the real Steam/Proton path
+but is not accepted, and Task 11 documentation is committed while the final
+audit remains open until every required gate passes.
 
-## Review cycle: Recovery 1 portable WSI acceptance
+## Vulkan swapchain compatibility
 
-- RED: `cargo test -p xtask --bin xtask wsi_compatibility -- --nocapture` initially failed because the evidence validator was absent; the focused direct-reason test also failed before the audited-reason parser was implemented.
-- GREEN: `cargo test -p xtask --bin xtask wsi_compatibility -- --nocapture`, `cargo test --workspace`, `cargo build --workspace`, `cargo clippy --workspace --lib -- -D warnings`, `cargo xtask fidelityfx-check`, `cargo xtask gpu-check --backend fsr_3_1_4`, formatting, and diff checks pass.
-- Display-backed result: `mutable_format`, `present_wait_generation`, `hdr_replacement`, and `incompatible_direct` passed with no validation errors. `display_timing` was executed and returned the required unverified result for the missing driver extension. The exact X11/XWayland `vkcube --wsi xcb --width 1280 --height 720` gate passed its acceptance evidence for 20 seconds after `393c3e1`: logical `1280x720`, physical `3440x1440`, `virtual=1`, FSR 3.1.4 dispatch, reconstructed present, and no validation error or post-publication recreation; exit `124` is the expected timeout.
-- Boundary: the real WSI acceptance is not closed while any required scenario is unverified; the egui/Proton task must remain unopened until a compatible display-timing environment is available.
-- Remote policy: work remains on `main`; no push or remote mutation was performed.
+- Implemented: semantic WSI extension classification, owned swapchain create
+  chains, equivalent mutable-format logical images, stable logical tokens,
+  physical generations, present-ID and wait routing, HDR and timing query
+  translation, maintenance aliases, direct fail-open decisions, and portable
+  X11/XWayland WSI scenarios.
+- Implemented: two-phase native-generation publication. The lifecycle marker
+  blocks Acquire, Present, application recreation, and Destroy while the
+  runtime is detached; downstream Vulkan, image queries, runtime
+  reconfiguration, and rollback run without a layer swapchain mutex. A
+  publication commits only against the captured logical token, surface, and
+  generation.
+- Verified: workspace tests, all-target/all-feature build and Clippy,
+  FidelityFX checks, FSR 3.1.4 GPU checks, formatting, and diff checks.
+- Verified: display-backed `mutable_format`, `present_wait_generation`,
+  `hdr_replacement`, and `incompatible_direct` scenarios under validation.
+- Environment-unverified: `display_timing` reports
+  `result=unverified reason=extension_unavailable` because the selected RADV
+  device does not expose the required display-timing/display-control support.
+- Verified: the exact X11/XWayland vkcube gate on Mutter with logical
+  `1280x720`, physical `3440x1440`, `virtual=1`, FSR 3.1.4 dispatch,
+  reconstructed present, no validation errors, and no post-publication
+  recreation.
+
+## Review cycle: Proton/DXVK acceptance
+
+- The real title was launched through Steam and GE-Proton 11-6 with the
+  validation layer, native output, guidance scale 1, ultra motion quality,
+  FSR 3.1.4, MangoHud disabled, and LSFG disabled.
+- The title visibly rendered its menu in a real XWayland window and reached
+  repeated logical `1280x720` virtual swapchains. It then destroyed those
+  contracts and issued a final `vkCreateSwapchainKHR` with `oldSwapchain=0`
+  and requested `3440x1440`, producing `virtual=0` without a native-generation
+  publication or an upscale dispatch. The required egui interaction was not
+  observed.
+- This is a failed acceptance gate, not a production-code excuse for a game
+  or executable special case. No egui production task was started.
+- The temporary Steam launch configuration was restored byte-for-byte and no
+  remote push was performed.
+
+## Local commits
+
+The implementation remains on `main` and preserves the existing local
+history. The compatibility commits are `aea0619`, `74f0803`, `eb1acc5`,
+`3b1adaf`, `0b2213d`, `37039f2`, `df5932f`, `9ca5c4f`, `aa4678d`, `15f5f5b`,
+and `704aa1b`. The documentation/report commit is created only after its
+checks are verified.
+
+## Boundary
+
+The plan is not globally complete: Task 10 remains unaccepted and the
+display-timing scenario remains environment-unverified. The next valid step
+is to fix or re-run those gates with evidence; no remote publication is
+authorized.
