@@ -456,16 +456,47 @@ fn native_output_target(
         config.output_resolution,
         tuxscaling_config::OutputResolution::Native
     ) {
+        eprintln!(
+            "TuxScaling evidence event=borderless_skipped surface=0x{:x} reason=config_not_native",
+            surface.as_raw(),
+        );
         return None;
     }
     // Pending Wine/Proton Win32 surfaces retry their process-window
     // association here, when the X11 window may exist even though it did not
     // at surface-creation time. Other unknown surfaces stay unresolved.
-    let window = super::surface::surface_window(surface)?;
-    let display = tuxscaling_display::X11Display::connect().ok()?;
-    let target = display.target_for_window(window).ok()?;
+    let Some(window) = super::surface::surface_window(surface) else {
+        eprintln!(
+            "TuxScaling evidence event=borderless_skipped surface=0x{:x} reason=no_window",
+            surface.as_raw(),
+        );
+        return None;
+    };
+    let Ok(display) = tuxscaling_display::X11Display::connect() else {
+        eprintln!(
+            "TuxScaling evidence event=borderless_skipped surface=0x{:x} reason=display_unavailable",
+            surface.as_raw(),
+        );
+        return None;
+    };
+    let Ok(target) = display.target_for_window(window) else {
+        eprintln!(
+            "TuxScaling evidence event=borderless_skipped surface=0x{:x} window={} reason=target_unavailable",
+            surface.as_raw(),
+            window,
+        );
+        return None;
+    };
     let target_extent = target.monitor.rect.extent();
-    target_extent.is_valid().then_some(InitialOutputTarget {
+    if !target_extent.is_valid() {
+        eprintln!(
+            "TuxScaling evidence event=borderless_skipped surface=0x{:x} window={} reason=invalid_target",
+            surface.as_raw(),
+            window,
+        );
+        return None;
+    }
+    Some(InitialOutputTarget {
         window,
         monitor: target.monitor,
     })
