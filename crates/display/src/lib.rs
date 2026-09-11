@@ -374,6 +374,17 @@ pub struct X11Display {
     root: Window,
 }
 
+/// Translates a desired root-relative position into the parent-relative
+/// coordinates that `configure_window` expects. Wine reparents game windows
+/// into frame windows, so root coordinates must be shifted by the parent
+/// origin; for directly parented windows the origin is (0, 0).
+fn parent_relative_position(desired: (i32, i32), parent_origin: (i32, i32)) -> (i32, i32) {
+    (
+        desired.0.saturating_sub(parent_origin.0),
+        desired.1.saturating_sub(parent_origin.1),
+    )
+}
+
 fn select_window_for_pid(windows: &[(u64, Option<u32>, Rect)], pid: u32) -> Option<u64> {
     windows
         .iter()
@@ -623,16 +634,38 @@ impl X11Display {
         self.connection.flush().map_err(operation)
     }
 
+    fn parent_origin(&self, window: u64) -> Result<(i32, i32), DisplayError> {
+        let parent = self
+            .connection
+            .query_tree(window as Window)
+            .map_err(operation)?
+            .reply()
+            .map_err(operation)?
+            .parent;
+        if parent == self.root {
+            return Ok((0, 0));
+        }
+        let translated = self
+            .connection
+            .translate_coordinates(parent, self.root, 0, 0)
+            .map_err(operation)?
+            .reply()
+            .map_err(operation)?;
+        Ok((translated.dst_x.into(), translated.dst_y.into()))
+    }
+
     fn configure_rect(&self, window: u64, rect: Rect) -> Result<(), DisplayError> {
         if !rect.is_valid() {
             return Err(DisplayError::Geometry);
         }
+        let parent_origin = self.parent_origin(window)?;
+        let (x, y) = parent_relative_position((rect.x, rect.y), parent_origin);
         self.connection
             .configure_window(
                 window as Window,
                 &ConfigureWindowAux::new()
-                    .x(rect.x)
-                    .y(rect.y)
+                    .x(x)
+                    .y(y)
                     .width(rect.width)
                     .height(rect.height),
             )
@@ -705,7 +738,7 @@ mod tests {
     use super::{
         BorderlessLease, DisplayTarget, Extent, Monitor, NegotiationFailure,
         PresentationNegotiation, PresentationState, Rect, SurfaceExtent, WindowSnapshot, X11Window,
-        select_monitor, select_window_for_pid,
+        parent_relative_position, select_monitor, select_window_for_pid,
     };
     use std::time::{Duration, Instant};
 
@@ -732,6 +765,13 @@ mod tests {
         assert_eq!(select_window_for_pid(&windows, 9), Some(43));
         assert_eq!(select_window_for_pid(&windows, 7), Some(41));
         assert_eq!(select_window_for_pid(&windows, 10), None);
+    }
+
+    #[test]
+    fn reparented_windows_configure_relative_to_their_parent_origin() {
+        assert_eq!(parent_relative_position((652, 1440), (0, 0)), (652, 1440));
+        assert_eq!(parent_relative_position((652, 1440), (652, 1479)), (0, -39));
+        assert_eq!(parent_relative_position((-1920, 0), (-1920, 0)), (0, 0));
     }
 
     #[test]
