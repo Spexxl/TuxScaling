@@ -71,7 +71,14 @@ unsafe fn create_xlib_surface_inner(
     let create: vk::PFN_vkCreateXlibSurfaceKHR = unsafe { std::mem::transmute(proc) };
     let result = unsafe { create(instance, create_info, allocation_callbacks, surface) };
     if result == vk::Result::SUCCESS && !create_info.is_null() && !surface.is_null() {
-        register_x11_surface(unsafe { *surface }, unsafe { (*create_info).window });
+        let created = unsafe { *surface };
+        let window = unsafe { (*create_info).window };
+        register_x11_surface(created, window);
+        eprintln!(
+            "TuxScaling evidence event=xlib_surface_mapped surface=0x{:x} window={}",
+            created.as_raw(),
+            window,
+        );
     }
     result
 }
@@ -100,7 +107,14 @@ unsafe fn create_xcb_surface_inner(
     let create: vk::PFN_vkCreateXcbSurfaceKHR = unsafe { std::mem::transmute(proc) };
     let result = unsafe { create(instance, create_info, allocation_callbacks, surface) };
     if result == vk::Result::SUCCESS && !create_info.is_null() && !surface.is_null() {
-        register_x11_surface(unsafe { *surface }, unsafe { (*create_info).window as u64 });
+        let created = unsafe { *surface };
+        let window = unsafe { (*create_info).window as u64 };
+        register_x11_surface(created, window);
+        eprintln!(
+            "TuxScaling evidence event=xcb_surface_mapped surface=0x{:x} window={}",
+            created.as_raw(),
+            window,
+        );
     }
     result
 }

@@ -1569,8 +1569,9 @@ unsafe fn create_swapchain_inner(
         .cloned();
     let original = unsafe { &*create_info };
     eprintln!(
-        "TuxScaling evidence event=swapchain_create_request old_swapchain=0x{:x} extent={}x{}",
+        "TuxScaling evidence event=swapchain_create_request old_swapchain=0x{:x} surface=0x{:x} extent={}x{}",
         original.old_swapchain.as_raw(),
+        original.surface.as_raw(),
         original.image_extent.width,
         original.image_extent.height,
     );
