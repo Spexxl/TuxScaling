@@ -24,6 +24,7 @@ use crate::mapping::LogicalSwapchainHandle;
 
 mod acquire;
 mod creation;
+pub(crate) mod display_timing;
 mod lifetime;
 pub(crate) mod maintenance;
 pub(crate) mod present_chain;
@@ -536,21 +537,91 @@ unsafe extern "system" fn get_past_presentation_timing_google(
     count: *mut u32,
     timings: *mut vk::PastPresentationTimingGOOGLE,
 ) -> vk::Result {
-    let physical = match current_physical_swapchain(swapchain) {
-        Ok(physical) => physical,
+    let Some(proc) = (unsafe { device_downstream(device, c"vkGetPastPresentationTimingGOOGLE") })
+    else {
+        return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
+    };
+    let get: vk::PFN_vkGetPastPresentationTimingGOOGLE = unsafe { std::mem::transmute(proc) };
+    let route = match resolve_swapchain_route(swapchain) {
+        Ok(route) => route,
         Err(error) => return error,
     };
-    unsafe {
-        downstream_result(
-            device,
-            c"vkGetPastPresentationTimingGOOGLE",
-            vk::Result::ERROR_EXTENSION_NOT_PRESENT,
-            |proc| {
-                let get: vk::PFN_vkGetPastPresentationTimingGOOGLE = std::mem::transmute(proc);
-                get(device, physical, count, timings)
-            },
-        )
+    let SwapchainRoute::CurrentVirtual { state, .. } = route else {
+        let SwapchainRoute::Direct(physical) = route else {
+            unreachable!("swapchain route was matched above")
+        };
+        return unsafe { get(device, physical, count, timings) };
+    };
+    if count.is_null() {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
+    let capacity = if timings.is_null() {
+        None
+    } else {
+        Some(unsafe { *count as usize })
+    };
+    let handles = {
+        let state = state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.lifecycle.blocks_frame_operations() {
+            return vk::Result::ERROR_OUT_OF_DATE_KHR;
+        }
+        let mut handles = Vec::with_capacity(state.retired_physical_generations.len() + 1);
+        for handle in std::iter::once(state.physical_handle)
+            .chain(state.retired_physical_generations.iter().copied())
+        {
+            if handle != vk::SwapchainKHR::null() && !handles.contains(&handle) {
+                handles.push(handle);
+            }
+        }
+        handles
+    };
+    let mut generations = Vec::with_capacity(handles.len());
+    for physical in handles {
+        let mut generation_count = 0;
+        let result = unsafe {
+            get(
+                device,
+                physical,
+                &mut generation_count,
+                std::ptr::null_mut(),
+            )
+        };
+        if result != vk::Result::SUCCESS && result != vk::Result::INCOMPLETE {
+            return result;
+        }
+        let mut records =
+            vec![vk::PastPresentationTimingGOOGLE::default(); generation_count as usize];
+        if generation_count != 0 {
+            let mut written = generation_count;
+            let result = unsafe { get(device, physical, &mut written, records.as_mut_ptr()) };
+            if result != vk::Result::SUCCESS && result != vk::Result::INCOMPLETE {
+                return result;
+            }
+            records.truncate(written.min(generation_count) as usize);
+        }
+        generations.push(
+            records
+                .into_iter()
+                .map(crate::hooks::display_timing::PresentationTiming::from_vk)
+                .collect::<Vec<_>>(),
+        );
+    }
+    let generations = generations.into_iter().map(Ok).collect::<Vec<_>>();
+    let merged = match crate::hooks::display_timing::merge_timing_results(&generations, capacity) {
+        Ok(merged) => merged,
+        Err(error) => return error,
+    };
+    if timings.is_null() {
+        unsafe { *count = merged.required_count() };
+        return vk::Result::SUCCESS;
+    }
+    unsafe { *count = merged.written_count() };
+    let output =
+        unsafe { std::slice::from_raw_parts_mut(timings, merged.written_count() as usize) };
+    for (destination, source) in output.iter_mut().zip(merged.timings()) {
+        *destination = source.to_vk();
+    }
+    merged.result()
 }
 
 unsafe extern "system" fn get_refresh_cycle_duration_google(
