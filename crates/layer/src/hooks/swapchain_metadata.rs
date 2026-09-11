@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn metadata_is_owned_without_retaining_application_pointers() {
         let mut source = sample_metadata();
-        source.p_next = 1usize as *const std::ffi::c_void;
+        source.p_next = std::ptr::dangling::<std::ffi::c_void>();
         let owned = OwnedHdrMetadata::from_vk(&source);
         let rebuilt = owned.to_vk();
 

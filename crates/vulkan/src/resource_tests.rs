@@ -7,6 +7,7 @@ use std::sync::{
 };
 
 static FAIL: AtomicUsize = AtomicUsize::new(0);
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 static EVENTS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 static OBSERVED_IMAGE_CREATE: Mutex<Option<ImageCreateSnapshot>> = Mutex::new(None);
 
@@ -182,6 +183,8 @@ fn test_memory() -> vk::PhysicalDeviceMemoryProperties {
 
 #[test]
 fn image_create_options_preserve_default_and_queue_sharing_contracts() {
+    let _test_lock = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    FAIL.store(0, Ordering::SeqCst);
     let device = test_device();
     let memory = test_memory();
     let extent = vk::Extent2D {
@@ -230,6 +233,8 @@ fn image_create_options_preserve_default_and_queue_sharing_contracts() {
 
 #[test]
 fn mutable_image_create_options_attach_only_the_owned_format_list() {
+    let _test_lock = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    FAIL.store(0, Ordering::SeqCst);
     let device = test_device();
     let memory = test_memory();
     let formats = [vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB];
@@ -265,6 +270,8 @@ fn mutable_image_create_options_attach_only_the_owned_format_list() {
 
 #[test]
 fn normal_image_creation_never_forwards_swapchain_only_contract_bits() {
+    let _test_lock = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    FAIL.store(0, Ordering::SeqCst);
     let device = test_device();
     let memory = test_memory();
 
@@ -288,6 +295,7 @@ fn normal_image_creation_never_forwards_swapchain_only_contract_bits() {
 }
 #[test]
 fn partial_image_allocations_are_rolled_back() {
+    let _test_lock = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let device = unsafe {
         ash::Device::load_with(
             |name| {

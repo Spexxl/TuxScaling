@@ -1815,14 +1815,13 @@ unsafe fn run() -> WsiOutcome {
                 let handles = chains.iter().map(|chain| chain.handle).collect::<Vec<_>>();
                 let mut results = vec![vk::Result::SUCCESS; chains.len()];
                 let present_ids = present_wait_scenario.then(|| {
-                    let ids = (0..chains.len())
+                    (0..chains.len())
                         .map(|_| {
                             let id = next_present_id;
                             next_present_id += 1;
                             id
                         })
-                        .collect::<Vec<_>>();
-                    ids
+                        .collect::<Vec<_>>()
                 });
                 let present_fences = chains
                     .iter()
