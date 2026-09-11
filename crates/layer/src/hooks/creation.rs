@@ -479,15 +479,28 @@ fn native_output_target(
         );
         return None;
     };
-    let Ok(target) = display.target_for_window(window) else {
+    let Ok(described) = display.describe_window(window) else {
         eprintln!(
-            "TuxScaling evidence event=borderless_skipped surface=0x{:x} window={} reason=target_unavailable",
+            "TuxScaling evidence event=borderless_skipped surface=0x{:x} window={} reason=window_unavailable",
             surface.as_raw(),
             window,
         );
         return None;
     };
-    let target_extent = target.monitor.rect.extent();
+    let Ok(monitor) = display.monitor_for_window(window) else {
+        eprintln!(
+            "TuxScaling evidence event=borderless_skipped surface=0x{:x} window={} rect={}x{}+{}+{} fullscreen={} reason=target_unavailable",
+            surface.as_raw(),
+            window,
+            described.rect.width,
+            described.rect.height,
+            described.rect.x,
+            described.rect.y,
+            described.fullscreen,
+        );
+        return None;
+    };
+    let target_extent = monitor.rect.extent();
     if !target_extent.is_valid() {
         eprintln!(
             "TuxScaling evidence event=borderless_skipped surface=0x{:x} window={} reason=invalid_target",
@@ -496,10 +509,7 @@ fn native_output_target(
         );
         return None;
     }
-    Some(InitialOutputTarget {
-        window,
-        monitor: target.monitor,
-    })
+    Some(InitialOutputTarget { window, monitor })
 }
 
 fn pending_native_logical_extent(
