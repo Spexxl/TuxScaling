@@ -31,6 +31,7 @@ pub(crate) mod present_id;
 mod presentation;
 mod surface;
 pub(crate) mod swapchain_create;
+pub(crate) mod swapchain_metadata;
 pub(crate) mod swapchain_route;
 pub(crate) mod wsi_compatibility;
 use acquire::{
@@ -460,6 +461,20 @@ fn current_physical_swapchain(swapchain: vk::SwapchainKHR) -> Result<vk::Swapcha
     }
 }
 
+pub(super) unsafe fn apply_hdr_metadata(
+    device: vk::Device,
+    swapchain: vk::SwapchainKHR,
+    metadata: crate::hooks::swapchain_metadata::OwnedHdrMetadata,
+) -> bool {
+    let Some(proc) = (unsafe { device_downstream(device, c"vkSetHdrMetadataEXT") }) else {
+        return false;
+    };
+    let set: vk::PFN_vkSetHdrMetadataEXT = unsafe { std::mem::transmute(proc) };
+    let metadata = metadata.to_vk();
+    unsafe { set(device, 1, &swapchain, &metadata) };
+    true
+}
+
 unsafe extern "system" fn get_swapchain_status_khr(
     device: vk::Device,
     swapchain: vk::SwapchainKHR,
@@ -633,30 +648,64 @@ unsafe extern "system" fn set_hdr_metadata_ext(
     swapchains_ptr: *const vk::SwapchainKHR,
     metadata: *const vk::HdrMetadataEXT<'_>,
 ) {
-    if swapchain_count != 0 && swapchains_ptr.is_null() {
+    if crate::hooks::swapchain_metadata::validate_metadata_inputs(
+        swapchain_count,
+        swapchains_ptr,
+        metadata,
+    )
+    .is_err()
+    {
         return;
     }
-    let swapchains_slice =
-        unsafe { std::slice::from_raw_parts(swapchains_ptr, swapchain_count as usize) };
-    let physical_swapchains = swapchains_slice
-        .iter()
-        .map(|swapchain| current_physical_swapchain(*swapchain))
-        .collect::<Result<Vec<_>, _>>();
-    let Ok(physical_swapchains) = physical_swapchains else {
-        return;
-    };
     let Some(proc) = (unsafe { device_downstream(device, c"vkSetHdrMetadataEXT") }) else {
         return;
     };
     let set: vk::PFN_vkSetHdrMetadataEXT = unsafe { std::mem::transmute(proc) };
-    unsafe {
-        set(
-            device,
-            swapchain_count,
-            physical_swapchains.as_ptr(),
-            metadata,
-        )
-    };
+    if swapchain_count == 0 {
+        unsafe { set(device, 0, swapchains_ptr, metadata) };
+        return;
+    }
+    let swapchains_slice =
+        unsafe { std::slice::from_raw_parts(swapchains_ptr, swapchain_count as usize) };
+    let metadata_slice = unsafe { std::slice::from_raw_parts(metadata, swapchain_count as usize) };
+    let mut physical_swapchains = Vec::with_capacity(swapchains_slice.len());
+    let mut virtual_metadata = Vec::new();
+    for (swapchain, metadata) in swapchains_slice.iter().zip(metadata_slice) {
+        match resolve_swapchain_route(*swapchain) {
+            Ok(SwapchainRoute::Direct(physical)) => physical_swapchains.push(physical),
+            Ok(SwapchainRoute::CurrentVirtual {
+                state, physical, ..
+            }) => {
+                physical_swapchains.push(physical);
+                virtual_metadata.push((
+                    state,
+                    crate::hooks::swapchain_metadata::OwnedHdrMetadata::from_vk(metadata),
+                ));
+            }
+            Err(_) => return,
+        }
+    }
+    let owned_metadata = metadata_slice
+        .iter()
+        .map(crate::hooks::swapchain_metadata::OwnedHdrMetadata::from_vk)
+        .collect::<Vec<_>>();
+    let _ = crate::hooks::swapchain_metadata::with_metadata_array(
+        swapchains_slice,
+        &physical_swapchains,
+        &owned_metadata,
+        |physical, metadata| unsafe {
+            set(
+                device,
+                swapchain_count,
+                physical.as_ptr(),
+                metadata.as_ptr(),
+            )
+        },
+    );
+    for (state, metadata) in virtual_metadata {
+        let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+        state.hdr_metadata = Some(metadata);
+    }
 }
 
 #[cfg(test)]

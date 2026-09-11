@@ -122,6 +122,7 @@ pub(crate) struct SwapchainState {
     pub(crate) generation: u64,
     pub(crate) template: Option<SwapchainTemplate>,
     pub(crate) contract: Option<LogicalSwapchainContract>,
+    pub(crate) hdr_metadata: Option<crate::hooks::swapchain_metadata::OwnedHdrMetadata>,
     pub(crate) present_ids: PresentIdHistory,
     pub(crate) lifecycle: ReconfigurationLifecycle,
 }

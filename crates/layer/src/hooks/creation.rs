@@ -535,6 +535,7 @@ struct NativeGenerationSnapshot {
     template: crate::state::SwapchainTemplate,
     contract: LogicalSwapchainContract,
     negotiation: PresentationNegotiation,
+    hdr_metadata: Option<crate::hooks::swapchain_metadata::OwnedHdrMetadata>,
 }
 
 fn begin_native_generation(
@@ -575,6 +576,7 @@ fn begin_native_generation(
     };
     let old_physical = guard.physical_handle;
     let negotiation = guard.negotiation;
+    let hdr_metadata = guard.hdr_metadata;
     drop(guard);
     let snapshot = NativeGenerationSnapshot {
         state,
@@ -583,6 +585,7 @@ fn begin_native_generation(
         template,
         contract,
         negotiation,
+        hdr_metadata,
     };
     Some((snapshot, runtime))
 }
@@ -804,6 +807,23 @@ pub(super) unsafe fn publish_native_generation(
             return false;
         }
     };
+    if let Some(metadata) = snapshot.hdr_metadata {
+        if !unsafe {
+            super::apply_hdr_metadata(device_state.device.handle(), new_physical, metadata)
+        } {
+            unsafe {
+                finish_native_generation_failure(
+                    device_state,
+                    snapshot,
+                    runtime,
+                    new_physical,
+                    &loader,
+                    true,
+                )
+            };
+            return false;
+        }
+    }
     let info = SwapchainInfo {
         format: snapshot.template.image_format,
         color_space: snapshot.template.image_color_space,
@@ -1864,6 +1884,7 @@ unsafe fn create_swapchain_inner(
             generation: 0,
             template,
             contract,
+            hdr_metadata: None,
             present_ids: crate::hooks::present_id::PresentIdHistory::new(),
             lifecycle: crate::recovery::ReconfigurationLifecycle::new(),
         }));
