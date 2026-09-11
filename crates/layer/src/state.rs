@@ -101,11 +101,6 @@ pub(crate) struct X11Surface {
     pub(crate) logical_capabilities: Option<vk::SurfaceCapabilitiesKHR>,
     pub(crate) borderless_lease: Option<tuxscaling_display::BorderlessLease>,
     pub(crate) negotiation: tuxscaling_display::PresentationNegotiation,
-    /// Set once the application adopts a promoted window as its own rendering
-    /// resolution. Promotion stays disabled for this surface afterwards; fresh
-    /// smaller requests virtualize 1:1 without promotion so the overlay and
-    /// handle translation keep working without fighting the application.
-    pub(crate) promotion_suppressed: bool,
 }
 
 pub(crate) struct SwapchainState {
