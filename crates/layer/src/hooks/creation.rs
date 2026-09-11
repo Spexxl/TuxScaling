@@ -34,6 +34,7 @@ fn preflight_logical_image_count(requested: u32) -> Option<usize> {
 unsafe fn allocate_logical_images(
     state: &DeviceState,
     info: &vk::SwapchainCreateInfoKHR<'_>,
+    create_chain: &SwapchainCreateChain,
     count: usize,
 ) -> Result<Vec<tuxscaling_vulkan::Image>, vk::Result> {
     let memory = unsafe {
@@ -57,15 +58,28 @@ unsafe fn allocate_logical_images(
     } else {
         &[]
     };
+    let image_flags = if info
+        .flags
+        .contains(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT)
+    {
+        vk::ImageCreateFlags::MUTABLE_FORMAT
+    } else {
+        vk::ImageCreateFlags::empty()
+    };
+    let options = tuxscaling_vulkan::ImageCreateOptions {
+        image_flags,
+        view_formats: create_chain.view_formats.as_deref().unwrap_or(&[]),
+        queue_family_indices: queue_families,
+    };
     (0..count)
         .map(|_| unsafe {
-            tuxscaling_vulkan::Image::with_sharing(
+            tuxscaling_vulkan::Image::with_options(
                 &state.device,
                 &memory,
                 info.image_extent,
                 info.image_format,
                 usage,
-                queue_families,
+                &options,
             )
         })
         .collect()
@@ -1401,13 +1415,8 @@ unsafe fn create_swapchain_inner(
         | vk::ImageUsageFlags::TRANSFER_DST
         | vk::ImageUsageFlags::COLOR_ATTACHMENT
         | vk::ImageUsageFlags::STORAGE;
-    let maintenance_create_is_supported = state.as_ref().is_some_and(|state| {
-        if state.wsi.maintenance1.enabled {
-            unsafe { SwapchainCreateChain::from_create_info(original) }.is_ok()
-        } else {
-            original.p_next.is_null() && original.flags.is_empty()
-        }
-    });
+    let maintenance_create_is_supported =
+        unsafe { SwapchainCreateChain::from_create_info(original) }.is_ok();
     if state
         .as_ref()
         .is_some_and(|state| state.wsi.maintenance1.enabled)
@@ -1458,6 +1467,21 @@ unsafe fn create_swapchain_inner(
                     )
             })
     });
+    let logical_create_chain = if virtual_preflight_eligible {
+        match unsafe { SwapchainCreateChain::from_create_info(original) } {
+            Ok(chain) => Some(chain),
+            Err(error) => {
+                eprintln!(
+                    "TuxScaling evidence event=virtualization_preflight result=direct reason={}",
+                    error.reason()
+                );
+                virtual_preflight_eligible = false;
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut preallocated_virtual_images = None;
     if virtual_preflight_eligible {
         if let Some(count) = preflight_logical_image_count(original.min_image_count) {
@@ -1465,6 +1489,9 @@ unsafe fn create_swapchain_inner(
                 allocate_logical_images(
                     state.as_ref().expect("eligible state must exist"),
                     original,
+                    logical_create_chain
+                        .as_ref()
+                        .expect("eligible create chain must exist"),
                     count,
                 )
             } {

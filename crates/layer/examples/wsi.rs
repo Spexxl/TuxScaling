@@ -23,7 +23,8 @@ fn game_extent_for(scenario: Option<&str>) -> vk::Extent2D {
     match scenario {
         Some(
             "upscale" | "windowed_promote" | "already_borderless" | "monitor_origin"
-            | "promotion_failure" | "temporal_failure" | "guidance_resolve" | "maintenance1",
+            | "promotion_failure" | "temporal_failure" | "guidance_resolve" | "maintenance1"
+            | "mutable_format",
         ) => vk::Extent2D {
             width: 1280,
             height: 720,
@@ -207,6 +208,34 @@ struct MaintenanceScaling {
     behavior: vk::PresentScalingFlagsEXT,
     gravity_x: vk::PresentGravityFlagsEXT,
     gravity_y: vk::PresentGravityFlagsEXT,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MutableFormatPair {
+    base: vk::Format,
+    alternate: vk::Format,
+    color_space: vk::ColorSpaceKHR,
+}
+
+fn choose_mutable_format_pair(formats: &[vk::SurfaceFormatKHR]) -> Option<MutableFormatPair> {
+    for (base, alternate) in [
+        (vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB),
+        (vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_SRGB),
+    ] {
+        let Some(base_format) = formats.iter().find(|format| format.format == base) else {
+            continue;
+        };
+        if formats.iter().any(|format| {
+            format.format == alternate && format.color_space == base_format.color_space
+        }) {
+            return Some(MutableFormatPair {
+                base,
+                alternate,
+                color_space: base_format.color_space,
+            });
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy)]
@@ -413,6 +442,7 @@ mod tests {
             "promotion_failure",
             "temporal_failure",
             "guidance_resolve",
+            "mutable_format",
         ] {
             assert!(
                 super::game_extent_for(Some(scenario)).width > 0,
@@ -431,6 +461,29 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn mutable_format_pair_requires_two_surface_formats_with_one_color_space() {
+        let formats = [
+            ash::vk::SurfaceFormatKHR {
+                format: ash::vk::Format::B8G8R8A8_UNORM,
+                color_space: ash::vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            },
+            ash::vk::SurfaceFormatKHR {
+                format: ash::vk::Format::B8G8R8A8_SRGB,
+                color_space: ash::vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            },
+        ];
+        assert_eq!(
+            super::choose_mutable_format_pair(&formats),
+            Some(super::MutableFormatPair {
+                base: ash::vk::Format::B8G8R8A8_UNORM,
+                alternate: ash::vk::Format::B8G8R8A8_SRGB,
+                color_space: ash::vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            })
+        );
+        assert!(super::choose_mutable_format_pair(&formats[..1]).is_none());
+    }
 }
 
 struct Chain {
@@ -443,6 +496,7 @@ struct Chain {
     present_fence: vk::Fence,
     present_mode: vk::PresentModeKHR,
     maintenance: Option<MaintenanceConfig>,
+    mutable_formats: Option<MutableFormatPair>,
     command: vk::CommandBuffer,
 }
 
@@ -458,6 +512,7 @@ unsafe fn replace(
     chain: &mut Chain,
     extent: vk::Extent2D,
     maintenance: Option<&MaintenanceConfig>,
+    mutable_formats: Option<MutableFormatPair>,
 ) {
     unsafe {
         context.device.device_wait_idle().unwrap();
@@ -469,13 +524,28 @@ unsafe fn replace(
             .surfaces
             .get_physical_device_surface_formats(context.physical, chain.surface)
             .unwrap();
-        let format = formats
-            .iter()
-            .find(|f| {
-                f.format == vk::Format::B8G8R8A8_UNORM
-                    && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
-            })
-            .unwrap();
+        let selected_format = mutable_formats
+            .map_or_else(
+                || {
+                    formats
+                        .iter()
+                        .find(|f| {
+                            f.format == vk::Format::B8G8R8A8_UNORM
+                                && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+                        })
+                        .copied()
+                },
+                |pair| {
+                    Some(vk::SurfaceFormatKHR {
+                        format: pair.base,
+                        color_space: pair.color_space,
+                    })
+                },
+            )
+            .expect("surface must expose the selected swapchain format");
+        let mutable_formats = mutable_formats
+            .map(|pair| [pair.base, pair.alternate])
+            .map(|formats| formats.to_vec());
         let promotion_failure_recreate = std::env::var("TUXSCALING_TEST_SCENARIO").ok().as_deref()
             == Some("promotion_failure")
             && std::env::var("TUXSCALING_TEST_FORCE_RESIZE_FAILURE")
@@ -514,8 +584,8 @@ unsafe fn replace(
         let mut info = vk::SwapchainCreateInfoKHR::default()
             .surface(chain.surface)
             .min_image_count(count)
-            .image_format(format.format)
-            .image_color_space(format.color_space)
+            .image_format(selected_format.format)
+            .image_color_space(selected_format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
             .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST)
@@ -530,7 +600,11 @@ unsafe fn replace(
             .flags(
                 maintenance.map_or(vk::SwapchainCreateFlagsKHR::empty(), |_| {
                     vk::SwapchainCreateFlagsKHR::DEFERRED_MEMORY_ALLOCATION_EXT
-                }),
+                }) | mutable_formats
+                    .as_ref()
+                    .map_or(vk::SwapchainCreateFlagsKHR::empty(), |_| {
+                        vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT
+                    }),
             );
         let mut modes_info = maintenance.map(|maintenance| {
             vk::SwapchainPresentModesCreateInfoEXT::default()
@@ -549,6 +623,12 @@ unsafe fn replace(
         }
         if let Some(scaling_info) = scaling_info.as_mut() {
             info = info.push_next(scaling_info);
+        }
+        let mut format_list = mutable_formats
+            .as_ref()
+            .map(|formats| vk::ImageFormatListCreateInfo::default().view_formats(formats));
+        if let Some(format_list) = format_list.as_mut() {
+            info = info.push_next(format_list);
         }
         let new = context.swapchains.create_swapchain(&info, None).unwrap();
         for s in chain.ready.drain(..) {
@@ -596,7 +676,48 @@ unsafe fn replace(
         chain.present_mode =
             maintenance.map_or(vk::PresentModeKHR::FIFO, MaintenanceConfig::present_mode);
         chain.maintenance = maintenance.cloned();
+        chain.mutable_formats = mutable_formats.map(|formats| MutableFormatPair {
+            base: formats[0],
+            alternate: formats[1],
+            color_space: selected_format.color_space,
+        });
     }
+}
+
+unsafe fn validate_alternate_views(
+    device: &ash::Device,
+    images: &[vk::Image],
+    pair: MutableFormatPair,
+) -> Result<(), vk::Result> {
+    let mut views = Vec::with_capacity(images.len());
+    for &image in images {
+        let mut usage = vk::ImageViewUsageCreateInfo::default().usage(
+            vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        );
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(pair.alternate)
+            .subresource_range(tuxscaling_vulkan::color_range())
+            .push_next(&mut usage);
+        let view = match unsafe { device.create_image_view(&view_info, None) } {
+            Ok(view) => view,
+            Err(error) => {
+                for view in views {
+                    unsafe { device.destroy_image_view(view, None) };
+                }
+                return Err(error);
+            }
+        };
+        views.push(view);
+    }
+    for view in views {
+        unsafe { device.destroy_image_view(view, None) };
+    }
+    Ok(())
 }
 
 unsafe fn release_swapchain_image(
@@ -666,11 +787,38 @@ unsafe fn acquire_for_release(
 }
 
 fn main() {
-    unsafe {
-        run();
+    if matches!(unsafe { run() }, WsiOutcome::EnvironmentSkip) {
+        std::process::exit(77);
     }
 }
-unsafe fn run() {
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WsiOutcome {
+    Passed,
+    EnvironmentSkip,
+}
+
+unsafe fn finish_environment_skip(
+    display: *mut c_void,
+    instance: &ash::Instance,
+    surface_loader: &ash::khr::surface::Instance,
+    surfaces: &[vk::SurfaceKHR],
+    windows: &[c_ulong],
+    reason: &str,
+) -> WsiOutcome {
+    eprintln!("TuxScaling WSI environment skip scenario=mutable_format reason={reason}");
+    for &surface in surfaces {
+        unsafe { surface_loader.destroy_surface(surface, None) };
+    }
+    unsafe { instance.destroy_instance(None) };
+    for &window in windows {
+        unsafe { XDestroyWindow(display, window) };
+    }
+    unsafe { XCloseDisplay(display) };
+    WsiOutcome::EnvironmentSkip
+}
+
+unsafe fn run() -> WsiOutcome {
     unsafe {
         let display = XOpenDisplay(std::ptr::null());
         assert!(!display.is_null(), "an X11 or Xwayland display is required");
@@ -686,6 +834,7 @@ unsafe fn run() {
         let scenario = std::env::var("TUXSCALING_TEST_SCENARIO").ok();
         let scenario_active = scenario.is_some();
         let maintenance_scenario = scenario.as_deref() == Some("maintenance1");
+        let mutable_scenario = scenario.as_deref() == Some("mutable_format");
         let borderless_monitor = starts_borderless().then(native_monitor_rect).flatten();
         let placement_monitor =
             borderless_monitor.or_else(|| maintenance_scenario.then(native_monitor_rect).flatten());
@@ -812,12 +961,70 @@ unsafe fn run() {
             })
             .collect::<Vec<_>>();
         let physical = instance.enumerate_physical_devices().unwrap()[0];
+        let device_properties = instance
+            .enumerate_device_extension_properties(physical)
+            .unwrap();
+        let mutable_formats = if mutable_scenario {
+            if device_extension_version(
+                &device_properties,
+                ash::khr::swapchain_mutable_format::NAME,
+            )
+            .is_none()
+            {
+                return finish_environment_skip(
+                    display,
+                    &instance,
+                    &surface_loader,
+                    &surfaces,
+                    &windows,
+                    "VK_KHR_swapchain_mutable_format is unavailable",
+                );
+            }
+            let mut selected = None;
+            for &surface in &surfaces {
+                let formats =
+                    match surface_loader.get_physical_device_surface_formats(physical, surface) {
+                        Ok(formats) => formats,
+                        Err(error) => {
+                            return finish_environment_skip(
+                                display,
+                                &instance,
+                                &surface_loader,
+                                &surfaces,
+                                &windows,
+                                &format!("surface format query failed: {error:?}"),
+                            );
+                        }
+                    };
+                let Some(pair) = choose_mutable_format_pair(&formats) else {
+                    return finish_environment_skip(
+                        display,
+                        &instance,
+                        &surface_loader,
+                        &surfaces,
+                        &windows,
+                        "surface does not expose a compatible UNORM/SRGB pair",
+                    );
+                };
+                if selected.is_some_and(|selected| selected != pair) {
+                    return finish_environment_skip(
+                        display,
+                        &instance,
+                        &surface_loader,
+                        &surfaces,
+                        &windows,
+                        "surfaces expose different mutable format pairs",
+                    );
+                }
+                selected = Some(pair);
+            }
+            selected
+        } else {
+            None
+        };
         let maintenance_flavor = if maintenance_scenario {
-            let properties = instance
-                .enumerate_device_extension_properties(physical)
-                .unwrap();
             let flavor = maintenance1_flavor(
-                &properties,
+                &device_properties,
                 surface_maintenance_name.expect("surface maintenance name is selected"),
             )
             .expect("maintenance1 scenario requires EXT or KHR revision 1");
@@ -878,6 +1085,9 @@ unsafe fn run() {
             .queue_family_index(family)
             .queue_priorities(&priorities[..n])];
         let mut device_extensions = vec![ash::khr::swapchain::NAME.as_ptr()];
+        if mutable_scenario {
+            device_extensions.push(ash::khr::swapchain_mutable_format::NAME.as_ptr());
+        }
         if let Some(flavor) = maintenance_flavor {
             device_extensions.push(flavor.name().as_ptr());
         }
@@ -948,6 +1158,7 @@ unsafe fn run() {
                 present_fence: vk::Fence::null(),
                 present_mode: vk::PresentModeKHR::FIFO,
                 maintenance: None,
+                mutable_formats: None,
                 command: commands[i],
             })
             .collect::<Vec<_>>();
@@ -970,8 +1181,28 @@ unsafe fn run() {
                     )
                     .unwrap();
             }
-            replace(&replacement, chain, game_extent(), maintenance.as_ref());
+            replace(
+                &replacement,
+                chain,
+                game_extent(),
+                maintenance.as_ref(),
+                mutable_formats,
+            );
         }
+        let mutable_views_validated = if let Some(pair) = mutable_formats {
+            assert_eq!(
+                std::env::var("TUXSCALING_VIEW").ok().as_deref(),
+                Some("reconstructed"),
+                "mutable format scenario requires reconstructed presentation"
+            );
+            for chain in &chains {
+                validate_alternate_views(&device, &chain.images, pair)
+                    .expect("alternate mutable image views must be compatible");
+            }
+            true
+        } else {
+            false
+        };
         if maintenance_scenario {
             // The layer requests fullscreen during the first swapchain create.
             // Repeat the monitor selection after that request so the window
@@ -1044,7 +1275,13 @@ unsafe fn run() {
             maintenance_released = true;
 
             let maintenance = chain.maintenance.clone();
-            replace(&replacement, chain, game_extent(), maintenance.as_ref());
+            replace(
+                &replacement,
+                chain,
+                game_extent(),
+                maintenance.as_ref(),
+                mutable_formats,
+            );
             maintenance_recreated = true;
         }
         let present = swapchains.fp().queue_present_khr;
@@ -1077,7 +1314,13 @@ unsafe fn run() {
                 XFlush(display);
                 for chain in &mut chains {
                     let maintenance = chain.maintenance.clone();
-                    replace(&replacement, chain, extent, maintenance.as_ref());
+                    replace(
+                        &replacement,
+                        chain,
+                        extent,
+                        maintenance.as_ref(),
+                        mutable_formats,
+                    );
                 }
                 resizes += 1;
             }
@@ -1115,6 +1358,7 @@ unsafe fn run() {
                                 height: 300,
                             },
                             maintenance.as_ref(),
+                            mutable_formats,
                         );
                         swapchains
                             .acquire_next_image(
@@ -1247,6 +1491,13 @@ unsafe fn run() {
                 "maintenance scenario did not group enough presents"
             );
         }
+        if mutable_scenario {
+            assert!(mutable_views_validated);
+            assert!(frame > 0, "mutable format scenario did not present a frame");
+            eprintln!(
+                "TuxScaling WSI evidence scenario=mutable_format alternate_views=1 reconstructed=1"
+            );
+        }
         device.device_wait_idle().unwrap();
         for chain in chains {
             for s in chain.ready {
@@ -1285,5 +1536,6 @@ unsafe fn run() {
         if resize_interval > 0 {
             assert!(resizes > 0);
         }
+        WsiOutcome::Passed
     }
 }

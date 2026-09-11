@@ -13,6 +13,13 @@ pub fn memory_type(
         .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ImageCreateOptions<'a> {
+    pub image_flags: vk::ImageCreateFlags,
+    pub view_formats: &'a [vk::Format],
+    pub queue_family_indices: &'a [u32],
+}
+
 pub struct Image {
     device: ash::Device,
     pub handle: vk::Image,
@@ -29,7 +36,16 @@ impl Image {
         format: vk::Format,
         usage: vk::ImageUsageFlags,
     ) -> Result<Self, vk::Result> {
-        unsafe { Self::with_sharing(device, memory, extent, format, usage, &[]) }
+        unsafe {
+            Self::with_options(
+                device,
+                memory,
+                extent,
+                format,
+                usage,
+                &ImageCreateOptions::default(),
+            )
+        }
     }
 
     pub unsafe fn with_sharing(
@@ -40,6 +56,29 @@ impl Image {
         usage: vk::ImageUsageFlags,
         queue_families: &[u32],
     ) -> Result<Self, vk::Result> {
+        unsafe {
+            Self::with_options(
+                device,
+                memory,
+                extent,
+                format,
+                usage,
+                &ImageCreateOptions {
+                    queue_family_indices: queue_families,
+                    ..Default::default()
+                },
+            )
+        }
+    }
+
+    pub unsafe fn with_options(
+        device: &ash::Device,
+        memory: &vk::PhysicalDeviceMemoryProperties,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        options: &ImageCreateOptions<'_>,
+    ) -> Result<Self, vk::Result> {
         let mut image = Self {
             device: device.clone(),
             handle: vk::Image::null(),
@@ -48,26 +87,9 @@ impl Image {
             extent,
             format,
         };
-        let info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(format)
-            .extent(vk::Extent3D {
-                width: extent.width,
-                height: extent.height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(usage)
-            .sharing_mode(if queue_families.is_empty() {
-                vk::SharingMode::EXCLUSIVE
-            } else {
-                vk::SharingMode::CONCURRENT
-            })
-            .queue_family_indices(queue_families);
-        image.handle = unsafe { device.create_image(&info, None) }?;
+        image.handle = with_image_create_info(format, extent, usage, options, |info| unsafe {
+            device.create_image(info, None)
+        })?;
         let r = unsafe { device.get_image_memory_requirements(image.handle) };
         image.memory = unsafe {
             device.allocate_memory(
@@ -94,6 +116,41 @@ impl Image {
         }?;
         Ok(image)
     }
+}
+
+fn with_image_create_info<R>(
+    format: vk::Format,
+    extent: vk::Extent2D,
+    usage: vk::ImageUsageFlags,
+    options: &ImageCreateOptions<'_>,
+    invoke: impl FnOnce(&vk::ImageCreateInfo<'_>) -> R,
+) -> R {
+    let mut format_list = (!options.view_formats.is_empty())
+        .then(|| vk::ImageFormatListCreateInfo::default().view_formats(options.view_formats));
+    let mut info = vk::ImageCreateInfo::default()
+        .flags(options.image_flags)
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(usage)
+        .sharing_mode(if options.queue_family_indices.is_empty() {
+            vk::SharingMode::EXCLUSIVE
+        } else {
+            vk::SharingMode::CONCURRENT
+        })
+        .queue_family_indices(options.queue_family_indices);
+    if let Some(format_list) = format_list.as_mut() {
+        info.p_next = (format_list as *mut vk::ImageFormatListCreateInfo<'_>).cast();
+    }
+    invoke(&info)
 }
 impl Drop for Image {
     fn drop(&mut self) {
