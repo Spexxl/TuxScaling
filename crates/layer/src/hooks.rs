@@ -5,7 +5,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Mutex},
 };
-use tuxscaling_overlay_vulkan::SwapchainInfo;
+use tuxscaling_overlay_vulkan::{InputRouteConfig, SwapchainInfo};
 use tuxscaling_runtime::{
     SwapchainImages, SwapchainRuntime as OverlaySwapchain, SwapchainRuntimeCreateInfo,
 };

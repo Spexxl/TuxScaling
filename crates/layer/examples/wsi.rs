@@ -255,6 +255,17 @@ unsafe extern "C" {
     fn XDestroyWindow(display: *mut c_void, window: c_ulong) -> c_int;
     fn XFlush(display: *mut c_void) -> c_int;
     fn XCloseDisplay(display: *mut c_void) -> c_int;
+    fn XWarpPointer(
+        display: *mut c_void,
+        source: c_ulong,
+        destination: c_ulong,
+        source_x: c_int,
+        source_y: c_int,
+        source_width: c_uint,
+        source_height: c_uint,
+        destination_x: c_int,
+        destination_y: c_int,
+    ) -> c_int;
 }
 
 fn parse_frame_limit(value: Option<&str>) -> Option<u32> {
@@ -269,6 +280,19 @@ fn single_window(value: Option<&str>) -> bool {
 
 fn requires_grouped_presents(window_count: usize) -> bool {
     window_count > 1
+}
+
+fn scripted_cursor_position(frame: u32, extent: vk::Extent2D) -> [f32; 2] {
+    let phase = (frame % 120) as f32 / 119.0;
+    let sweep = if (frame / 120).is_multiple_of(2) {
+        phase
+    } else {
+        1.0 - phase
+    };
+    [
+        extent.width as f32 * (0.15 + 0.7 * sweep),
+        extent.height as f32 * (0.2 + 0.6 * (1.0 - sweep)),
+    ]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -605,6 +629,21 @@ mod tests {
                 height: 1080,
             }
         );
+    }
+
+    #[test]
+    fn scripted_cursor_stays_inside_the_logical_game_extent() {
+        let extent = ash::vk::Extent2D {
+            width: 1280,
+            height: 720,
+        };
+        let first = super::scripted_cursor_position(0, extent);
+        let later = super::scripted_cursor_position(60, extent);
+        for position in [first, later] {
+            assert!((0.0..=extent.width as f32).contains(&position[0]));
+            assert!((0.0..=extent.height as f32).contains(&position[1]));
+        }
+        assert_ne!(first, later);
     }
 
     #[test]
@@ -1704,7 +1743,7 @@ unsafe fn run() -> WsiOutcome {
                 );
             }
         }
-        let presenter_native = if presenter_scenario {
+        let presenter_input_windows = if presenter_scenario {
             let native = native_monitor_rect().expect("presenter scenario needs a RandR monitor");
             assert_eq!(
                 [native.2, native.3],
@@ -1717,17 +1756,23 @@ unsafe fn run() -> WsiOutcome {
                 windows.len(),
                 "each game surface must own one presenter window"
             );
-            for (_, rect) in presenter_windows {
+            for (_, rect) in &presenter_windows {
                 assert_eq!(
                     (rect.x, rect.y, rect.width, rect.height),
                     (native.0, native.1, native.2, native.3),
                     "presenter window must cover the selected native monitor"
                 );
             }
-            Some(native)
+            Some(
+                presenter_windows
+                    .into_iter()
+                    .map(|(window, _)| window)
+                    .collect::<Vec<_>>(),
+            )
         } else {
             None
         };
+        let presenter_native = presenter_scenario.then(native_monitor_rect).flatten();
         let seconds = std::env::var("TUXSCALING_TEST_SECONDS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -1835,6 +1880,39 @@ unsafe fn run() -> WsiOutcome {
         while frame_limit.is_some_and(|limit| frame < limit)
             || frame_limit.is_none() && start.elapsed() < Duration::from_secs(seconds)
         {
+            if let (Some(presenter_windows), Some((_, _, output_width, output_height))) =
+                (presenter_input_windows.as_ref(), presenter_native)
+            {
+                let logical = scripted_cursor_position(frame, game_extent());
+                let logical_extent = game_extent();
+                for &presenter_window in presenter_windows.iter().take(chains.len()) {
+                    let x = (logical[0] * output_width as f32 / logical_extent.width as f32).round()
+                        as c_int;
+                    let y = (logical[1] * output_height as f32 / logical_extent.height as f32)
+                        .round() as c_int;
+                    XWarpPointer(
+                        display,
+                        0,
+                        presenter_window as c_ulong,
+                        0,
+                        0,
+                        0,
+                        0,
+                        x.clamp(0, output_width.saturating_sub(1) as c_int),
+                        y.clamp(0, output_height.saturating_sub(1) as c_int),
+                    );
+                }
+                if frame == 0 {
+                    eprintln!(
+                        "TuxScaling evidence event=scripted_presenter_input logical={}x{} output={}x{} route=absolute",
+                        logical[0].round(),
+                        logical[1].round(),
+                        output_width,
+                        output_height,
+                    );
+                }
+                XFlush(display);
+            }
             let promotion_failure_finished =
                 std::env::var("TUXSCALING_TEST_SCENARIO").ok().as_deref()
                     == Some("promotion_failure")

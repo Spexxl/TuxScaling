@@ -238,6 +238,7 @@ pub(crate) struct SwapchainState {
     pub(crate) physical_images: Vec<vk::Image>,
     pub(crate) retired_physical_generations: Vec<vk::SwapchainKHR>,
     pub(crate) maintenance_overlay_reported: bool,
+    pub(crate) input_route_reported: bool,
     pub(crate) maintenance_present_reported: bool,
     pub(crate) maintenance_release_reported: bool,
     pub(crate) generation: u64,
@@ -375,6 +376,14 @@ pub(crate) fn presenter_surface(game_surface: vk::SurfaceKHR) -> Option<vk::Surf
         .unwrap_or_else(|error| error.into_inner())
         .get(&game_surface)
         .map(|state| state.surface)
+}
+
+pub(crate) fn presenter_window(game_surface: vk::SurfaceKHR) -> Option<u64> {
+    presenter_states()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&game_surface)
+        .map(|state| u64::from(state.window.window()))
 }
 
 pub(crate) fn begin_surface_recreation(surface: vk::SurfaceKHR) -> bool {

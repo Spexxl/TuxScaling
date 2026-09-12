@@ -513,21 +513,33 @@ unsafe fn submit_overlay(
             }
             break;
         }
-        let (overlay_report, maintenance_report) = if let Ok(mut state) = state.lock()
+        let (overlay_report, input_route_report, maintenance_report) = if let Ok(mut state) =
+            state.lock()
             && let Some(overlay) = state.overlay.as_mut()
         {
             overlay.submitted();
             let overlay_report = state.mapping.is_some() && !state.maintenance_overlay_reported;
+            let input_route_report = state.present_surface.is_some() && !state.input_route_reported;
             let maintenance_report = device_state.wsi.maintenance1.enabled && overlay_report;
             if overlay_report {
                 state.maintenance_overlay_reported = true;
             }
-            (overlay_report, maintenance_report)
+            if input_route_report {
+                state.input_route_reported = true;
+            }
+            (overlay_report, input_route_report, maintenance_report)
         } else {
-            (false, false)
+            (false, false, false)
         };
         if overlay_report {
             eprintln!("TuxScaling evidence event=overlay_submitted virtual=1");
+        }
+        if input_route_report && let Ok(state) = state.lock() {
+            eprintln!(
+                "TuxScaling evidence event=input_route_active game_surface=0x{:x} presenter_surface=0x{:x} mode=absolute bars=reject_motion_clamp_button",
+                state.game_surface.as_raw(),
+                state.present_surface.map_or(0, |surface| surface.as_raw()),
+            );
         }
         if maintenance_report {
             eprintln!("TuxScaling evidence event=overlay_submitted maintenance1=1");

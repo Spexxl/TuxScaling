@@ -1,5 +1,5 @@
 use std::{thread, time::Duration};
-use tuxscaling_input::X11Input;
+use tuxscaling_input::{InputRoute, PointerViewport, X11Input};
 use x11rb::{connection::Connection, protocol::xproto::*};
 
 #[test]
@@ -48,7 +48,17 @@ fn keyboard_and_pointer_work_after_resize_and_release_on_close() {
         .position(|keys| keys.first() == Some(&0xff63))
         .unwrap() as u8
         + setup.min_keycode;
-    let mut input = X11Input::connect(window.into()).unwrap();
+    let mut input = X11Input::connect(InputRoute::new(
+        window.into(),
+        window.into(),
+        [640, 480],
+        [640, 480],
+        PointerViewport {
+            offset: [0.0, 0.0],
+            extent: [640.0, 480.0],
+        },
+    ))
+    .unwrap();
     let key = |kind| {
         connection
             .send_event(

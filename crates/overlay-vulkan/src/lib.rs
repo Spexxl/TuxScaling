@@ -1,7 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 use ash::vk;
 use egui_ash_renderer::{Options, Renderer};
-use tuxscaling_input::X11Input;
+use tuxscaling_input::{InputRoute, PointerViewport, X11Input};
 use tuxscaling_overlay::{FrameDiagnostics, OverlayFrame};
 
 pub const CRATE_NAME: &str = "tuxscaling-overlay-vulkan";
@@ -11,6 +11,89 @@ pub struct SwapchainInfo {
     pub format: vk::Format,
     pub color_space: vk::ColorSpaceKHR,
     pub extent: vk::Extent2D,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InputRouteConfig {
+    pub event_window: u64,
+    pub game_window: u64,
+    pub output_extent: [u32; 2],
+    pub game_extent: [u32; 2],
+    pub viewport: PointerViewport,
+}
+
+impl InputRouteConfig {
+    pub const fn new(
+        event_window: u64,
+        game_window: u64,
+        output_extent: [u32; 2],
+        game_extent: [u32; 2],
+        viewport: PointerViewport,
+    ) -> Self {
+        Self {
+            event_window,
+            game_window,
+            output_extent,
+            game_extent,
+            viewport,
+        }
+    }
+
+    pub fn aspect_fit(
+        event_window: u64,
+        game_window: u64,
+        output_extent: [u32; 2],
+        game_extent: [u32; 2],
+    ) -> Option<Self> {
+        if output_extent.contains(&0) || game_extent.contains(&0) {
+            return None;
+        }
+        let input_aspect = game_extent[0] as f32 / game_extent[1] as f32;
+        let output_aspect = output_extent[0] as f32 / output_extent[1] as f32;
+        let extent = if output_aspect > input_aspect {
+            [
+                output_extent[0] as f32 * input_aspect / output_aspect,
+                output_extent[1] as f32,
+            ]
+        } else {
+            [
+                output_extent[0] as f32,
+                output_extent[1] as f32 * output_aspect / input_aspect,
+            ]
+        };
+        Some(Self::new(
+            event_window,
+            game_window,
+            output_extent,
+            game_extent,
+            PointerViewport {
+                offset: [
+                    (output_extent[0] as f32 - extent[0]) * 0.5,
+                    (output_extent[1] as f32 - extent[1]) * 0.5,
+                ],
+                extent,
+            },
+        ))
+    }
+
+    pub fn with_output_extent(self, output_extent: [u32; 2]) -> Option<Self> {
+        Self::aspect_fit(
+            self.event_window,
+            self.game_window,
+            output_extent,
+            self.game_extent,
+        )
+    }
+
+    fn route(self) -> InputRoute {
+        InputRoute::new(
+            self.event_window,
+            self.game_window,
+            self.output_extent,
+            self.game_extent,
+            self.viewport,
+        )
+    }
 }
 
 struct Slot {
@@ -45,15 +128,15 @@ impl OverlayRenderer {
         device: &ash::Device,
         info: SwapchainInfo,
         images: &[vk::Image],
-        window: Option<u64>,
+        input_route: Option<InputRouteConfig>,
     ) -> Result<Self, vk::Result> {
         let mut result = Self {
             device: device.clone(),
             info,
             render_pass: vk::RenderPass::null(),
             slots: Vec::new(),
-            input: window.and_then(|window| {
-                X11Input::connect(window)
+            input: input_route.and_then(|route| {
+                X11Input::connect(route.route())
                     .map_err(|error| eprintln!("TuxScaling input: {error}"))
                     .ok()
             }),
@@ -239,5 +322,17 @@ mod tests {
     fn identifies_srgb_swapchain_formats() {
         assert!(is_srgb_framebuffer(vk::Format::B8G8R8A8_SRGB));
         assert!(!is_srgb_framebuffer(vk::Format::R16G16B16A16_SFLOAT));
+    }
+
+    #[test]
+    fn input_route_config_maps_native_output_to_logical_game_viewport() {
+        let route = InputRouteConfig::aspect_fit(0x900, 0x400, [1920, 1200], [1280, 720])
+            .expect("valid extents should produce a route");
+
+        assert_eq!(route.event_window, 0x900);
+        assert_eq!(route.game_window, 0x400);
+        assert_eq!(route.viewport.offset, [0.0, 60.0]);
+        assert_eq!(route.viewport.extent, [1920.0, 1080.0]);
+        assert_eq!(route.with_output_extent([0, 1200]), None);
     }
 }

@@ -5,7 +5,7 @@ use tuxscaling_capture::Capture;
 use tuxscaling_config::{DebugView, Upscaler};
 use tuxscaling_motion::MotionQuality;
 use tuxscaling_overlay::{FrameDiagnostics, OverlayFrame};
-use tuxscaling_overlay_vulkan::{OverlayRenderer, SwapchainInfo};
+use tuxscaling_overlay_vulkan::{InputRouteConfig, OverlayRenderer, SwapchainInfo};
 use tuxscaling_temporal::{DepthSemantics, FrameExtent, GuidanceReset, SignalState};
 use tuxscaling_upscaler::{
     BackendError, BackendFrame, BackendImage, ResolutionPlan, content_viewport,
@@ -66,7 +66,7 @@ pub struct SwapchainRuntimeCreateInfo {
     pub images: SwapchainImages,
     pub capture_enabled: bool,
     pub vulkan_api_version: u32,
-    pub window: Option<u64>,
+    pub input_route: Option<InputRouteConfig>,
     pub fullscreen: bool,
     pub monitor: Option<[i32; 4]>,
     /// Temporal reconstruction is withheld while a virtual swapchain is
@@ -519,7 +519,7 @@ pub struct SwapchainRuntime {
     slots: Vec<Slot>,
     queue: Option<vk::Queue>,
     enabled: bool,
-    window: Option<u64>,
+    input_route: Option<InputRouteConfig>,
     requested_config: tuxscaling_config::Config,
     temporal_enabled: bool,
     set_loader_data: Option<SetLoaderData>,
@@ -545,7 +545,7 @@ impl SwapchainRuntime {
             images,
             capture_enabled,
             vulkan_api_version,
-            window,
+            input_route,
             fullscreen,
             monitor,
             temporal_enabled,
@@ -582,7 +582,7 @@ impl SwapchainRuntime {
                 device,
                 info,
                 &images.output_images,
-                window,
+                input_route,
             )
         }?;
         let temporal = unsafe {
@@ -635,7 +635,7 @@ impl SwapchainRuntime {
             slots: Vec::new(),
             queue: None,
             enabled: true,
-            window,
+            input_route,
             requested_config,
             temporal_enabled,
             set_loader_data,
@@ -746,6 +746,9 @@ impl SwapchainRuntime {
 
         let output_views =
             unsafe { create_output_views(&self.device, &output_images, info.format) }?;
+        let input_route = self
+            .input_route
+            .and_then(|route| route.with_output_extent([info.extent.width, info.extent.height]));
         let overlay = match unsafe {
             OverlayRenderer::new(
                 &self.instance,
@@ -753,7 +756,7 @@ impl SwapchainRuntime {
                 &self.device,
                 info,
                 &output_images,
-                self.window,
+                input_route,
             )
         } {
             Ok(overlay) => overlay,
@@ -800,6 +803,7 @@ impl SwapchainRuntime {
         let old_slots = mem::take(&mut self.slots);
         self.queue = None;
         self.info = info;
+        self.input_route = input_route;
         self.output_images = output_images;
         self.output_presented = vec![false; self.output_images.len()];
         self.pending_output = None;

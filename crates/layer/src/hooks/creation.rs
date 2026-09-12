@@ -2583,6 +2583,17 @@ unsafe fn create_swapchain_inner(
             .get(&original.surface)
             .map(|surface| surface.window)
             .filter(|window| *window != super::surface::PENDING_WIN32_WINDOW);
+        let event_window = presenter_surface
+            .and_then(|_| crate::state::presenter_window(original.surface))
+            .or(window);
+        let input_route = window.and_then(|game_window| {
+            InputRouteConfig::aspect_fit(
+                event_window.unwrap_or(game_window),
+                game_window,
+                [info.extent.width, info.extent.height],
+                [game_extent.width, game_extent.height],
+            )
+        });
         let persisted_negotiation = surface_snapshot.map(|surface| surface.negotiation);
         let monitor = initial_target.map(|target| {
             let rect = target.monitor.rect;
@@ -2602,7 +2613,7 @@ unsafe fn create_swapchain_inner(
                     },
                     capture_enabled,
                     vulkan_api_version: device_state.vulkan_api_version,
-                    window,
+                    input_route,
                     fullscreen: window
                         .and_then(|window| {
                             tuxscaling_display::X11Display::connect()
@@ -2727,6 +2738,7 @@ unsafe fn create_swapchain_inner(
             physical_images: output_images.clone(),
             retired_physical_generations: Vec::new(),
             maintenance_overlay_reported: false,
+            input_route_reported: false,
             maintenance_present_reported: false,
             maintenance_release_reported: false,
             generation: 0,
