@@ -225,6 +225,57 @@ fn requires_grouped_presents(window_count: usize) -> bool {
     window_count > 1
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum PresenterTeardownEvent {
+    PhysicalSwapchain,
+    PresenterSurface,
+    PresenterWindow,
+    Instance,
+}
+
+#[allow(dead_code)]
+fn presenter_teardown_is_valid(events: &[PresenterTeardownEvent]) -> bool {
+    let physical = events
+        .iter()
+        .position(|event| *event == PresenterTeardownEvent::PhysicalSwapchain);
+    let surface = events
+        .iter()
+        .position(|event| *event == PresenterTeardownEvent::PresenterSurface);
+    let window = events
+        .iter()
+        .position(|event| *event == PresenterTeardownEvent::PresenterWindow);
+    let instance = events
+        .iter()
+        .position(|event| *event == PresenterTeardownEvent::Instance);
+    physical.zip(surface).zip(window).zip(instance).is_some_and(
+        |(((physical, surface), window), instance)| {
+            physical < surface && surface < window && window < instance
+        },
+    )
+}
+
+#[cfg(test)]
+mod presenter_lifetime_tests {
+    use super::{PresenterTeardownEvent, presenter_teardown_is_valid};
+
+    #[test]
+    fn presenter_surface_and_window_follow_instance_lifetime_order() {
+        assert!(presenter_teardown_is_valid(&[
+            PresenterTeardownEvent::PhysicalSwapchain,
+            PresenterTeardownEvent::PresenterSurface,
+            PresenterTeardownEvent::PresenterWindow,
+            PresenterTeardownEvent::Instance,
+        ]));
+        assert!(!presenter_teardown_is_valid(&[
+            PresenterTeardownEvent::PhysicalSwapchain,
+            PresenterTeardownEvent::PresenterWindow,
+            PresenterTeardownEvent::PresenterSurface,
+            PresenterTeardownEvent::Instance,
+        ]));
+    }
+}
+
 fn queue_index_for_swapchain(swapchain: usize, queue_count: usize) -> usize {
     swapchain.min(queue_count.saturating_sub(1))
 }

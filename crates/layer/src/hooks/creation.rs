@@ -1147,6 +1147,182 @@ fn temporal_enabled_for_logical_creation(
     !virtual_eligible || previous_state == Some(PresentationState::Virtualized)
 }
 
+struct InstanceExtensionPlan {
+    names: Vec<*const i8>,
+    presenter_enabled: bool,
+    fallback_reason: Option<crate::state::PresenterFallbackReason>,
+}
+
+fn extension_name_is(name: *const i8, expected: &CStr) -> bool {
+    !name.is_null() && unsafe { CStr::from_ptr(name) }.to_bytes() == expected.to_bytes()
+}
+
+fn extension_is_supported(name: &CStr, supported: &[Vec<u8>]) -> bool {
+    supported
+        .iter()
+        .any(|candidate| candidate.as_slice() == name.to_bytes())
+}
+
+fn augment_instance_extensions(
+    requested: &[*const i8],
+    supported: &[Vec<u8>],
+) -> InstanceExtensionPlan {
+    let surface_name = ash::khr::surface::NAME;
+    let xcb_name = ash::khr::xcb_surface::NAME;
+    let surface_supported = extension_is_supported(surface_name, supported);
+    let xcb_supported = extension_is_supported(xcb_name, supported);
+    let surface_requested = requested
+        .iter()
+        .copied()
+        .any(|name| extension_name_is(name, surface_name));
+    let xcb_requested = requested
+        .iter()
+        .copied()
+        .any(|name| extension_name_is(name, xcb_name));
+
+    let mut names = requested.to_vec();
+    if surface_supported && !surface_requested {
+        names.push(surface_name.as_ptr());
+    }
+    if xcb_supported && !xcb_requested {
+        names.push(xcb_name.as_ptr());
+    }
+
+    let presenter_enabled = surface_supported
+        && xcb_supported
+        && names
+            .iter()
+            .copied()
+            .any(|name| extension_name_is(name, surface_name))
+        && names
+            .iter()
+            .copied()
+            .any(|name| extension_name_is(name, xcb_name));
+    let fallback_reason = if presenter_enabled {
+        None
+    } else if !surface_supported {
+        Some(crate::state::PresenterFallbackReason::MissingSurfaceExtension)
+    } else if !xcb_supported {
+        Some(crate::state::PresenterFallbackReason::MissingXcbSurfaceExtension)
+    } else {
+        Some(crate::state::PresenterFallbackReason::PresenterSurfaceUnavailable)
+    };
+
+    InstanceExtensionPlan {
+        names,
+        presenter_enabled,
+        fallback_reason,
+    }
+}
+
+unsafe fn enumerate_instance_extensions(
+    get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
+) -> Option<Vec<Vec<u8>>> {
+    let proc = unsafe {
+        get_instance_proc_addr(
+            vk::Instance::null(),
+            c"vkEnumerateInstanceExtensionProperties".as_ptr(),
+        )
+    }?;
+    let enumerate: vk::PFN_vkEnumerateInstanceExtensionProperties =
+        unsafe { std::mem::transmute(proc) };
+    let mut count = 0;
+    if unsafe { enumerate(std::ptr::null(), &mut count, std::ptr::null_mut()) }
+        != vk::Result::SUCCESS
+    {
+        return None;
+    }
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    let mut properties = vec![vk::ExtensionProperties::default(); count as usize];
+    let result = unsafe { enumerate(std::ptr::null(), &mut count, properties.as_mut_ptr()) };
+    if !matches!(result, vk::Result::SUCCESS | vk::Result::INCOMPLETE) {
+        return None;
+    }
+    properties.truncate(count as usize);
+    Some(
+        properties
+            .iter()
+            .map(|property| {
+                unsafe { CStr::from_ptr(property.extension_name.as_ptr()) }
+                    .to_bytes()
+                    .to_vec()
+            })
+            .collect(),
+    )
+}
+
+fn selected_queue_families(
+    device: vk::Device,
+    info: &vk::SwapchainCreateInfoKHR<'_>,
+    queue_family_count: usize,
+) -> Vec<u32> {
+    if info.image_sharing_mode == vk::SharingMode::CONCURRENT
+        && info.queue_family_index_count != 0
+        && !info.p_queue_family_indices.is_null()
+    {
+        return unsafe {
+            std::slice::from_raw_parts(
+                info.p_queue_family_indices,
+                info.queue_family_index_count as usize,
+            )
+            .to_vec()
+        };
+    }
+    let registered = queues()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .values()
+        .filter(|queue| queue.device == device)
+        .map(|queue| queue.family_index)
+        .collect::<Vec<_>>();
+    if !registered.is_empty() {
+        return registered;
+    }
+    (0..queue_family_count as u32).collect()
+}
+
+unsafe fn presenter_queue_supported(
+    device: vk::Device,
+    info: &vk::SwapchainCreateInfoKHR<'_>,
+    device_state: &DeviceState,
+    presenter_surface: vk::SurfaceKHR,
+) -> bool {
+    let Some(proc) = (unsafe {
+        downstream(
+            device_state.instance.handle(),
+            c"vkGetPhysicalDeviceSurfaceSupportKHR",
+        )
+    }) else {
+        return false;
+    };
+    let get: vk::PFN_vkGetPhysicalDeviceSurfaceSupportKHR = unsafe { std::mem::transmute(proc) };
+    let families = selected_queue_families(device, info, device_state.queue_families.len());
+    if families.is_empty() {
+        return false;
+    }
+    let concurrent = info.image_sharing_mode == vk::SharingMode::CONCURRENT;
+    let mut supported = Vec::with_capacity(families.len());
+    for family in families {
+        let mut present = vk::FALSE;
+        let result = unsafe {
+            get(
+                device_state.physical_device,
+                family,
+                presenter_surface,
+                &mut present,
+            )
+        };
+        supported.push(result == vk::Result::SUCCESS && present != 0);
+    }
+    if concurrent {
+        supported.into_iter().all(std::convert::identity)
+    } else {
+        supported.into_iter().any(std::convert::identity)
+    }
+}
+
 unsafe fn find_device_callback(
     mut next: *const c_void,
 ) -> Option<tuxscaling_runtime::SetLoaderData> {
@@ -1247,6 +1423,21 @@ unsafe fn create_instance_inner(
     } else {
         requested_api_version
     };
+    let requested_extensions = unsafe {
+        if (*create_info).enabled_extension_count == 0
+            || (*create_info).pp_enabled_extension_names.is_null()
+        {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(
+                (*create_info).pp_enabled_extension_names,
+                (*create_info).enabled_extension_count as usize,
+            )
+        }
+    };
+    let extension_plan = unsafe { enumerate_instance_extensions(get_instance_proc_addr) };
+    let extension_plan = extension_plan
+        .map(|supported| augment_instance_extensions(requested_extensions, &supported));
     let mut modified_application_info = unsafe {
         (*create_info)
             .p_application_info
@@ -1261,9 +1452,30 @@ unsafe fn create_instance_inner(
     }
     let mut modified_create_info = unsafe { *create_info };
     modified_create_info.p_application_info = &modified_application_info;
+    if let Some(plan) = extension_plan.as_ref()
+        && plan.names.len() != requested_extensions.len()
+    {
+        modified_create_info.enabled_extension_count = plan.names.len() as u32;
+        modified_create_info.pp_enabled_extension_names = plan.names.as_ptr();
+    }
     let result = unsafe { create_instance(&modified_create_info, allocation_callbacks, instance) };
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if result == vk::Result::SUCCESS {
+            let availability = extension_plan
+                .as_ref()
+                .and_then(|plan| {
+                    plan.presenter_enabled
+                        .then_some(crate::state::PresenterAvailability::available())
+                        .or_else(|| {
+                            plan.fallback_reason
+                                .map(crate::state::PresenterAvailability::unavailable)
+                        })
+                })
+                .unwrap_or_else(|| {
+                    crate::state::PresenterAvailability::unavailable(
+                        crate::state::PresenterFallbackReason::InstanceExtensionEnumerationUnavailable,
+                    )
+                });
             crate::state::instance_dispatch()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1284,6 +1496,19 @@ unsafe fn create_instance_inner(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(unsafe { *instance }, vulkan_api_version);
+            crate::state::presenter_availability()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(unsafe { *instance }, availability);
+            if !availability.enabled
+                && let Some(reason) = availability.fallback_reason
+            {
+                eprintln!(
+                    "TuxScaling evidence event=presenter_instance_unavailable instance=0x{:x} reason={}",
+                    unsafe { (*instance).as_raw() },
+                    reason.as_str(),
+                );
+            }
         }
         result
     }));
@@ -1731,6 +1956,47 @@ unsafe fn create_swapchain_inner(
                 || extent.height != original.image_extent.height
         })
     };
+    let mut presenter_surface = crate::state::presenter_surface(original.surface);
+    let mut presenter_created_here = false;
+    if let Some(target) = initial_target
+        && virtualization_plan.is_some()
+        && let Some(device_state) = state.as_ref()
+    {
+        let had_presenter = presenter_surface.is_some();
+        match unsafe {
+            super::surface::ensure_presenter_surface(
+                device_state.instance.handle(),
+                original.surface,
+                device,
+                target.window,
+                target.monitor,
+            )
+        } {
+            Ok(surface)
+                if unsafe {
+                    presenter_queue_supported(device, original, device_state, surface)
+                } =>
+            {
+                presenter_surface = Some(surface);
+                presenter_created_here = !had_presenter;
+            }
+            Ok(_) => {
+                crate::state::record_presenter_fallback(
+                    original.surface,
+                    crate::state::PresenterFallbackReason::PresenterQueueUnsupported,
+                );
+                unsafe { super::surface::destroy_presenter_for_surface(original.surface) };
+                presenter_surface = None;
+                virtualization_plan = None;
+                virtual_preflight_eligible = false;
+            }
+            Err(reason) => {
+                crate::state::record_presenter_fallback(original.surface, reason);
+                // The existing borderless promotion remains the migration
+                // fallback until native output is routed through this surface.
+            }
+        }
+    }
     // A native request on a promoted surface means the application adopted the
     // promoted window as its own resolution. There is nothing to upscale, so
     // no logical predecessor is inferred: the request below goes direct, and
@@ -1758,6 +2024,11 @@ unsafe fn create_swapchain_inner(
                     );
                     virtualization_plan = None;
                     virtual_preflight_eligible = false;
+                    if presenter_created_here {
+                        unsafe { super::surface::destroy_presenter_for_surface(original.surface) };
+                        presenter_surface = None;
+                        presenter_created_here = false;
+                    }
                 }
             }
         } else {
@@ -1896,6 +2167,9 @@ unsafe fn create_swapchain_inner(
         }
     }
     if result != vk::Result::SUCCESS {
+        if presenter_created_here {
+            unsafe { super::surface::destroy_presenter_for_surface(original.surface) };
+        }
         super::lifetime::restore_surface_window(original.surface);
         return result;
     }
@@ -1950,6 +2224,10 @@ unsafe fn create_swapchain_inner(
         } else {
             None
         };
+        if !virtual_eligible && presenter_created_here {
+            unsafe { super::surface::destroy_presenter_for_surface(original.surface) };
+            presenter_surface = None;
+        }
         let game_images = virtual_images.as_ref().map_or_else(
             || output_images.clone(),
             |images| images.iter().map(|image| image.handle).collect(),
@@ -2006,6 +2284,9 @@ unsafe fn create_swapchain_inner(
         };
         let Ok(overlay) = overlay else {
             eprintln!("TuxScaling: overlay disabled for swapchain");
+            if presenter_created_here {
+                unsafe { super::surface::destroy_presenter_for_surface(original.surface) };
+            }
             return result;
         };
         let template = virtual_eligible.then(|| {
@@ -2056,6 +2337,7 @@ unsafe fn create_swapchain_inner(
         let state = Arc::new(Mutex::new(SwapchainState {
             device,
             surface: original.surface,
+            presenter_surface: virtual_eligible.then_some(presenter_surface).flatten(),
             logical_handle,
             physical_handle: handle,
             mapping: virtual_images
@@ -2134,6 +2416,11 @@ unsafe fn create_swapchain_inner(
                                 unsafe { overlay.destroy(&device_state.device) };
                             }
                         }
+                        if presenter_created_here {
+                            unsafe {
+                                super::surface::destroy_presenter_for_surface(original.surface)
+                            };
+                        }
                         return result;
                     }
                 };
@@ -2161,6 +2448,11 @@ unsafe fn create_swapchain_inner(
                             if let Some(overlay) = overlay {
                                 unsafe { overlay.destroy(&device_state.device) };
                             }
+                        }
+                        if presenter_created_here {
+                            unsafe {
+                                super::surface::destroy_presenter_for_surface(original.surface)
+                            };
                         }
                         return result;
                     }
@@ -2219,6 +2511,9 @@ unsafe fn create_swapchain_inner(
         result
     }));
     if post_result.is_err() {
+        if presenter_created_here {
+            unsafe { super::surface::destroy_presenter_for_surface(original.surface) };
+        }
         super::lifetime::restore_surface_window(original.surface);
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
@@ -2239,9 +2534,10 @@ pub(super) unsafe extern "system" fn create_swapchain_khr(
 #[cfg(test)]
 mod tests {
     use super::{
-        initial_physical_extent, logical_image_count, native_generation_failure_can_restore,
-        preflight_swapchain_virtualization, temporal_enabled_for_logical_creation,
-        translate_old_swapchain, translate_recreation_create_info, virtual_swapchain_supported,
+        augment_instance_extensions, initial_physical_extent, logical_image_count,
+        native_generation_failure_can_restore, preflight_swapchain_virtualization,
+        temporal_enabled_for_logical_creation, translate_old_swapchain,
+        translate_recreation_create_info, virtual_swapchain_supported,
     };
     use crate::hooks::swapchain_create::SwapchainCompatibilityError;
     use crate::recovery::{
@@ -2290,6 +2586,65 @@ mod tests {
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .push_next(&mut list);
         invoke(&info)
+    }
+
+    #[test]
+    fn instance_extension_injection_preserves_application_names_and_adds_supported_presenter_names()
+    {
+        let requested = [c"VK_EXT_debug_utils".as_ptr()];
+        let supported = vec![b"VK_KHR_surface".to_vec(), b"VK_KHR_xcb_surface".to_vec()];
+
+        let plan = augment_instance_extensions(&requested, &supported);
+        let names = plan
+            .names
+            .iter()
+            .map(|name| unsafe { std::ffi::CStr::from_ptr(*name) }.to_bytes())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                b"VK_EXT_debug_utils".as_slice(),
+                b"VK_KHR_surface",
+                b"VK_KHR_xcb_surface"
+            ]
+        );
+        assert!(plan.presenter_enabled);
+        assert_eq!(plan.fallback_reason, None);
+    }
+
+    #[test]
+    fn instance_extension_injection_does_not_request_unsupported_names() {
+        let requested = [c"VK_EXT_debug_utils".as_ptr()];
+        let supported = vec![b"VK_KHR_surface".to_vec()];
+
+        let plan = augment_instance_extensions(&requested, &supported);
+        let names = plan
+            .names
+            .iter()
+            .map(|name| unsafe { std::ffi::CStr::from_ptr(*name) }.to_bytes())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![b"VK_EXT_debug_utils".as_slice(), b"VK_KHR_surface"]
+        );
+        assert!(!plan.presenter_enabled);
+        assert_eq!(
+            plan.fallback_reason,
+            Some(crate::state::PresenterFallbackReason::MissingXcbSurfaceExtension)
+        );
+    }
+
+    #[test]
+    fn instance_extension_injection_does_not_duplicate_application_names() {
+        let requested = [c"VK_KHR_surface".as_ptr(), c"VK_KHR_xcb_surface".as_ptr()];
+        let supported = vec![b"VK_KHR_surface".to_vec(), b"VK_KHR_xcb_surface".to_vec()];
+
+        let plan = augment_instance_extensions(&requested, &supported);
+
+        assert_eq!(plan.names.len(), requested.len());
+        assert!(plan.presenter_enabled);
     }
 
     fn compatible_wsi() -> crate::hooks::wsi_compatibility::DeviceWsiCapabilities {

@@ -1,4 +1,8 @@
 use super::*;
+use crate::state::{
+    PresenterAvailability, PresenterFallbackReason, PresenterState, presenter_availability,
+    presenter_states,
+};
 
 fn register_x11_surface(surface: vk::SurfaceKHR, window: u64) {
     surfaces()
@@ -319,6 +323,10 @@ unsafe fn destroy_surface_inner(
     surface: vk::SurfaceKHR,
     allocation_callbacks: *const vk::AllocationCallbacks<'_>,
 ) {
+    // The presenter surface and its X11 window are private resources tied to
+    // this application surface. Destroy the Vulkan surface first while the
+    // instance dispatch table is still alive.
+    unsafe { destroy_presenter_for_surface(surface) };
     let surface_state = surfaces()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -344,6 +352,155 @@ pub(super) unsafe extern "system" fn destroy_surface_khr(
     let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         destroy_surface_inner(instance, surface, allocation_callbacks)
     }));
+}
+
+pub(super) unsafe fn ensure_presenter_surface(
+    instance: vk::Instance,
+    game_surface: vk::SurfaceKHR,
+    device: vk::Device,
+    game_window: u64,
+    monitor: tuxscaling_display::Monitor,
+) -> Result<vk::SurfaceKHR, PresenterFallbackReason> {
+    let availability = presenter_availability()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&instance)
+        .copied()
+        .unwrap_or_else(|| {
+            PresenterAvailability::unavailable(
+                PresenterFallbackReason::InstanceExtensionEnumerationUnavailable,
+            )
+        });
+    if !availability.enabled {
+        return Err(availability
+            .fallback_reason
+            .unwrap_or(PresenterFallbackReason::PresenterSurfaceUnavailable));
+    }
+    if let Some(existing) = presenter_states()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&game_surface)
+    {
+        return (existing.instance == instance)
+            .then_some(existing.surface)
+            .ok_or(PresenterFallbackReason::InstanceMismatch);
+    }
+
+    let mut window = tuxscaling_display::PresenterWindow::new(game_window, monitor)
+        .map_err(|_| PresenterFallbackReason::PresenterWindowUnavailable)?;
+    let Some(proc) = (unsafe { downstream(instance, c"vkCreateXcbSurfaceKHR") }) else {
+        window.destroy();
+        return Err(PresenterFallbackReason::PresenterSurfaceUnavailable);
+    };
+    let create: vk::PFN_vkCreateXcbSurfaceKHR = unsafe { std::mem::transmute(proc) };
+    let info = window.surface_info();
+    let create_info = vk::XcbSurfaceCreateInfoKHR::default()
+        .connection(info.connection.cast())
+        .window(info.window);
+    let mut surface = vk::SurfaceKHR::null();
+    let result = unsafe { create(instance, &create_info, std::ptr::null(), &mut surface) };
+    if result != vk::Result::SUCCESS || surface == vk::SurfaceKHR::null() {
+        window.destroy();
+        return Err(PresenterFallbackReason::PresenterSurfaceUnavailable);
+    }
+
+    let mut presenters = presenter_states()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(existing) = presenters.get(&game_surface) {
+        let existing_surface = existing.surface;
+        let same_instance = existing.instance == instance;
+        drop(presenters);
+        let duplicate = PresenterState {
+            window,
+            surface,
+            instance,
+            device,
+        };
+        unsafe { destroy_presenter_state(duplicate) };
+        return same_instance
+            .then_some(existing_surface)
+            .ok_or(PresenterFallbackReason::InstanceMismatch);
+    }
+    presenters.insert(
+        game_surface,
+        PresenterState {
+            window,
+            surface,
+            instance,
+            device,
+        },
+    );
+    eprintln!(
+        "TuxScaling evidence event=presenter_surface_created game_surface=0x{:x} presenter_surface=0x{:x} window={} extent={}x{}",
+        game_surface.as_raw(),
+        surface.as_raw(),
+        info.window,
+        info.extent.width,
+        info.extent.height,
+    );
+    Ok(surface)
+}
+
+pub(super) unsafe fn destroy_presenter_state(mut state: PresenterState) {
+    if state.surface != vk::SurfaceKHR::null() {
+        if let Some(proc) = unsafe { downstream(state.instance, c"vkDestroySurfaceKHR") } {
+            let destroy: vk::PFN_vkDestroySurfaceKHR = unsafe { std::mem::transmute(proc) };
+            unsafe { destroy(state.instance, state.surface, std::ptr::null()) };
+        }
+        state.surface = vk::SurfaceKHR::null();
+    }
+    // Explicitly restore/destroy the X11 window only after the Vulkan surface
+    // callback has returned. PresenterWindow::Drop repeats this idempotently.
+    state.window.destroy();
+}
+
+pub(super) unsafe fn destroy_presenter_for_surface(game_surface: vk::SurfaceKHR) {
+    let state = presenter_states()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&game_surface);
+    if let Some(state) = state {
+        unsafe { destroy_presenter_state(state) };
+    }
+}
+
+pub(super) unsafe fn destroy_presenters_for_device(device: vk::Device) {
+    let states = {
+        let mut presenters = presenter_states()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let keys = presenters
+            .iter()
+            .filter_map(|(game_surface, state)| (state.device == device).then_some(*game_surface))
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|game_surface| presenters.remove(&game_surface))
+            .collect::<Vec<_>>()
+    };
+    for state in states {
+        unsafe { destroy_presenter_state(state) };
+    }
+}
+
+pub(super) unsafe fn destroy_presenters_for_instance(instance: vk::Instance) {
+    let states = {
+        let mut presenters = presenter_states()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let keys = presenters
+            .iter()
+            .filter_map(|(game_surface, state)| {
+                (state.instance == instance).then_some(*game_surface)
+            })
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|game_surface| presenters.remove(&game_surface))
+            .collect::<Vec<_>>()
+    };
+    for state in states {
+        unsafe { destroy_presenter_state(state) };
+    }
 }
 
 #[cfg(test)]

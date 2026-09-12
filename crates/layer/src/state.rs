@@ -1,6 +1,6 @@
 use ash::{vk, vk::Handle};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex, OnceLock},
 };
 use tuxscaling_runtime::{SetLoaderData, SwapchainRuntime as OverlaySwapchain};
@@ -11,6 +11,126 @@ use crate::hooks::swapchain_create::{SwapchainCompatibilityError, SwapchainCreat
 use crate::hooks::wsi_compatibility::DeviceWsiCapabilities;
 use crate::mapping::{LogicalSwapchainHandle, Mapping};
 use crate::recovery::{LogicalSwapchainContract, ReconfigurationLifecycle};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum PresenterOwnershipState {
+    Absent,
+    WindowOwned,
+    SurfaceOwned,
+    SwapchainOwned,
+    RolledBack,
+    Destroyed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum PresenterOwnershipEvent {
+    WindowCreated,
+    SurfaceCreated,
+    SwapchainCreated,
+    SwapchainReplaced,
+    PhysicalSwapchainDestroyed,
+    PresenterSurfaceDestroyed,
+    PresenterWindowDestroyed,
+    OriginalSurfaceDestroyed,
+    DeviceDestroyed,
+    InstanceDestroyed,
+    CreationFailed,
+}
+
+#[allow(dead_code)]
+pub(crate) const fn presenter_ownership_transition(
+    state: PresenterOwnershipState,
+    event: PresenterOwnershipEvent,
+) -> PresenterOwnershipState {
+    use PresenterOwnershipEvent as Event;
+    use PresenterOwnershipState as State;
+
+    match (state, event) {
+        (State::Destroyed, _) | (State::RolledBack, _) => state,
+        (State::Absent, Event::WindowCreated) => State::WindowOwned,
+        (State::WindowOwned, Event::SurfaceCreated) => State::SurfaceOwned,
+        (State::SurfaceOwned, Event::SwapchainCreated) => State::SwapchainOwned,
+        (State::SwapchainOwned, Event::SwapchainReplaced) => State::SwapchainOwned,
+        (State::SwapchainOwned, Event::PhysicalSwapchainDestroyed) => State::SurfaceOwned,
+        (State::SurfaceOwned, Event::PresenterSurfaceDestroyed) => State::WindowOwned,
+        (State::WindowOwned, Event::PresenterWindowDestroyed) => State::Destroyed,
+        (
+            State::WindowOwned | State::SurfaceOwned | State::SwapchainOwned,
+            Event::OriginalSurfaceDestroyed,
+        )
+        | (
+            State::WindowOwned | State::SurfaceOwned | State::SwapchainOwned,
+            Event::DeviceDestroyed,
+        )
+        | (
+            State::WindowOwned | State::SurfaceOwned | State::SwapchainOwned,
+            Event::InstanceDestroyed,
+        ) => State::Destroyed,
+        (
+            State::WindowOwned | State::SurfaceOwned | State::SwapchainOwned,
+            Event::CreationFailed,
+        ) => State::RolledBack,
+        _ => state,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PresenterFallbackReason {
+    InstanceExtensionEnumerationUnavailable,
+    MissingSurfaceExtension,
+    MissingXcbSurfaceExtension,
+    PresenterWindowUnavailable,
+    PresenterSurfaceUnavailable,
+    PresenterQueueUnsupported,
+    InstanceMismatch,
+}
+
+impl PresenterFallbackReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::InstanceExtensionEnumerationUnavailable => {
+                "instance_extension_enumeration_unavailable"
+            }
+            Self::MissingSurfaceExtension => "missing_vk_khr_surface",
+            Self::MissingXcbSurfaceExtension => "missing_vk_khr_xcb_surface",
+            Self::PresenterWindowUnavailable => "presenter_window_unavailable",
+            Self::PresenterSurfaceUnavailable => "presenter_surface_unavailable",
+            Self::PresenterQueueUnsupported => "presenter_queue_unsupported",
+            Self::InstanceMismatch => "presenter_instance_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PresenterAvailability {
+    pub(crate) enabled: bool,
+    pub(crate) fallback_reason: Option<PresenterFallbackReason>,
+}
+
+impl PresenterAvailability {
+    pub(crate) const fn available() -> Self {
+        Self {
+            enabled: true,
+            fallback_reason: None,
+        }
+    }
+
+    pub(crate) const fn unavailable(reason: PresenterFallbackReason) -> Self {
+        Self {
+            enabled: false,
+            fallback_reason: Some(reason),
+        }
+    }
+}
+
+pub(crate) struct PresenterState {
+    pub(crate) window: tuxscaling_display::PresenterWindow,
+    pub(crate) surface: vk::SurfaceKHR,
+    pub(crate) instance: vk::Instance,
+    pub(crate) device: vk::Device,
+}
 
 #[derive(Clone)]
 pub(crate) struct SwapchainTemplate {
@@ -106,6 +226,7 @@ pub(crate) struct X11Surface {
 pub(crate) struct SwapchainState {
     pub(crate) device: vk::Device,
     pub(crate) surface: vk::SurfaceKHR,
+    pub(crate) presenter_surface: Option<vk::SurfaceKHR>,
     /// The application-visible key remains stable even if a later task
     /// replaces the downstream WSI generation.
     pub(crate) logical_handle: vk::SwapchainKHR,
@@ -155,6 +276,11 @@ static SWAPCHAINS: OnceLock<Mutex<HashMap<vk::SwapchainKHR, Arc<Mutex<SwapchainS
 static RETIRED_SWAPCHAINS: OnceLock<Mutex<std::collections::HashSet<vk::SwapchainKHR>>> =
     OnceLock::new();
 static SURFACES: OnceLock<Mutex<HashMap<vk::SurfaceKHR, X11Surface>>> = OnceLock::new();
+static PRESENTER_STATES: OnceLock<Mutex<HashMap<vk::SurfaceKHR, PresenterState>>> = OnceLock::new();
+static PRESENTER_AVAILABILITY: OnceLock<Mutex<HashMap<vk::Instance, PresenterAvailability>>> =
+    OnceLock::new();
+static PRESENTER_FALLBACKS: OnceLock<Mutex<HashSet<(vk::SurfaceKHR, PresenterFallbackReason)>>> =
+    OnceLock::new();
 static RECREATING_SURFACES: OnceLock<Mutex<std::collections::HashSet<vk::SurfaceKHR>>> =
     OnceLock::new();
 
@@ -216,6 +342,41 @@ pub(crate) fn surfaces() -> &'static Mutex<HashMap<vk::SurfaceKHR, X11Surface>> 
     SURFACES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+pub(crate) fn presenter_states() -> &'static Mutex<HashMap<vk::SurfaceKHR, PresenterState>> {
+    PRESENTER_STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn presenter_availability()
+-> &'static Mutex<HashMap<vk::Instance, PresenterAvailability>> {
+    PRESENTER_AVAILABILITY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn record_presenter_fallback(
+    game_surface: vk::SurfaceKHR,
+    reason: PresenterFallbackReason,
+) {
+    let first_report = PRESENTER_FALLBACKS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert((game_surface, reason));
+    if first_report {
+        eprintln!(
+            "TuxScaling evidence event=presenter_fallback surface=0x{:x} reason={}",
+            game_surface.as_raw(),
+            reason.as_str(),
+        );
+    }
+}
+
+pub(crate) fn presenter_surface(game_surface: vk::SurfaceKHR) -> Option<vk::SurfaceKHR> {
+    presenter_states()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&game_surface)
+        .map(|state| state.surface)
+}
+
 pub(crate) fn begin_surface_recreation(surface: vk::SurfaceKHR) -> bool {
     RECREATING_SURFACES
         .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
@@ -241,9 +402,103 @@ pub(crate) fn instance_dispatch()
 
 #[cfg(test)]
 mod tests {
-    use super::{is_retired_swapchain, retire_swapchain};
+    use super::{
+        PresenterOwnershipEvent, PresenterOwnershipState, is_retired_swapchain,
+        presenter_ownership_transition, retire_swapchain,
+    };
     use ash::vk;
     use ash::vk::Handle;
+
+    #[test]
+    fn presenter_ownership_covers_creation_replacement_and_shutdown() {
+        let mut state = PresenterOwnershipState::Absent;
+
+        state = presenter_ownership_transition(state, PresenterOwnershipEvent::WindowCreated);
+        assert_eq!(state, PresenterOwnershipState::WindowOwned);
+        state = presenter_ownership_transition(state, PresenterOwnershipEvent::SurfaceCreated);
+        assert_eq!(state, PresenterOwnershipState::SurfaceOwned);
+        state = presenter_ownership_transition(state, PresenterOwnershipEvent::SwapchainCreated);
+        assert_eq!(state, PresenterOwnershipState::SwapchainOwned);
+        state = presenter_ownership_transition(state, PresenterOwnershipEvent::SwapchainReplaced);
+        assert_eq!(state, PresenterOwnershipState::SwapchainOwned);
+        state = presenter_ownership_transition(
+            state,
+            PresenterOwnershipEvent::OriginalSurfaceDestroyed,
+        );
+        assert_eq!(state, PresenterOwnershipState::Destroyed);
+        state = presenter_ownership_transition(state, PresenterOwnershipEvent::InstanceDestroyed);
+        assert_eq!(state, PresenterOwnershipState::Destroyed);
+    }
+
+    #[test]
+    fn presenter_creation_failure_rolls_back_window_and_surface_ownership() {
+        assert_eq!(
+            presenter_ownership_transition(
+                PresenterOwnershipState::WindowOwned,
+                PresenterOwnershipEvent::CreationFailed,
+            ),
+            PresenterOwnershipState::RolledBack
+        );
+        assert_eq!(
+            presenter_ownership_transition(
+                PresenterOwnershipState::SurfaceOwned,
+                PresenterOwnershipEvent::CreationFailed,
+            ),
+            PresenterOwnershipState::RolledBack
+        );
+        assert_eq!(
+            presenter_ownership_transition(
+                PresenterOwnershipState::RolledBack,
+                PresenterOwnershipEvent::WindowCreated,
+            ),
+            PresenterOwnershipState::RolledBack
+        );
+    }
+
+    #[test]
+    fn device_and_instance_destruction_release_any_remaining_presenter_owner() {
+        assert_eq!(
+            presenter_ownership_transition(
+                PresenterOwnershipState::SurfaceOwned,
+                PresenterOwnershipEvent::DeviceDestroyed,
+            ),
+            PresenterOwnershipState::Destroyed
+        );
+        assert_eq!(
+            presenter_ownership_transition(
+                PresenterOwnershipState::WindowOwned,
+                PresenterOwnershipEvent::InstanceDestroyed,
+            ),
+            PresenterOwnershipState::Destroyed
+        );
+    }
+
+    #[test]
+    fn presenter_shutdown_is_idempotent_and_preserves_surface_before_window_order() {
+        let state = PresenterOwnershipState::SwapchainOwned;
+        let state = presenter_ownership_transition(
+            state,
+            PresenterOwnershipEvent::PhysicalSwapchainDestroyed,
+        );
+        assert_eq!(state, PresenterOwnershipState::SurfaceOwned);
+        let state = presenter_ownership_transition(
+            state,
+            PresenterOwnershipEvent::PresenterSurfaceDestroyed,
+        );
+        assert_eq!(state, PresenterOwnershipState::WindowOwned);
+        let state = presenter_ownership_transition(
+            state,
+            PresenterOwnershipEvent::PresenterWindowDestroyed,
+        );
+        assert_eq!(state, PresenterOwnershipState::Destroyed);
+        assert_eq!(
+            presenter_ownership_transition(
+                state,
+                PresenterOwnershipEvent::PresenterWindowDestroyed,
+            ),
+            PresenterOwnershipState::Destroyed
+        );
+    }
 
     #[test]
     fn retired_logical_tokens_are_explicitly_rejected() {

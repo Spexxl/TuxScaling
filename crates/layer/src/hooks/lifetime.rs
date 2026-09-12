@@ -21,6 +21,7 @@ fn unique_physical_handles(
 struct SwapchainTeardown {
     physical_handles: Vec<vk::SwapchainKHR>,
     restore_surface: Option<vk::SurfaceKHR>,
+    presenter_owner: Option<vk::SurfaceKHR>,
     virtualized: bool,
     overlay: Option<OverlaySwapchain>,
 }
@@ -46,9 +47,22 @@ fn take_swapchain_teardown(
         restore_surface: virtualized.then_some(state.surface).filter(|_| {
             should_restore_surface_on_destroy(state.negotiation.public_state(), force_restore)
         }),
+        presenter_owner: state.presenter_surface.map(|_| state.surface),
         virtualized,
         overlay: state.overlay.take(),
     }
+}
+
+fn has_live_presenter_swapchain(game_surface: vk::SurfaceKHR) -> bool {
+    swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .values()
+        .any(|state| {
+            state.lock().is_ok_and(|state| {
+                state.surface == game_surface && state.presenter_surface.is_some()
+            })
+        })
 }
 
 unsafe fn destroy_overlay(device_state: &DeviceState, overlay: OverlaySwapchain) {
@@ -91,6 +105,7 @@ unsafe fn destroy_swapchain_inner(
         .unwrap_or_else(|| SwapchainTeardown {
             physical_handles: vec![swapchain],
             restore_surface: None,
+            presenter_owner: None,
             virtualized: false,
             overlay: None,
         });
@@ -130,6 +145,11 @@ unsafe fn destroy_swapchain_inner(
         for physical_swapchain in teardown.physical_handles {
             unsafe { destroy_swapchain(device, physical_swapchain, allocation_callbacks) };
         }
+    }
+    if let Some(game_surface) = teardown.presenter_owner
+        && !has_live_presenter_swapchain(game_surface)
+    {
+        unsafe { super::surface::destroy_presenter_for_surface(game_surface) };
     }
 }
 
@@ -254,6 +274,12 @@ unsafe fn destroy_device_inner(
                 }
             }
         }));
+        // Presenter surfaces are instance-owned, but the device owns the
+        // physical swapchains that may still reference them. Destroy those
+        // swapchains before releasing the presenter resources.
+        let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+            super::surface::destroy_presenters_for_device(device);
+        }));
         for surface in surfaces_to_restore {
             let another_virtual_swapchain = swapchains()
                 .lock()
@@ -289,6 +315,12 @@ unsafe fn destroy_instance_inner(
 ) {
     let destroy = unsafe { downstream(instance, c"vkDestroyInstance") };
     let _ = catch_unwind(AssertUnwindSafe(|| {
+        // Keep the instance dispatch entry available while destroying the
+        // presenter Vulkan surfaces. Their X11 windows are dropped only after
+        // those callbacks return.
+        let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+            super::surface::destroy_presenters_for_instance(instance);
+        }));
         instances()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -298,6 +330,10 @@ unsafe fn destroy_instance_inner(
             .unwrap_or_else(|e| e.into_inner())
             .remove(&instance);
         crate::state::instance_dispatch()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&instance);
+        crate::state::presenter_availability()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&instance);
