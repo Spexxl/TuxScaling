@@ -489,6 +489,17 @@ impl MotionEstimator {
         width: u32,
         height: u32,
     ) {
+        unsafe { self.dispatch_with_barrier(command, pipeline, params, width, height, true) };
+    }
+    unsafe fn dispatch_with_barrier(
+        &self,
+        command: vk::CommandBuffer,
+        pipeline: usize,
+        params: [u32; 16],
+        width: u32,
+        height: u32,
+        barrier_after: bool,
+    ) {
         unsafe {
             self.device.cmd_bind_pipeline(
                 command,
@@ -504,7 +515,9 @@ impl MotionEstimator {
             );
             self.device
                 .cmd_dispatch(command, width.div_ceil(8), height.div_ceil(8), 1);
-            compute_memory_barrier(&self.device, command);
+            if barrier_after {
+                compute_memory_barrier(&self.device, command);
+            }
         }
     }
     pub unsafe fn record(
@@ -620,7 +633,18 @@ impl MotionEstimator {
                         | ((profile.coarse_radius as u32) << 20)
                         | ((profile.fine_radius as u32) << 24)
                         | (profile.sample_step << 28);
-                    self.dispatch(command, 2, p, l.width.div_ceil(2), l.height.div_ceil(2));
+                    // Forward and backward flow write independent buffers. No
+                    // producer/consumer dependency exists at this boundary;
+                    // retain barriers for all pyramid dependencies.
+                    let barrier_after = !(direction == 0 && i == 0);
+                    self.dispatch_with_barrier(
+                        command,
+                        2,
+                        p,
+                        l.width.div_ceil(2),
+                        l.height.div_ceil(2),
+                        barrier_after,
+                    );
                 }
                 if let Some((query_pool, query_base)) = timestamps {
                     self.device.cmd_write_timestamp(

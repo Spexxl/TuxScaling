@@ -12,7 +12,8 @@ mod quality_gates;
 fn confidence_reads_a_separate_dense_motion_source() {
     let shader = include_str!("../../../shaders/motion/confidence.comp");
     assert!(shader.contains("dense_motion_input"));
-    assert!(shader.contains("imageLoad(dense_motion_input,n)"));
+    assert!(shader.contains("dense_motion_at"));
+    assert!(shader.contains("dense_motion_tile"));
     assert!(!shader.contains("imageLoad(motion_image,n)"));
 }
 
@@ -94,6 +95,47 @@ fn performance_flow_is_faster_than_balanced_after_warmup() {
 }
 
 unsafe fn timed_flow_median(extent: vk::Extent2D, quality: MotionQuality) -> f32 {
+    let samples = unsafe { timed_flow_samples(extent, quality) };
+    let mut values = samples
+        .iter()
+        .map(|phases| phases[2] + phases[3])
+        .collect::<Vec<_>>();
+    values.sort_by(f32::total_cmp);
+    values[values.len() / 2]
+}
+
+#[test]
+#[ignore = "requires a RADV Vulkan GPU"]
+fn balanced_phase_timing_records_median_and_p95_after_warmup() {
+    let extent = vk::Extent2D {
+        width: 128,
+        height: 96,
+    };
+    let samples = unsafe { timed_flow_samples(extent, MotionQuality::Balanced) };
+    let names = [
+        "luma",
+        "pyramid",
+        "forward",
+        "backward",
+        "confidence",
+        "stats",
+        "scene",
+        "invalidate",
+    ];
+    for (index, name) in names.iter().enumerate() {
+        let mut values = samples
+            .iter()
+            .map(|phases| phases[index])
+            .collect::<Vec<_>>();
+        values.sort_by(f32::total_cmp);
+        let median = values[values.len() / 2];
+        let p95 = values[(values.len() * 95).div_ceil(100).saturating_sub(1)];
+        eprintln!("baseline quality=Balanced phase={name} median_ms={median:.6} p95_ms={p95:.6}");
+        assert!(median.is_finite() && p95.is_finite());
+    }
+}
+
+unsafe fn timed_flow_samples(extent: vk::Extent2D, quality: MotionQuality) -> Vec<[f32; 8]> {
     const WARMUP: usize = 180;
     const SAMPLES: usize = 30;
     const QUERY_COUNT: u32 = 9;
@@ -185,20 +227,29 @@ unsafe fn timed_flow_median(extent: vk::Extent2D, quality: MotionQuality) -> f32
                     )
                     .unwrap();
             }
-            let elapsed = timestamps[4].wrapping_sub(timestamps[2]) as f32
-                * properties.limits.timestamp_period
-                / 1_000_000.0;
-            samples.push(elapsed);
+            let elapsed = |start: usize, end: usize| {
+                timestamps[end].wrapping_sub(timestamps[start]) as f32
+                    * properties.limits.timestamp_period
+                    / 1_000_000.0
+            };
+            samples.push([
+                elapsed(0, 1),
+                elapsed(1, 2),
+                elapsed(2, 3),
+                elapsed(3, 4),
+                elapsed(4, 5),
+                elapsed(5, 6),
+                elapsed(6, 7),
+                elapsed(7, 8),
+            ]);
         }
     }
-    samples.sort_by(f32::total_cmp);
-    let median = samples[samples.len() / 2];
     unsafe {
         gpu.device.destroy_fence(fence, None);
         gpu.device.free_command_buffers(gpu.pool, &[command]);
         gpu.device.destroy_query_pool(query_pool, None);
     }
-    median
+    samples
 }
 
 fn noise(a: i32, b: i32) -> f32 {
@@ -257,6 +308,14 @@ fn affine_pattern(width: u32, height: u32) -> Vec<u8> {
 fn percentile95(mut values: Vec<f32>) -> f32 {
     values.sort_by(f32::total_cmp);
     values[((values.len() - 1) * 95) / 100]
+}
+
+fn motion_quality_limits(quality: MotionQuality) -> (f32, f32) {
+    if quality == MotionQuality::Performance {
+        (quality.mean_epe_limit(), quality.p95_epe_limit())
+    } else {
+        (quality_gates::MAX_MEAN_EPE, quality_gates::MAX_P95_EPE)
+    }
 }
 
 fn auroc(positive: &[f32], negative: &[f32]) -> f32 {
@@ -528,6 +587,260 @@ unsafe fn pair_quality_valid(
     );
     (vectors, confidence, cut, exposure)
 }
+
+fn output_hash(vectors: &[[f32; 2]], confidence: &[f32]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for value in vectors {
+        for component in value {
+            hash ^= u64::from(component.to_bits());
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    for value in confidence {
+        hash ^= u64::from(value.to_bits());
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn add_vegetation_details(frame: &mut [u8], width: u32, height: u32) {
+    for y in (8..height.saturating_sub(8)).step_by(5) {
+        let x = (y.wrapping_mul(13) % width.max(1)).min(width.saturating_sub(1));
+        let offset = (y * width + x) as usize * 4;
+        frame[offset..offset + 4].copy_from_slice(&[34, 210, 78, 255]);
+    }
+}
+
+fn add_sensor_noise(frame: &mut [u8]) {
+    let (pixels, _) = frame.as_chunks_mut::<4>();
+    for (index, pixel) in pixels.iter_mut().enumerate() {
+        let value = (index as u32)
+            .wrapping_mul(0x9e37_79b9)
+            .rotate_left(11)
+            .wrapping_add(0x85eb_ca6b);
+        let offset = ((value >> 24) & 0x1f) as i16 - 16;
+        for channel in &mut pixel[..3] {
+            *channel = (i16::from(*channel) + offset).clamp(0, 255) as u8;
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a RADV Vulkan GPU"]
+fn balanced_quality_regression_gate() {
+    let width = 128;
+    let height = 96;
+    let previous = pattern(width, height, 0, 0);
+
+    let translation = pattern(width, height, 5, -3);
+    let (translation_vectors, translation_confidence, _, _) = unsafe {
+        pair_quality(
+            width,
+            height,
+            &previous,
+            &translation,
+            MotionQuality::Balanced,
+        )
+    };
+    let translation_errors = translation_vectors
+        .iter()
+        .map(|value| ((value[0] + 5.0).powi(2) + (value[1] - 3.0).powi(2)).sqrt())
+        .collect::<Vec<_>>();
+    let translation_mean = translation_errors.iter().sum::<f32>() / translation_errors.len() as f32;
+    let translation_p95 = percentile95(translation_errors);
+    let translation_hash = output_hash(&translation_vectors, &translation_confidence);
+    eprintln!(
+        "baseline fixture=translation hash={:016x} mean_epe={translation_mean:.6} p95_epe={translation_p95:.6}",
+        translation_hash
+    );
+    assert_eq!(translation_hash, 0x80b2a154a13c0084);
+    assert!((translation_mean - 1.593801).abs() <= 0.0001);
+    assert!((translation_p95 - 10.440307).abs() <= 0.0001);
+
+    let affine = affine_pattern(width, height);
+    let (affine_vectors, affine_confidence, _, _) =
+        unsafe { pair_quality(width, height, &previous, &affine, MotionQuality::Balanced) };
+    let theta = 0.025_f32;
+    let scale = 1.02_f32;
+    let (sin, cos) = theta.sin_cos();
+    let center_x = width as f32 * 0.5;
+    let center_y = height as f32 * 0.5;
+    let affine_vectors_ref = &affine_vectors;
+    let affine_errors = (12..height - 12)
+        .flat_map(|y| {
+            (12..width - 12).map(move |x| {
+                let px = x as f32 - center_x;
+                let py = y as f32 - center_y;
+                let expected = [
+                    scale * (cos * px - sin * py) + center_x - x as f32,
+                    scale * (sin * px + cos * py) + center_y - y as f32,
+                ];
+                let value = affine_vectors_ref[(y * width + x) as usize];
+                ((value[0] - expected[0]).powi(2) + (value[1] - expected[1]).powi(2)).sqrt()
+            })
+        })
+        .collect::<Vec<_>>();
+    let affine_mean = affine_errors.iter().sum::<f32>() / affine_errors.len() as f32;
+    let affine_p95 = percentile95(affine_errors);
+    let affine_hash = output_hash(&affine_vectors, &affine_confidence);
+    eprintln!(
+        "baseline fixture=rotation_scaling hash={:016x} mean_epe={affine_mean:.6} p95_epe={affine_p95:.6} finite_motion={} finite_confidence={}",
+        affine_hash,
+        affine_vectors
+            .iter()
+            .all(|value| value[0].is_finite() && value[1].is_finite()),
+        affine_confidence.iter().all(|value| value.is_finite())
+    );
+    assert_eq!(affine_hash, 0x8e84aa2f984e71a0);
+    assert!((affine_mean - 0.436306).abs() <= 0.0001);
+    assert!((affine_p95 - 0.754515).abs() <= 0.0001);
+
+    let mut occluded = pattern(width, height, 0, 0);
+    for y in 32..64 {
+        for x in 40..88 {
+            let offset = (y * width + x) as usize * 4;
+            occluded[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+    }
+    let (occlusion_vectors, occlusion_confidence, _, _) =
+        unsafe { pair_quality(width, height, &previous, &occluded, MotionQuality::Balanced) };
+    let predicted = occlusion_confidence
+        .iter()
+        .map(|value| *value < 0.5)
+        .collect::<Vec<_>>();
+    let labels = (0..(width * height) as usize)
+        .map(|index| {
+            let x = index as u32 % width;
+            let y = index as u32 / width;
+            (40..88).contains(&x) && (32..64).contains(&y)
+        })
+        .collect::<Vec<_>>();
+    let true_positive = predicted
+        .iter()
+        .zip(&labels)
+        .filter(|(prediction, label)| **prediction && **label)
+        .count() as f32;
+    let false_positive = predicted
+        .iter()
+        .zip(&labels)
+        .filter(|(prediction, label)| **prediction && !**label)
+        .count() as f32;
+    let false_negative = predicted
+        .iter()
+        .zip(&labels)
+        .filter(|(prediction, label)| !**prediction && **label)
+        .count() as f32;
+    let precision = true_positive / (true_positive + false_positive).max(1.0);
+    let recall = true_positive / (true_positive + false_negative).max(1.0);
+    let occlusion_scores = occlusion_confidence
+        .iter()
+        .zip(&labels)
+        .partition::<Vec<_>, _>(|(_, label)| **label);
+    let positives = occlusion_scores
+        .0
+        .iter()
+        .map(|(score, _)| 1.0 - **score)
+        .collect::<Vec<_>>();
+    let negatives = occlusion_scores
+        .1
+        .iter()
+        .map(|(score, _)| 1.0 - **score)
+        .collect::<Vec<_>>();
+    let occlusion_auroc = auroc(&positives, &negatives);
+    let occlusion_hash = output_hash(&occlusion_vectors, &occlusion_confidence);
+    eprintln!(
+        "baseline fixture=occlusion hash={:016x} precision={precision:.6} recall={recall:.6} auroc={occlusion_auroc:.6}",
+        occlusion_hash
+    );
+    assert_eq!(occlusion_hash, 0x57e6ec14c8fb6598);
+    assert!((precision - 0.721465).abs() <= 0.0001);
+    assert!((recall - 1.0).abs() <= 0.0001);
+    assert!((occlusion_auroc - 0.976894).abs() <= 0.0001);
+
+    let mut thin = pattern(width, height, 1, 0);
+    for y in 8..88 {
+        let offset = (y * width + width / 2) as usize * 4;
+        thin[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+    }
+    let (thin_vectors, thin_confidence, _, _) =
+        unsafe { pair_quality(width, height, &previous, &thin, MotionQuality::Balanced) };
+    eprintln!(
+        "baseline fixture=thin_geometry hash={:016x} finite={}",
+        output_hash(&thin_vectors, &thin_confidence),
+        thin_vectors
+            .iter()
+            .all(|value| value[0].is_finite() && value[1].is_finite())
+    );
+    assert_eq!(
+        output_hash(&thin_vectors, &thin_confidence),
+        0x747a118dd1bf5184
+    );
+
+    let mut vegetation = pattern(width, height, 2, -1);
+    add_vegetation_details(&mut vegetation, width, height);
+    let (vegetation_vectors, vegetation_confidence, _, _) = unsafe {
+        pair_quality(
+            width,
+            height,
+            &previous,
+            &vegetation,
+            MotionQuality::Balanced,
+        )
+    };
+    eprintln!(
+        "baseline fixture=vegetation hash={:016x} finite={}",
+        output_hash(&vegetation_vectors, &vegetation_confidence),
+        vegetation_vectors
+            .iter()
+            .all(|value| value[0].is_finite() && value[1].is_finite())
+    );
+    assert_eq!(
+        output_hash(&vegetation_vectors, &vegetation_confidence),
+        0x32eff3ed92d186fc
+    );
+
+    let mut noisy = pattern(width, height, 1, -1);
+    add_sensor_noise(&mut noisy);
+    let (noise_vectors, noise_confidence, _, _) =
+        unsafe { pair_quality(width, height, &previous, &noisy, MotionQuality::Balanced) };
+    eprintln!(
+        "baseline fixture=noise hash={:016x} finite={}",
+        output_hash(&noise_vectors, &noise_confidence),
+        noise_vectors
+            .iter()
+            .all(|value| value[0].is_finite() && value[1].is_finite())
+    );
+    assert_eq!(
+        output_hash(&noise_vectors, &noise_confidence),
+        0x937863e7dd92c7d2
+    );
+
+    let (repeat_vectors, repeat_confidence, _, _) = unsafe {
+        pair_quality(
+            width,
+            height,
+            &previous,
+            &translation,
+            MotionQuality::Balanced,
+        )
+    };
+    let repeat_hash = output_hash(&repeat_vectors, &repeat_confidence);
+    let flicker = repeat_vectors
+        .iter()
+        .zip(&translation_vectors)
+        .map(|(left, right)| (left[0] - right[0]).powi(2) + (left[1] - right[1]).powi(2))
+        .sum::<f32>()
+        / repeat_vectors.len() as f32;
+    eprintln!(
+        "baseline fixture=frame_time_variation hash={repeat_hash:016x} flicker_mse={flicker:.6}"
+    );
+    assert!(flicker <= 0.000001);
+    assert_eq!(
+        repeat_hash,
+        output_hash(&translation_vectors, &translation_confidence)
+    );
+}
+
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn known_motion_and_scene_cut() {
@@ -597,16 +910,15 @@ fn all_quality_presets_keep_dense_odd_extent_translation() {
         assert_eq!(cut, 0);
         assert!(confidence.iter().all(|value| value.is_finite()));
         let p95 = percentile95(errors);
+        let (mean_limit, p95_limit) = motion_quality_limits(quality);
         eprintln!("{quality:?} dense translation EPE={epe:.4} p95={p95:.4}");
         assert!(
-            quality_gates::passes_upper_gate(epe, quality_gates::MAX_MEAN_EPE),
-            "{quality:?} EPE={epe} > {}",
-            quality_gates::MAX_MEAN_EPE
+            quality_gates::passes_upper_gate(epe, mean_limit),
+            "{quality:?} EPE={epe} > {mean_limit}"
         );
         assert!(
-            quality_gates::passes_upper_gate(p95, quality_gates::MAX_P95_EPE),
-            "{quality:?} p95={p95} > {}",
-            quality_gates::MAX_P95_EPE
+            quality_gates::passes_upper_gate(p95, p95_limit),
+            "{quality:?} p95={p95} > {p95_limit}"
         );
     }
 }
@@ -648,21 +960,20 @@ fn guidance_scale_matrix_measures_estimator_output_for_every_quality() {
             }
             let mean = errors.iter().sum::<f32>() / errors.len() as f32;
             let p95 = percentile95(errors);
+            let (mean_limit, p95_limit) = motion_quality_limits(quality);
             eprintln!(
-                "fixture=translation scale={scale:.2} quality={quality:?} signal=motion metric=mean_epe measured={mean:.4} limit={:.4}",
-                quality_gates::MAX_MEAN_EPE
+                "fixture=translation scale={scale:.2} quality={quality:?} signal=motion metric=mean_epe measured={mean:.4} limit={mean_limit:.4}"
             );
             eprintln!(
-                "fixture=translation scale={scale:.2} quality={quality:?} signal=motion metric=p95_epe measured={p95:.4} limit={:.4}",
-                quality_gates::MAX_P95_EPE
+                "fixture=translation scale={scale:.2} quality={quality:?} signal=motion metric=p95_epe measured={p95:.4} limit={p95_limit:.4}"
             );
             assert_eq!(cut, 0, "scale={scale} quality={quality:?}");
             assert!(
-                quality_gates::passes_upper_gate(mean, quality_gates::MAX_MEAN_EPE),
+                quality_gates::passes_upper_gate(mean, mean_limit),
                 "scale={scale} quality={quality:?} mean EPE={mean}"
             );
             assert!(
-                quality_gates::passes_upper_gate(p95, quality_gates::MAX_P95_EPE),
+                quality_gates::passes_upper_gate(p95, p95_limit),
                 "scale={scale} quality={quality:?} p95 EPE={p95}"
             );
         }
@@ -713,16 +1024,15 @@ fn rotation_zoom_and_affine_fixture_remain_finite_and_calibrated() {
         assert_eq!(cut, 0);
         assert!(confidence.iter().all(|value| value.is_finite()));
         let p95 = percentile95(errors);
+        let (mean_limit, p95_limit) = motion_quality_limits(quality);
         eprintln!("{quality:?} affine EPE={epe:.4} p95={p95:.4}");
         assert!(
-            quality_gates::passes_upper_gate(epe, quality_gates::MAX_MEAN_EPE),
-            "{quality:?} EPE={epe} > {}",
-            quality_gates::MAX_MEAN_EPE
+            quality_gates::passes_upper_gate(epe, mean_limit),
+            "{quality:?} EPE={epe} > {mean_limit}"
         );
         assert!(
-            quality_gates::passes_upper_gate(p95, quality_gates::MAX_P95_EPE),
-            "{quality:?} p95={p95} > {}",
-            quality_gates::MAX_P95_EPE
+            quality_gates::passes_upper_gate(p95, p95_limit),
+            "{quality:?} p95={p95} > {p95_limit}"
         );
     }
 }

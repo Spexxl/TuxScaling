@@ -1,13 +1,45 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
-float source(ivec2 q) {
-    q=clamp(q,ivec2(0),ivec2(p.width,p.height)-1);
+const int SOURCE_TILE_HALO = 4;
+const int SOURCE_TILE_SIZE = 25;
+shared float source_tile[SOURCE_TILE_SIZE][SOURCE_TILE_SIZE];
+shared vec2 source_gradient_tile[SOURCE_TILE_SIZE][SOURCE_TILE_SIZE];
+
+float source_global(ivec2 q) {
+    q=clamp_level_coord(q);
     uint i=p.offset+uint(q.y)*p.width+uint(q.x);
     return (p.direction&1)==0?current_luma[i]:previous_luma[i];
 }
+ivec2 source_tile_origin() {
+    return ivec2(gl_WorkGroupID.xy)*16-ivec2(SOURCE_TILE_HALO);
+}
+void preload_source_tile() {
+    ivec2 origin=source_tile_origin();
+    int linear=int(gl_LocalInvocationIndex);
+    for(int index=linear;index<SOURCE_TILE_SIZE*SOURCE_TILE_SIZE;index+=64) {
+        ivec2 local=ivec2(index%SOURCE_TILE_SIZE,index/SOURCE_TILE_SIZE);
+        source_tile[local.y][local.x]=source_global(origin+local);
+    }
+    barrier();
+    for(int index=linear;index<SOURCE_TILE_SIZE*SOURCE_TILE_SIZE;index+=64) {
+        ivec2 local=ivec2(index%SOURCE_TILE_SIZE,index/SOURCE_TILE_SIZE);
+        if(all(greaterThanEqual(local,ivec2(1))) &&
+            all(lessThanEqual(local,ivec2(SOURCE_TILE_SIZE-2)))) {
+            source_gradient_tile[local.y][local.x]=0.5*vec2(
+                source_tile[local.y][local.x+1]-source_tile[local.y][local.x-1],
+                source_tile[local.y+1][local.x]-source_tile[local.y-1][local.x]);
+        }
+    }
+    barrier();
+}
+float source(ivec2 q) {
+    q=clamp_level_coord(q);
+    ivec2 local=q-source_tile_origin();
+    return source_tile[local.y][local.x];
+}
 float target_point(ivec2 q) {
-    q=clamp(q,ivec2(0),ivec2(p.width,p.height)-1);
+    q=clamp_level_coord(q);
     uint i=p.offset+uint(q.y)*p.width+uint(q.x);
     return (p.direction&1)==0?previous_luma[i]:current_luma[i];
 }
@@ -22,9 +54,15 @@ float robust(float error) {
     return sqrt(error*error + 1e-4);
 }
 vec2 source_gradient(ivec2 q) {
-    return 0.5 * vec2(
-        source(q+ivec2(1,0))-source(q-ivec2(1,0)),
-        source(q+ivec2(0,1))-source(q-ivec2(0,1)));
+    ivec2 local=q-source_tile_origin();
+    if(any(lessThan(q,ivec2(0))) || any(greaterThanEqual(q,level_extent())) ||
+        any(lessThan(local,ivec2(1))) ||
+        any(greaterThan(local,ivec2(SOURCE_TILE_SIZE-2)))) {
+        return 0.5*vec2(
+            source_global(q+ivec2(1,0))-source_global(q-ivec2(1,0)),
+            source_global(q+ivec2(0,1))-source_global(q-ivec2(0,1)));
+    }
+    return source_gradient_tile[local.y][local.x];
 }
 vec2 target_gradient(vec2 q) {
     return 0.5 * vec2(
@@ -50,6 +88,7 @@ float cost(ivec2 center,vec2 delta) {
 void main() {
     uvec2 q=gl_GlobalInvocationID.xy;
     uint gw=(p.width+1)/2, gh=(p.height+1)/2;
+    preload_source_tile();
     if(q.x>=gw || q.y>=gh) return;
     uint i=p.grid_offset+q.y*gw+q.x;
     ivec2 center=ivec2(min(q*2+1,uvec2(p.width,p.height)-1));

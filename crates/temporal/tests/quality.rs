@@ -6,9 +6,9 @@ mod sequence;
 use ash::vk;
 use sequence::{
     affine_motion, auroc, depth_order, endpoint_error_masked, ev_error, f1, fade, flash, hud,
-    image_error, independent_objects, invalid_timing, layered_parallax, occlusion, particles,
-    pause, percentile, reveal_occlusion, rotation, scene_cut, subpixel_translation, thin_geometry,
-    translation, transparency, zoom,
+    image_error, independent_objects, invalid_timing, layered_parallax, noise, occlusion,
+    particles, pause, percentile, reveal_occlusion, rotation, scene_cut, subpixel_translation,
+    thin_geometry, translation, transparency, zoom,
 };
 use std::time::Duration;
 use tuxscaling_temporal::{
@@ -419,6 +419,63 @@ fn deterministic_failure_modes_cover_stable_signal_thresholds() {
     );
     assert!(pause(width, height).long_pause);
     assert!(!invalid_timing(width, height).timing_valid);
+}
+
+#[test]
+fn optical_flow_baseline_catalog_covers_motion_and_timing_axes() {
+    let width = 64;
+    let height = 48;
+    let cases = [
+        ("translation", translation(width, height)),
+        ("rotation", rotation(width, height)),
+        ("scaling", zoom(width, height)),
+        ("occlusion", occlusion(width, height)),
+        ("thin_geometry", thin_geometry(width, height)),
+        ("particles", particles(width, height)),
+        ("noise", noise(width, height)),
+        ("frame_time_variation", pause(width, height)),
+    ];
+
+    for (name, fixture) in cases {
+        assert_eq!(fixture.width, width, "{name}");
+        assert_eq!(fixture.height, height, "{name}");
+        assert!(
+            fixture
+                .previous
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite()),
+            "{name}"
+        );
+        assert!(
+            fixture
+                .current
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite()),
+            "{name}"
+        );
+        assert!(
+            fixture
+                .motion
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite()),
+            "{name}"
+        );
+        assert!(
+            fixture.depth.iter().all(|value| value.is_finite()),
+            "{name}"
+        );
+    }
+
+    let first = translation(width, height);
+    let second = translation(width, height);
+    assert_eq!(first.previous, second.previous);
+    assert_eq!(first.current, second.current);
+    assert_eq!(first.motion, second.motion);
+    assert!(!first.long_pause);
+    assert!(pause(width, height).long_pause);
 }
 
 #[test]

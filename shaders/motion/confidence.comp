@@ -2,6 +2,31 @@
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 layout(rg16f,binding=9) uniform readonly image2D dense_motion_input;
+const int CONFIDENCE_TILE_SIZE = 10;
+shared vec2 dense_motion_tile[CONFIDENCE_TILE_SIZE][CONFIDENCE_TILE_SIZE];
+
+ivec2 confidence_tile_origin() {
+    return ivec2(gl_WorkGroupID.xy)*8;
+}
+vec2 dense_motion_at(ivec2 q,ivec2 size) {
+    return imageLoad(dense_motion_input,clamp(q,ivec2(0),size-1)).xy;
+}
+void preload_dense_motion() {
+    ivec2 size=imageSize(motion_image);
+    ivec2 origin=confidence_tile_origin();
+    ivec2 local=ivec2(gl_LocalInvocationID.xy);
+    ivec2 pixel=origin+local;
+    dense_motion_tile[local.y+1][local.x+1]=dense_motion_at(pixel,size);
+    if(local.x==0) dense_motion_tile[local.y+1][0]=dense_motion_at(pixel+ivec2(-1,0),size);
+    if(local.x==7) dense_motion_tile[local.y+1][9]=dense_motion_at(pixel+ivec2(1,0),size);
+    if(local.y==0) dense_motion_tile[0][local.x+1]=dense_motion_at(pixel+ivec2(0,-1),size);
+    if(local.y==7) dense_motion_tile[9][local.x+1]=dense_motion_at(pixel+ivec2(0,1),size);
+    if(local.x==0 && local.y==0) dense_motion_tile[0][0]=dense_motion_at(pixel+ivec2(-1,-1),size);
+    if(local.x==7 && local.y==0) dense_motion_tile[0][9]=dense_motion_at(pixel+ivec2(1,-1),size);
+    if(local.x==0 && local.y==7) dense_motion_tile[9][0]=dense_motion_at(pixel+ivec2(-1,1),size);
+    if(local.x==7 && local.y==7) dense_motion_tile[9][9]=dense_motion_at(pixel+ivec2(1,1),size);
+    barrier();
+}
 
 float level0_sample(bool previous,vec2 original) {
     vec2 q=original*0.5;
@@ -28,9 +53,11 @@ vec4 coarse(ivec2 q,bool reverse) {
 void main() {
     uvec2 q=gl_GlobalInvocationID.xy;
     uvec2 size=uvec2(imageSize(motion_image));
+    preload_dense_motion();
     if(any(greaterThanEqual(q,size))) return;
     ivec2 pixel=ivec2(q);
-    vec2 motion=imageLoad(dense_motion_input,pixel).xy;
+    ivec2 tile_origin=confidence_tile_origin();
+    vec2 motion=dense_motion_tile[ivec2(gl_LocalInvocationID.xy).y+1][ivec2(gl_LocalInvocationID.xy).x+1];
     vec2 target=vec2(pixel)+motion;
     bool inside=all(greaterThanEqual(target,vec2(0))) &&
         all(lessThanEqual(target,vec2(size)-vec2(1)));
@@ -48,7 +75,8 @@ void main() {
     float stability=0.0;
     for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++) {
         ivec2 n=clamp(pixel+ivec2(x,y),ivec2(0),ivec2(size)-1);
-        stability+=length(imageLoad(dense_motion_input,n).xy-motion);
+        ivec2 local=n-tile_origin+1;
+        stability+=length(dense_motion_tile[local.y][local.x]-motion);
     }
     float spatial=exp(-0.12*stability/9.0);
     float ambiguity=clamp(forward.w,0.0,1.0);

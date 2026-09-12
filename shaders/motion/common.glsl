@@ -21,3 +21,11 @@ layout(push_constant) uniform Params {
     uint level; uint coarsest; uint valid; uint decode_srgb;
     uint mode; float scene_distance_threshold; float scene_consistency_threshold; uint direction;
 } p;
+
+ivec2 level_extent() {
+    return ivec2(p.width, p.height);
+}
+
+ivec2 clamp_level_coord(ivec2 q) {
+    return clamp(q, ivec2(0), level_extent() - 1);
+}
