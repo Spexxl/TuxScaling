@@ -1,4 +1,5 @@
 pub const CRATE_NAME: &str = "tuxscaling-runtime";
+pub(crate) mod diagnostic_capture;
 mod generation;
 pub use generation::*;
 mod present;

@@ -7,6 +7,13 @@ pub struct OutputGeneration {
     image_count: usize,
 }
 
+/// Returns the next monotonically increasing physical-output generation ID.
+/// Saturation keeps diagnostics usable even if a long-lived process reaches
+/// the numeric limit instead of wrapping into an older generation.
+pub const fn next_generation_id(current: u64) -> u64 {
+    current.saturating_add(1)
+}
+
 impl OutputGeneration {
     pub const fn new(id: u64, extent: vk::Extent2D, image_count: usize) -> Self {
         Self {
@@ -105,7 +112,7 @@ impl RuntimeGeneration {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutputGeneration, RuntimeGeneration};
+    use super::{OutputGeneration, RuntimeGeneration, next_generation_id};
     use ash::vk;
 
     fn extent(width: u32, height: u32) -> vk::Extent2D {
@@ -149,5 +156,11 @@ mod tests {
             runtime.dispatch_mode(true),
             super::DispatchMode::TemporalBackend
         );
+    }
+
+    #[test]
+    fn generation_ids_never_wrap_back_to_an_older_output() {
+        assert_eq!(next_generation_id(0), 1);
+        assert_eq!(next_generation_id(u64::MAX), u64::MAX);
     }
 }

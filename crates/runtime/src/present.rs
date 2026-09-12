@@ -1,4 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
+use crate::diagnostic_capture::{
+    DiagnosticCapture, DiagnosticCaptureConfig, DiagnosticFrameMetadata, DiagnosticImage,
+};
 use ash::vk;
 use std::{collections::VecDeque, mem, time::Instant};
 use tuxscaling_capture::Capture;
@@ -16,6 +19,7 @@ use tuxscaling_vulkan::{compute_memory_barrier, image_barrier, transfer_memory_b
 
 #[path = "pipeline.rs"]
 mod pipeline;
+use crate::next_generation_id;
 pub use pipeline::{FrameTimingState, TemporalPipeline, TemporalPipelineDescriptor, TimingState};
 
 pub type SetLoaderData = unsafe extern "system" fn(vk::Device, *mut std::ffi::c_void) -> vk::Result;
@@ -76,6 +80,7 @@ pub struct SwapchainRuntimeCreateInfo {
     pub temporal_enabled: bool,
 }
 
+#[derive(Clone, Copy)]
 struct Slot {
     command: vk::CommandBuffer,
     backend_command: vk::CommandBuffer,
@@ -226,6 +231,13 @@ fn upscaler_name(upscaler: Upscaler) -> &'static str {
         Upscaler::Reference => "Reference",
         Upscaler::Fsr314 => "FSR 3.1.4",
         Upscaler::Off => "Off",
+    }
+}
+
+fn guidance_mode_name(mode: GuidanceMode) -> &'static str {
+    match mode {
+        GuidanceMode::Estimated => "Estimated",
+        GuidanceMode::Zero => "Zero",
     }
 }
 
@@ -616,6 +628,8 @@ pub struct SwapchainRuntime {
     temporal_enabled: bool,
     set_loader_data: Option<SetLoaderData>,
     temporal: TemporalPipeline,
+    diagnostic_capture: Option<DiagnosticCapture>,
+    generation_id: u64,
     mode: u32,
     output_presented: Vec<bool>,
     pending_output: Option<usize>,
@@ -701,6 +715,27 @@ impl SwapchainRuntime {
             unsafe { create_output_views(device, &images.output_images, info.format) }?;
         let image_count = images.output_images.len();
         let diagnostic_resolution = temporal.resolution;
+        let diagnostic_capture = DiagnosticCaptureConfig::from_env().and_then(|config| {
+            let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
+            match unsafe {
+                DiagnosticCapture::new(
+                    device,
+                    &memory,
+                    diagnostic_resolution.game_extent,
+                    diagnostic_resolution.guidance_extent,
+                    diagnostic_resolution.output_extent,
+                    info.format,
+                    image_count,
+                    config,
+                )
+            } {
+                Ok(capture) => Some(capture),
+                Err(error) => {
+                    eprintln!("TuxScaling: diagnostic capture unavailable: {error:?}");
+                    None
+                }
+            }
+        });
         let promoted_borderless =
             diagnostic_resolution.game_extent != diagnostic_resolution.output_extent && fullscreen;
         let monitor = monitor.map_or_else(
@@ -732,6 +767,8 @@ impl SwapchainRuntime {
             temporal_enabled,
             set_loader_data,
             temporal,
+            diagnostic_capture,
+            generation_id: 0,
             mode,
             output_presented: vec![false; image_count],
             pending_output: None,
@@ -862,6 +899,10 @@ impl SwapchainRuntime {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
         unsafe { self.device.device_wait_idle() }?;
+        let old_fences = self.diagnostic_fences();
+        if let Some(capture) = &mut self.diagnostic_capture {
+            unsafe { capture.service_completed(&old_fences) };
+        }
 
         let output_views =
             unsafe { create_output_views(&self.device, &output_images, info.format) }?;
@@ -914,9 +955,39 @@ impl SwapchainRuntime {
             }
         };
 
+        let diagnostic_capture = self
+            .diagnostic_capture
+            .as_ref()
+            .map(|capture| capture.config().clone())
+            .and_then(|config| {
+                let memory = unsafe {
+                    self.instance
+                        .get_physical_device_memory_properties(self.physical)
+                };
+                match unsafe {
+                    DiagnosticCapture::new(
+                        &self.device,
+                        &memory,
+                        temporal.resolution.game_extent,
+                        temporal.resolution.guidance_extent,
+                        temporal.resolution.output_extent,
+                        info.format,
+                        output_images.len(),
+                        config,
+                    )
+                } {
+                    Ok(capture) => Some(capture),
+                    Err(error) => {
+                        eprintln!("TuxScaling: diagnostic capture resize unavailable: {error:?}");
+                        None
+                    }
+                }
+            });
+
         let old_views = mem::replace(&mut self.output_views, output_views);
         let old_overlay = self.overlay.replace(overlay);
         let old_temporal = mem::replace(&mut self.temporal, temporal);
+        let old_diagnostic_capture = mem::replace(&mut self.diagnostic_capture, diagnostic_capture);
         let old_query_pool = old_temporal.queries;
         let old_pool = mem::replace(&mut self.pool, vk::CommandPool::null());
         let old_slots = mem::take(&mut self.slots);
@@ -927,6 +998,7 @@ impl SwapchainRuntime {
         self.output_presented = vec![false; self.output_images.len()];
         self.pending_output = None;
         self.temporal_enabled = temporal_enabled;
+        self.generation_id = next_generation_id(self.generation_id);
         self.temporal.reset_history(GuidanceReset::Resize);
         self.diagnostics.state = "Native generation published; temporal backend ready".into();
         self.diagnostics.reset_reason = reset_name(GuidanceReset::Resize).into();
@@ -979,6 +1051,7 @@ impl SwapchainRuntime {
 
         drop(old_overlay);
         drop(old_temporal);
+        drop(old_diagnostic_capture);
         unsafe {
             for view in old_views {
                 self.device.destroy_image_view(view, None);
@@ -999,6 +1072,172 @@ impl SwapchainRuntime {
             rect,
         )
     }
+
+    fn diagnostic_metadata(&self, frame_id: u64) -> DiagnosticFrameMetadata {
+        let viewport = content_viewport(
+            self.temporal.resolution.game_extent,
+            self.temporal.resolution.output_extent,
+        );
+        DiagnosticFrameMetadata {
+            frame_id,
+            generation_id: self.generation_id,
+            game_extent: [
+                self.temporal.resolution.game_extent.width,
+                self.temporal.resolution.game_extent.height,
+            ],
+            guidance_extent: [
+                self.temporal.resolution.guidance_extent.width,
+                self.temporal.resolution.guidance_extent.height,
+            ],
+            output_extent: [
+                self.temporal.resolution.output_extent.width,
+                self.temporal.resolution.output_extent.height,
+            ],
+            viewport: [
+                viewport.offset[0],
+                viewport.offset[1],
+                viewport.size[0],
+                viewport.size[1],
+            ],
+            reset_reason: self.diagnostics.reset_reason.clone(),
+            backend: upscaler_name(self.temporal.active_upscaler).into(),
+            guidance_mode: guidance_mode_name(self.temporal.config.guidance_mode).into(),
+            ablations: self.temporal.guidance_ablations,
+            sharpening_enabled: self.temporal.config.sharpening_enabled,
+            sharpness: self.temporal.config.sharpness,
+            history_age: self.temporal.history_age,
+            gpu_timings_ms: [
+                self.diagnostics.capture_ms,
+                self.diagnostics.luma_ms,
+                self.diagnostics.pyramid_ms,
+                self.diagnostics.forward_flow_ms,
+                self.diagnostics.backward_flow_ms,
+                self.diagnostics.confidence_ms,
+                self.diagnostics.stats_ms,
+                self.diagnostics.scene_ms,
+                self.diagnostics.invalidate_ms,
+                self.diagnostics.reactive_ms,
+                self.diagnostics.exposure_ms,
+                self.diagnostics.depth_ms,
+                self.diagnostics.guidance_total_ms,
+                self.diagnostics.reconstruction_ms,
+                self.diagnostics.overlay_ms,
+            ],
+        }
+    }
+
+    fn diagnostic_fences(&self) -> Vec<vk::Fence> {
+        self.slots.iter().map(|slot| slot.fence).collect()
+    }
+
+    unsafe fn service_diagnostic_capture(&mut self) {
+        let fences = self.diagnostic_fences();
+        if let Some(capture) = &mut self.diagnostic_capture {
+            unsafe { capture.service_completed(&fences) };
+        }
+    }
+
+    unsafe fn record_diagnostic_frame(
+        &mut self,
+        command: vk::CommandBuffer,
+        index: usize,
+        frame_id: u64,
+        output_name: &'static str,
+        source: Option<DiagnosticImage>,
+    ) {
+        let output = DiagnosticImage::new(
+            output_name,
+            self.output_images[index],
+            self.temporal.resolution.output_extent,
+            self.info.format,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        let mut images = Vec::with_capacity(11);
+        if let Some(source) = source {
+            images.push(source);
+        }
+        images.push(output);
+        if let Some(motion) = &self.temporal.motion {
+            images.push(DiagnosticImage::new(
+                "motion",
+                motion.vectors.handle,
+                motion.vectors.extent,
+                motion.vectors.format,
+                vk::ImageLayout::GENERAL,
+            ));
+            images.push(DiagnosticImage::new(
+                "confidence",
+                motion.confidence.handle,
+                motion.confidence.extent,
+                motion.confidence.format,
+                vk::ImageLayout::GENERAL,
+            ));
+        }
+        if let Some(guidance) = &self.temporal.guidance {
+            for (name, image) in [
+                ("disocclusion", &guidance.disocclusion),
+                ("reactive", &guidance.reactive),
+                ("composition", &guidance.transparency),
+                ("relative_depth", &guidance.depth),
+                ("exposure", &guidance.exposure),
+            ] {
+                images.push(DiagnosticImage::new(
+                    name,
+                    image.handle,
+                    image.extent,
+                    image.format,
+                    vk::ImageLayout::GENERAL,
+                ));
+            }
+        }
+        let metadata = self.diagnostic_metadata(frame_id);
+        let Some(capture) = &mut self.diagnostic_capture else {
+            return;
+        };
+        unsafe { capture.record_frame(command, index, metadata, &images) };
+    }
+
+    unsafe fn record_off_diagnostic_frame(
+        &mut self,
+        command: vk::CommandBuffer,
+        index: usize,
+        frame_id: u64,
+        game_image: vk::Image,
+        source_layout: vk::ImageLayout,
+    ) {
+        let source = DiagnosticImage::new(
+            "source",
+            game_image,
+            self.temporal.resolution.game_extent,
+            self.info.format,
+            source_layout,
+        );
+        unsafe {
+            self.record_diagnostic_frame(command, index, frame_id, "spatial_off", Some(source));
+        }
+    }
+
+    unsafe fn resize_diagnostic_capture(&mut self) {
+        let fences = self.diagnostic_fences();
+        let Some(capture) = &mut self.diagnostic_capture else {
+            return;
+        };
+        unsafe { capture.service_completed(&fences) };
+        let resolution = self.temporal.resolution;
+        if let Err(error) = unsafe {
+            capture.resize(
+                resolution.game_extent,
+                resolution.guidance_extent,
+                resolution.output_extent,
+                self.info.format,
+                self.output_images.len(),
+            )
+        } {
+            eprintln!("TuxScaling: diagnostic capture resize failed: {error:?}");
+            capture.mark_device_lost();
+        }
+    }
+
     unsafe fn initialize(&mut self, queue: vk::Queue, family: u32) -> Result<(), vk::Result> {
         if let Some(selected) = self.queue {
             return if selected == queue {
@@ -1122,6 +1361,7 @@ impl SwapchainRuntime {
         self.diagnostics.upscaler = self.temporal.active_upscaler;
         self.diagnostics.active_upscaler = self.temporal.active_upscaler;
         self.diagnostics.state = "Guidance scale changed; history reset".into();
+        unsafe { self.resize_diagnostic_capture() };
         Ok(())
     }
     pub unsafe fn prepare_frame(
@@ -1155,7 +1395,7 @@ impl SwapchainRuntime {
             physical_index,
         )?;
         let index = physical_index as usize;
-        let slot = self
+        let slot = *self
             .slots
             .get(index)
             .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
@@ -1165,6 +1405,7 @@ impl SwapchainRuntime {
             vk::ImageLayout::UNDEFINED
         };
         unsafe { self.device.wait_for_fences(&[slot.fence], true, u64::MAX) }?;
+        unsafe { self.service_diagnostic_capture() };
         self.temporal.apply_pending_manual_controls();
         self.diagnostics.active_guidance_mode = self.temporal.config.guidance_mode;
         self.diagnostics.active_sharpening_enabled = self.temporal.config.sharpening_enabled;
@@ -1791,6 +2032,26 @@ impl SwapchainRuntime {
                     );
                 }
             }
+            let diagnostic_source = self.temporal.capture.as_ref().map(|capture| {
+                DiagnosticImage::new(
+                    "source",
+                    capture.source.color.handle,
+                    capture.source.color.extent,
+                    capture.source.color.format,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                )
+            });
+            let diagnostic_frame_id = guidance_view
+                .map_or(self.temporal.history.frame_id.saturating_add(1), |view| {
+                    view.motion.metadata.frame_id
+                });
+            self.record_diagnostic_frame(
+                slot.command,
+                index,
+                diagnostic_frame_id,
+                "reconstructed",
+                diagnostic_source,
+            );
             if backend_recorded
                 && self.temporal.config.comparison_enabled
                 && let (Some(comparison), Some(source)) =
@@ -1812,6 +2073,18 @@ impl SwapchainRuntime {
                 ) {
                     self.diagnostics.state = format!("Comparison unavailable: {error}");
                     self.diagnostics.fallback_reason = Some("comparison_record_failed".into());
+                } else if let Some(capture) = &mut self.diagnostic_capture {
+                    capture.record_additional(
+                        slot.command,
+                        index,
+                        DiagnosticImage::new(
+                            "comparison",
+                            self.output_images[index],
+                            self.temporal.resolution.output_extent,
+                            self.info.format,
+                            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        ),
+                    );
                 }
             }
             if self.mode != 0
@@ -1941,6 +2214,7 @@ impl SwapchainRuntime {
         }
         unsafe { self.initialize(queue, family) }?;
         unsafe { self.device.wait_for_fences(&[fence], true, u64::MAX)? };
+        unsafe { self.service_diagnostic_capture() };
         self.diagnostics.active_path =
             if self.temporal.resolution.game_extent != self.temporal.resolution.output_extent {
                 "spatial_off"
@@ -2005,6 +2279,18 @@ impl SwapchainRuntime {
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 );
             }
+            let source_layout = if game_image == self.output_images[index] {
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+            } else {
+                vk::ImageLayout::PRESENT_SRC_KHR
+            };
+            self.record_off_diagnostic_frame(
+                command,
+                index,
+                self.diagnostics.frame_id.saturating_add(1),
+                game_image,
+                source_layout,
+            );
             self.overlay
                 .as_mut()
                 .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
@@ -2054,11 +2340,12 @@ impl SwapchainRuntime {
         } else {
             vk::ImageLayout::UNDEFINED
         };
-        let slot = self
+        let slot = *self
             .slots
             .get(index)
             .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
         unsafe { self.device.wait_for_fences(&[slot.fence], true, u64::MAX) }?;
+        unsafe { self.service_diagnostic_capture() };
         eprintln!("TuxScaling: temporal processing failed ({reason:?}); using spatial fallback");
         self.temporal.reset_history(GuidanceReset::ProviderFailure);
         self.diagnostics.state = "Temporal failure; spatial fallback".into();
@@ -2175,6 +2462,22 @@ impl SwapchainRuntime {
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 );
             }
+            let fallback_source = self.temporal.capture.as_ref().map(|capture| {
+                DiagnosticImage::new(
+                    "source",
+                    capture.source.color.handle,
+                    capture.source.color.extent,
+                    capture.source.color.format,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                )
+            });
+            self.record_diagnostic_frame(
+                slot.command,
+                index,
+                self.temporal.history.frame_id.saturating_add(1),
+                "spatial_off",
+                fallback_source,
+            );
             self.overlay
                 .as_mut()
                 .unwrap()
@@ -2241,6 +2544,9 @@ impl SwapchainRuntime {
 }
 impl Drop for SwapchainRuntime {
     fn drop(&mut self) {
+        if let Some(capture) = &mut self.diagnostic_capture {
+            capture.shutdown();
+        }
         if !self.temporal.timings.is_empty() {
             let mut summary = String::new();
             for (axis, name) in [
