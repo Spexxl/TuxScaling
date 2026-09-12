@@ -1,0 +1,55 @@
+TuxScaling swapchain: format=B8G8R8A8_UNORM
+---
+TuxScaling swapchain: format=B8G8R8A8_UNORM
+TuxScaling evidence event=logical_swapchain_created logical=1280x720 physical=1280x720 virtual=1
+---
+TuxScaling swapchain: format=B8G8R8A8_UNORM
+TuxScaling evidence event=virtual_swapchain_active logical=1280x720 physical=2160x1440
+TuxScaling evidence event=native_generation_published logical=1280x720 physical=2160x1440
+TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=1
+TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=2
+TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=3
+TuxScaling evidence event=overlay_submitted virtual=1
+TuxScaling evidence event=overlay_submitted virtual=1
+TuxScaling evidence event=overlay_submitted virtual=1
+---
+TuxScaling swapchain: format=B8G8R8A8_UNORM
+TuxScaling evidence event=virtual_swapchain_active logical=1280x720 physical=2160x1440
+TuxScaling evidence event=native_generation_published logical=1280x720 physical=2160x1440
+TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=1280x720 physical=2160x1440
+TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=1280x720 physical=2160x1440
+TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=1280x720 physical=2160x1440
+TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=1
+TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=2
+TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=3
+TuxScaling evidence event=overlay_submitted virtual=1
+TuxScaling evidence event=overlay_submitted virtual=1
+TuxScaling evidence event=overlay_submitted virtual=1
+TuxScaling evidence event=presenter_fallback_to_direct reason=presenter_recreation_loop
+---
+TuxScaling swapchain: format=B8G8R8A8_UNORM
+TuxScaling evidence event=virtual_swapchain_active logical=2160x1440 physical=2160x1440
+TuxScaling evidence event=native_generation_published logical=2160x1440 physical=2160x1440
+TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=2160x1440 physical=2160x1440
+TuxScaling evidence event=fsr_dispatch backend=fsr_3_1_4 logical=2160x1440 physical=2160x1440
+TuxScaling evidence event=fsr_dispatch backend=fsr_3_1_4 logical=2160x1440 physical=2160x1440
+TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=1
+TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=2
+TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=3
+TuxScaling evidence event=overlay_submitted virtual=1
+TuxScaling evidence event=overlay_submitted virtual=1
+TuxScaling evidence event=overlay_submitted virtual=1
+---
+TuxScaling swapchain: format=B8G8R8A8_UNORM
+TuxScaling evidence event=virtual_swapchain_active logical=1280x720 physical=2160x1440
+TuxScaling evidence event=native_generation_published logical=1280x720 physical=2160x1440
+TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=1280x720 physical=2160x1440
+TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=1280x720 physical=2160x1440
+TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=1280x720 physical=2160x1440
+TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=1
+TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=2
+TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=3
+TuxScaling evidence event=overlay_submitted virtual=1
+TuxScaling evidence event=overlay_submitted virtual=1
+TuxScaling evidence event=overlay_submitted virtual=1
+overlay=hidden cursor=missing grab=stuck

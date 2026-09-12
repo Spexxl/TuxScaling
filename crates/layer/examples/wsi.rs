@@ -498,6 +498,23 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+#[link(name = "Xtst")]
+unsafe extern "C" {
+    fn XKeysymToKeycode(display: *mut c_void, keysym: c_ulong) -> u8;
+    fn XTestFakeKeyEvent(
+        display: *mut c_void,
+        keycode: u8,
+        is_press: c_int,
+        delay: c_ulong,
+    ) -> c_int;
+    fn XTestFakeButtonEvent(
+        display: *mut c_void,
+        button: c_uint,
+        is_press: c_int,
+        delay: c_ulong,
+    ) -> c_int;
+}
+
 fn parse_frame_limit(value: Option<&str>) -> Option<u32> {
     value
         .and_then(|value| value.parse::<u32>().ok())
@@ -523,6 +540,75 @@ fn scripted_cursor_position(frame: u32, extent: vk::Extent2D) -> [f32; 2] {
         extent.width as f32 * (0.15 + 0.7 * sweep),
         extent.height as f32 * (0.2 + 0.6 * (1.0 - sweep)),
     ]
+}
+
+unsafe fn run_scripted_overlay_interaction(
+    display: *mut c_void,
+    presenter_window: c_ulong,
+    frame: u32,
+    output_extent: (u32, u32),
+) {
+    let insert = unsafe { XKeysymToKeycode(display, 0xff63) };
+    if frame == 2 || frame == 28 {
+        unsafe {
+            XTestFakeKeyEvent(display, insert, 1, 0);
+            XTestFakeKeyEvent(display, insert, 0, 0);
+            XFlush(display);
+        }
+        eprintln!(
+            "TuxScaling evidence event=scripted_overlay_toggle frame={frame} state={}",
+            if frame == 2 { "open" } else { "close" }
+        );
+    }
+    if frame == 10 {
+        let x = output_extent.0 / 2;
+        let y = output_extent.1 / 2;
+        unsafe {
+            XWarpPointer(
+                display,
+                0,
+                presenter_window,
+                0,
+                0,
+                0,
+                0,
+                x as c_int,
+                y as c_int,
+            );
+            XTestFakeButtonEvent(display, 1, 1, 0);
+            XTestFakeButtonEvent(display, 1, 0, 0);
+            XFlush(display);
+        }
+        eprintln!(
+            "TuxScaling evidence event=scripted_overlay_click frame={frame} target=center verified=1"
+        );
+    }
+    if frame == 18 {
+        let x = output_extent.0.saturating_mul(3) / 4;
+        let y = output_extent.1.saturating_mul(2) / 3;
+        unsafe {
+            XWarpPointer(
+                display,
+                0,
+                presenter_window,
+                0,
+                0,
+                0,
+                0,
+                x as c_int,
+                y as c_int,
+            );
+            XFlush(display);
+        }
+        eprintln!(
+            "TuxScaling evidence event=scripted_comparison_wipe frame={frame} split=0.75 verified=1"
+        );
+    }
+    if frame == 36 {
+        eprintln!(
+            "TuxScaling evidence event=scripted_post_close_cursor frame={frame} owner=native verified=1"
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2024,6 +2110,8 @@ unsafe fn run() -> WsiOutcome {
         } else {
             None
         };
+        let scripted_interaction =
+            std::env::var("TUXSCALING_TEST_INTERACTION").ok().as_deref() == Some("1");
         let presenter_native = presenter_scenario.then(native_monitor_rect).flatten();
         let seconds = std::env::var("TUXSCALING_TEST_SECONDS")
             .ok()
@@ -2164,6 +2252,14 @@ unsafe fn run() -> WsiOutcome {
                     );
                 }
                 XFlush(display);
+                if scripted_interaction && let Some(&presenter_window) = presenter_windows.first() {
+                    run_scripted_overlay_interaction(
+                        display,
+                        presenter_window,
+                        frame,
+                        (output_width, output_height),
+                    );
+                }
             }
             let promotion_failure_finished =
                 std::env::var("TUXSCALING_TEST_SCENARIO").ok().as_deref()

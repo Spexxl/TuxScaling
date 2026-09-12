@@ -408,6 +408,105 @@ enum VkcubeExit {
     UnexpectedExit,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct VkcubeEvidence {
+    layer_startup: bool,
+    native_published: bool,
+    virtual_active: bool,
+    virtual_zero: bool,
+    fallback: bool,
+    validation_error: bool,
+    overlay_submitted: u32,
+    fsr_dispatches: u32,
+    reconstructed_presents: u32,
+    logical: Option<WsiExtent>,
+    physical: Option<WsiExtent>,
+}
+
+fn parse_vkcube_evidence(stdout: &str, stderr: &str) -> VkcubeEvidence {
+    let mut evidence = VkcubeEvidence::default();
+    for line in format!("{stdout}\n{stderr}").lines() {
+        let lowercase = line.to_ascii_lowercase();
+        evidence.layer_startup |=
+            lowercase.contains(&VKCUBE_LAYER_EVIDENCE_MARKER.to_ascii_lowercase());
+        evidence.validation_error |= lowercase.contains("validation error")
+            || lowercase.contains("vuid-")
+            || lowercase.contains("panic")
+            || lowercase.contains("panicked");
+        evidence.virtual_zero |= lowercase
+            .split_whitespace()
+            .any(|field| field == "virtual=0");
+        let Some(event) = wsi_field(&lowercase, "event") else {
+            continue;
+        };
+        match event {
+            "native_generation_published" => {
+                evidence.native_published = true;
+                evidence.logical = wsi_field(&lowercase, "logical").and_then(parse_wsi_extent);
+                evidence.physical = wsi_field(&lowercase, "physical").and_then(parse_wsi_extent);
+            }
+            "virtual_swapchain_active" => {
+                evidence.virtual_active = true;
+                evidence.logical = wsi_field(&lowercase, "logical").and_then(parse_wsi_extent);
+                evidence.physical = wsi_field(&lowercase, "physical").and_then(parse_wsi_extent);
+            }
+            "fsr_dispatch" => evidence.fsr_dispatches = evidence.fsr_dispatches.saturating_add(1),
+            "reconstructed_present" => {
+                evidence.reconstructed_presents = evidence.reconstructed_presents.saturating_add(1)
+            }
+            "overlay_submitted" => {
+                evidence.overlay_submitted = evidence.overlay_submitted.saturating_add(1)
+            }
+            "presenter_fallback"
+            | "presenter_fallback_to_direct"
+            | "presenter_instance_unavailable" => evidence.fallback = true,
+            _ => {}
+        }
+    }
+    evidence
+}
+
+fn vkcube_output_is_valid(stdout: &str, stderr: &str, backend: BackendSelection) -> bool {
+    let evidence = parse_vkcube_evidence(stdout, stderr);
+    let output = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    if [
+        "recreation_loop",
+        "recreations_after_publish=1",
+        "logical_takeover",
+        "overlay=hidden",
+        "cursor=missing",
+        "grab=stuck",
+    ]
+    .iter()
+    .any(|marker| output.contains(marker))
+    {
+        return false;
+    }
+    let continuous_dispatch = match backend {
+        BackendSelection::Reference => true,
+        BackendSelection::Fsr314 => evidence.fsr_dispatches >= 3,
+    };
+    evidence.layer_startup
+        && evidence.native_published
+        && evidence.virtual_active
+        && !evidence.virtual_zero
+        && !evidence.fallback
+        && !evidence.validation_error
+        && evidence.overlay_submitted >= 3
+        && evidence.reconstructed_presents >= 3
+        && continuous_dispatch
+        && evidence.logical.is_some_and(|extent| {
+            extent
+                == (WsiExtent {
+                    width: 1280,
+                    height: 720,
+                })
+        })
+        && evidence.physical.is_some_and(|extent| {
+            extent.width > 0 && extent.height > 0 && Some(extent) != evidence.logical
+        })
+}
+
 impl VkcubeExit {
     const fn success(self) -> bool {
         matches!(self, Self::Success)
@@ -546,6 +645,7 @@ fn configure_vkcube_command(root: &Path, options: VkcubeOptions) -> Command {
         .collect::<Vec<_>>();
     let mut command = Command::new("vkcube");
     validation(&mut command)
+        .args(["--wsi", "xcb", "--width", "1280", "--height", "720"])
         .env("VK_ADD_LAYER_PATH", root.join("assets/vulkan-layer"))
         .env("LD_LIBRARY_PATH", std::env::join_paths(libraries).unwrap())
         .env(
@@ -559,7 +659,7 @@ fn configure_vkcube_command(root: &Path, options: VkcubeOptions) -> Command {
     command
 }
 
-fn wait_for_vkcube(mut child: Child, seconds: u64) -> VkcubeExit {
+fn wait_for_vkcube(mut child: Child, seconds: u64, backend: BackendSelection) -> VkcubeExit {
     let Some(mut stdout) = child.stdout.take() else {
         return VkcubeExit::UnexpectedExit;
     };
@@ -610,13 +710,20 @@ fn wait_for_vkcube(mut child: Child, seconds: u64) -> VkcubeExit {
         return VkcubeExit::UnexpectedExit;
     }
     let (startup_evidence, validation_error) = classify_vkcube_output(&stdout, &stderr);
-    classify_vkcube_exit(
+    let classification = classify_vkcube_exit(
         status.code(),
         timed_out,
         startup_evidence,
         validation_error,
         false,
-    )
+    );
+    let stdout_text = String::from_utf8_lossy(&stdout);
+    let stderr_text = String::from_utf8_lossy(&stderr);
+    if classification.success() && !vkcube_output_is_valid(&stdout_text, &stderr_text, backend) {
+        VkcubeExit::MissingStartupEvidence
+    } else {
+        classification
+    }
 }
 
 fn run_vkcube(root: &Path, options: VkcubeOptions) -> VkcubeExit {
@@ -632,7 +739,7 @@ fn run_vkcube(root: &Path, options: VkcubeOptions) -> VkcubeExit {
     if std::fs::write(
         &launch.config_path,
         generated_config_with_backend_and_sharpening(
-            "swapchain",
+            "native",
             1.0,
             None,
             options.backend,
@@ -645,7 +752,7 @@ fn run_vkcube(root: &Path, options: VkcubeOptions) -> VkcubeExit {
         return VkcubeExit::BuildFailure;
     }
     match configure_vkcube_command(root, options).spawn() {
-        Ok(child) => wait_for_vkcube(child, options.seconds),
+        Ok(child) => wait_for_vkcube(child, options.seconds, options.backend),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => VkcubeExit::MissingExecutable,
         Err(_) => VkcubeExit::UnexpectedExit,
     }
@@ -2727,8 +2834,8 @@ mod tests {
         fidelityfx_elf_architecture_is_valid, fidelityfx_symbols_are_complete, generated_config,
         maintenance_evidence_complete, maintenance_output_is_valid, parse_backend_args,
         parse_maintenance_evidence, parse_visual_quality_args, parse_vkcube_args,
-        quality_fixture_passes, visual_quality_metrics_for_test, vkcube_launch,
-        wsi_compatibility_output_is_valid,
+        parse_vkcube_evidence, quality_fixture_passes, visual_quality_metrics_for_test,
+        vkcube_launch, vkcube_output_is_valid, wsi_compatibility_output_is_valid,
     };
     use std::path::Path;
 
@@ -2973,6 +3080,48 @@ mod tests {
             classify_vkcube_exit(None, true, false, false, false),
             VkcubeExit::MissingStartupEvidence
         );
+    }
+
+    #[test]
+    fn vkcube_requires_continuous_end_to_end_evidence() {
+        let positive = concat!(
+            "TuxScaling swapchain: format=B8G8R8A8_UNORM\n",
+            "TuxScaling evidence event=virtual_swapchain_active logical=1280x720 physical=2160x1440\n",
+            "TuxScaling evidence event=native_generation_published logical=1280x720 physical=2160x1440\n",
+            "TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=1280x720 physical=2160x1440\n",
+            "TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=1280x720 physical=2160x1440\n",
+            "TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=1280x720 physical=2160x1440\n",
+            "TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=1\n",
+            "TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=2\n",
+            "TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=3\n",
+            "TuxScaling evidence event=overlay_submitted virtual=1\n",
+            "TuxScaling evidence event=overlay_submitted virtual=1\n",
+            "TuxScaling evidence event=overlay_submitted virtual=1\n",
+        );
+        let evidence = parse_vkcube_evidence(positive, "");
+        assert_eq!(evidence.fsr_dispatches, 3);
+        assert_eq!(evidence.reconstructed_presents, 3);
+        assert!(vkcube_output_is_valid(
+            positive,
+            "",
+            BackendSelection::Fsr314
+        ));
+        assert!(!vkcube_output_is_valid(
+            positive.replace("fsr_dispatch", "layer_loaded").as_str(),
+            "",
+            BackendSelection::Fsr314
+        ));
+    }
+
+    #[test]
+    fn vkcube_failure_fixtures_reject_partial_or_unhealthy_runs() {
+        let fixtures = include_str!("../../crates/layer/tests/fixtures/vkcube-gate-failures.txt");
+        for fixture in fixtures.split("\n---\n") {
+            assert!(
+                !vkcube_output_is_valid(fixture, "", BackendSelection::Fsr314),
+                "fixture unexpectedly passed:\n{fixture}"
+            );
+        }
     }
 
     #[test]
