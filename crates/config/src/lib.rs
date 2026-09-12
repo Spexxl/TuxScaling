@@ -28,6 +28,8 @@ pub struct Config {
     pub guidance_mode: GuidanceMode,
     pub sharpening_enabled: bool,
     pub sharpness: f32,
+    pub comparison_enabled: bool,
+    pub comparison_split: f32,
     pub motion_quality: MotionQuality,
     pub output_resolution: OutputResolution,
     #[serde(alias = "processing_scale", alias = "render_scale")]
@@ -130,6 +132,8 @@ impl Default for Config {
             guidance_mode: GuidanceMode::Estimated,
             sharpening_enabled: true,
             sharpness: 0.2,
+            comparison_enabled: false,
+            comparison_split: 0.5,
             motion_quality: MotionQuality::Balanced,
             output_resolution: OutputResolution::Native,
             guidance_scale: 1.0,
@@ -151,6 +155,7 @@ impl Config {
     pub fn parse(source: &str) -> Result<Self, ConfigError> {
         let mut config: Self = toml::from_str(source)?;
         config.sharpness = clamp_sharpness(config.sharpness);
+        config.comparison_split = clamp_comparison_split(config.comparison_split);
         if !config.guidance_scale.is_finite()
             || !(0.5..=1.0).contains(&config.guidance_scale)
             || !config.scene_distance_threshold.is_finite()
@@ -168,6 +173,14 @@ impl Config {
 fn clamp_sharpness(value: f32) -> f32 {
     if value.is_nan() {
         0.0
+    } else {
+        value.clamp(0.0, 1.0)
+    }
+}
+
+fn clamp_comparison_split(value: f32) -> f32 {
+    if value.is_nan() {
+        0.5
     } else {
         value.clamp(0.0, 1.0)
     }
@@ -351,6 +364,36 @@ mod tests {
         assert_eq!(
             Config::parse("render_scale = 0.75").unwrap().guidance_scale,
             0.75
+        );
+    }
+
+    #[test]
+    fn defaults_comparison_to_disabled_center_split() {
+        let config = Config::parse("").unwrap();
+
+        assert!(!config.comparison_enabled);
+        assert_eq!(config.comparison_split, 0.5);
+    }
+
+    #[test]
+    fn clamps_comparison_split_at_the_configuration_boundary() {
+        assert_eq!(
+            Config::parse("comparison_split = -1.0")
+                .unwrap()
+                .comparison_split,
+            0.0
+        );
+        assert_eq!(
+            Config::parse("comparison_split = 2.0")
+                .unwrap()
+                .comparison_split,
+            1.0
+        );
+        assert_eq!(
+            Config::parse("comparison_split = nan")
+                .unwrap()
+                .comparison_split,
+            0.5
         );
     }
 }

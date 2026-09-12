@@ -227,6 +227,15 @@ fn upscaler_name(upscaler: Upscaler) -> &'static str {
     }
 }
 
+fn config_motion_quality(quality: MotionQuality) -> tuxscaling_config::MotionQuality {
+    match quality {
+        MotionQuality::Ultra => tuxscaling_config::MotionQuality::Ultra,
+        MotionQuality::High => tuxscaling_config::MotionQuality::High,
+        MotionQuality::Balanced => tuxscaling_config::MotionQuality::Balanced,
+        MotionQuality::Performance => tuxscaling_config::MotionQuality::Performance,
+    }
+}
+
 fn backend_vk_error(operation: &'static str, error: vk::Result) -> BackendError {
     BackendError::Internal(format!("{operation}: {error:?}"))
 }
@@ -652,8 +661,14 @@ impl SwapchainRuntime {
                 .into(),
                 mode: mode_name(mode).into(),
                 quality: config.motion_quality,
+                active_quality: config.motion_quality,
                 upscaler: active_upscaler,
                 active_upscaler,
+                active_guidance_mode: config.guidance_mode,
+                active_sharpening_enabled: config.sharpening_enabled,
+                active_sharpness: config.sharpness,
+                active_comparison_enabled: config.comparison_enabled,
+                active_comparison_split: config.comparison_split,
                 jitter_mode: config.jitter_mode,
                 debug_view: config.debug_view,
                 reset_reason: reset_name(GuidanceReset::Initialize).into(),
@@ -668,6 +683,17 @@ impl SwapchainRuntime {
                     "Windowed 1:1"
                 }
                 .into(),
+                active_path: if temporal_enabled
+                    && diagnostic_resolution.game_extent != diagnostic_resolution.output_extent
+                {
+                    "presenter_virtual"
+                } else if temporal_enabled {
+                    "presenter_native_aa"
+                } else {
+                    "direct"
+                }
+                .into(),
+                presenter_state: if temporal_enabled { "active" } else { "direct" }.into(),
                 window_mode: if promoted_borderless {
                     "Promoted borderless"
                 } else if fullscreen {
@@ -689,6 +715,16 @@ impl SwapchainRuntime {
                     diagnostic_resolution.output_extent.width,
                     diagnostic_resolution.output_extent.height,
                 ],
+                input_to_output_scale: tuxscaling_overlay::input_to_output_scale(
+                    [
+                        diagnostic_resolution.game_extent.width,
+                        diagnostic_resolution.game_extent.height,
+                    ],
+                    [
+                        diagnostic_resolution.output_extent.width,
+                        diagnostic_resolution.output_extent.height,
+                    ],
+                ),
                 ..Default::default()
             },
             evidence_fsr_dispatches: 0,
@@ -814,6 +850,13 @@ impl SwapchainRuntime {
         self.diagnostics.guidance_scale = self.requested_config.guidance_scale;
         self.diagnostics.upscaler = self.temporal.active_upscaler;
         self.diagnostics.active_upscaler = self.temporal.active_upscaler;
+        self.diagnostics.active_quality = self.requested_config.motion_quality;
+        self.diagnostics.quality = self.requested_config.motion_quality;
+        self.diagnostics.active_guidance_mode = self.requested_config.guidance_mode;
+        self.diagnostics.active_sharpening_enabled = self.requested_config.sharpening_enabled;
+        self.diagnostics.active_sharpness = self.requested_config.sharpness;
+        self.diagnostics.active_comparison_enabled = self.requested_config.comparison_enabled;
+        self.diagnostics.active_comparison_split = self.requested_config.comparison_split;
         self.diagnostics.game_extent = [
             self.temporal.resolution.game_extent.width,
             self.temporal.resolution.game_extent.height,
@@ -823,6 +866,21 @@ impl SwapchainRuntime {
             self.temporal.resolution.guidance_extent.height,
         ];
         self.diagnostics.output_extent = [info.extent.width, info.extent.height];
+        self.diagnostics.input_to_output_scale = tuxscaling_overlay::input_to_output_scale(
+            self.diagnostics.game_extent,
+            self.diagnostics.output_extent,
+        );
+        self.diagnostics.active_path =
+            if temporal_enabled && self.diagnostics.game_extent != self.diagnostics.output_extent {
+                "presenter_virtual"
+            } else if temporal_enabled {
+                "presenter_native_aa"
+            } else {
+                "direct"
+            }
+            .into();
+        self.diagnostics.presenter_state =
+            if temporal_enabled { "active" } else { "direct" }.into();
         self.diagnostics.presentation_mode = "Virtual upscale".into();
         self.diagnostics.window_mode = "Promoted borderless".into();
         eprintln!(
@@ -1023,10 +1081,20 @@ impl SwapchainRuntime {
             vk::ImageLayout::UNDEFINED
         };
         unsafe { self.device.wait_for_fences(&[slot.fence], true, u64::MAX) }?;
+        self.temporal.apply_pending_manual_controls();
+        self.diagnostics.active_guidance_mode = self.temporal.config.guidance_mode;
+        self.diagnostics.active_sharpening_enabled = self.temporal.config.sharpening_enabled;
+        self.diagnostics.active_sharpness = self.temporal.config.sharpness;
+        self.diagnostics.active_comparison_enabled = self.temporal.config.comparison_enabled;
+        self.diagnostics.active_comparison_split = self.temporal.config.comparison_split;
+        self.diagnostics.history_valid = self.temporal.history.valid(self.temporal.pending_time);
+        self.diagnostics.history_age = self.temporal.history_age;
         if let Some(quality) = self.temporal.pending_quality.take() {
             if let Some(motion) = &mut self.temporal.motion {
                 motion.set_quality(quality);
             }
+            self.diagnostics.active_quality = config_motion_quality(quality);
+            self.diagnostics.quality = self.diagnostics.active_quality;
             self.temporal.reset_history(GuidanceReset::PresetChanged);
             self.diagnostics.state = "Preset changed; history reset".into();
         }
@@ -1109,12 +1177,43 @@ impl SwapchainRuntime {
         self.diagnostics.overlay_cpu_ms = cpu_overlay_start.elapsed().as_secs_f32() * 1_000.0;
         if let Some(selection) = frame.requested_upscaler {
             self.temporal.request_upscaler(selection);
+            self.requested_config.upscaler = selection;
+            self.diagnostics.requested_upscaler = Some(selection);
         }
         if let Some(quality) = frame.requested_quality {
             self.temporal.pending_quality = Some(motion_quality(quality));
+            self.requested_config.motion_quality = quality;
+            self.diagnostics.requested_quality = Some(quality);
         }
         if let Some(scale) = frame.requested_guidance_scale {
             self.temporal.pending_guidance_scale = Some(scale);
+            self.requested_config.guidance_scale = scale;
+            self.diagnostics.requested_guidance_scale = Some(scale);
+        }
+        if let Some(mode) = frame.requested_guidance_mode {
+            self.temporal.request_guidance_mode(mode);
+            self.requested_config.guidance_mode = mode;
+            self.diagnostics.requested_guidance_mode = Some(mode);
+        }
+        if let Some(enabled) = frame.requested_sharpening_enabled {
+            self.temporal.request_sharpening_enabled(enabled);
+            self.requested_config.sharpening_enabled = enabled;
+            self.diagnostics.requested_sharpening_enabled = Some(enabled);
+        }
+        if let Some(sharpness) = frame.requested_sharpness {
+            self.temporal.request_sharpness(sharpness);
+            self.requested_config.sharpness = sharpness;
+            self.diagnostics.requested_sharpness = Some(sharpness);
+        }
+        if let Some(enabled) = frame.requested_comparison_enabled {
+            self.temporal.request_comparison_enabled(enabled);
+            self.requested_config.comparison_enabled = enabled;
+            self.diagnostics.requested_comparison_enabled = Some(enabled);
+        }
+        if let Some(split) = frame.requested_comparison_split {
+            self.temporal.request_comparison_split(split);
+            self.requested_config.comparison_split = split;
+            self.diagnostics.requested_comparison_split = Some(split);
         }
         if let Some(mode) = frame.requested_jitter_mode
             && self.temporal.jitter.set_mode(mode)
@@ -1136,6 +1235,8 @@ impl SwapchainRuntime {
         }
         self.diagnostics.jitter_mode = self.temporal.jitter.mode();
         let valid = self.temporal.history.valid(self.temporal.pending_time);
+        self.diagnostics.history_valid = valid;
+        self.diagnostics.history_age = self.temporal.history_age;
         self.diagnostics.reset_reason = reset_name(if valid {
             GuidanceReset::None
         } else {
@@ -1399,6 +1500,7 @@ impl SwapchainRuntime {
                 layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             });
             let mut backend_failed = false;
+            let mut backend_recorded = false;
             let requested_upscaler = self.temporal.pending_upscaler;
             if let (Some(guidance), Some(source)) = (guidance_view, backend_source)
                 && requested_upscaler.is_some()
@@ -1502,17 +1604,29 @@ impl SwapchainRuntime {
                     self.last_backend_dispatch = false;
                 } else {
                     self.last_backend_dispatch = true;
-                    if self.temporal.active_upscaler == Upscaler::Fsr314
-                        && self.evidence_fsr_dispatches == 0
+                    backend_recorded = true;
+                    self.diagnostics.fallback_reason = None;
+                    self.diagnostics.active_path = if self.temporal.resolution.game_extent
+                        != self.temporal.resolution.output_extent
                     {
-                        self.evidence_fsr_dispatches = 1;
-                        eprintln!(
-                            "TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical={}x{} physical={}x{}",
-                            self.temporal.resolution.game_extent.width,
-                            self.temporal.resolution.game_extent.height,
-                            self.temporal.resolution.output_extent.width,
-                            self.temporal.resolution.output_extent.height,
-                        );
+                        "presenter_virtual"
+                    } else {
+                        "presenter_native_aa"
+                    }
+                    .into();
+                    if self.temporal.active_upscaler == Upscaler::Fsr314 {
+                        self.evidence_fsr_dispatches =
+                            self.evidence_fsr_dispatches.saturating_add(1);
+                        self.diagnostics.fsr_dispatches = self.evidence_fsr_dispatches;
+                        if self.evidence_fsr_dispatches == 1 {
+                            eprintln!(
+                                "TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical={}x{} physical={}x{}",
+                                self.temporal.resolution.game_extent.width,
+                                self.temporal.resolution.game_extent.height,
+                                self.temporal.resolution.output_extent.width,
+                                self.temporal.resolution.output_extent.height,
+                            );
+                        }
                     }
                 }
             } else if game_image != self.output_images[index]
@@ -1535,6 +1649,8 @@ impl SwapchainRuntime {
                     self.temporal.pending_upscaler = Some(Upscaler::Reference);
                 }
                 self.diagnostics.state = "Backend failure; spatial fallback".into();
+                self.diagnostics.active_path = "spatial_fallback".into();
+                self.diagnostics.fallback_reason = Some("backend_record_failed".into());
                 if game_image != self.output_images[index]
                     && let Some(capture) = &self.temporal.capture
                 {
@@ -1546,6 +1662,29 @@ impl SwapchainRuntime {
                         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                         self.temporal.resolution.output_extent,
                     );
+                }
+            }
+            if backend_recorded
+                && self.temporal.config.comparison_enabled
+                && let (Some(comparison), Some(source)) =
+                    (&mut self.temporal.comparison, backend_source)
+            {
+                let output = BackendImage {
+                    image: self.output_images[index],
+                    view: self.output_views[index],
+                    format: self.info.format,
+                    extent: self.temporal.resolution.output_extent,
+                    layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                };
+                if let Err(error) = comparison.record(
+                    slot.command,
+                    index,
+                    source,
+                    output,
+                    self.temporal.config.comparison_split,
+                ) {
+                    self.diagnostics.state = format!("Comparison unavailable: {error}");
+                    self.diagnostics.fallback_reason = Some("comparison_record_failed".into());
                 }
             }
             if self.mode != 0
@@ -1675,6 +1814,16 @@ impl SwapchainRuntime {
         }
         unsafe { self.initialize(queue, family) }?;
         unsafe { self.device.wait_for_fences(&[fence], true, u64::MAX)? };
+        self.diagnostics.active_path =
+            if self.temporal.resolution.game_extent != self.temporal.resolution.output_extent {
+                "spatial_off"
+            } else {
+                "direct_off"
+            }
+            .into();
+        self.diagnostics.fallback_reason = None;
+        self.diagnostics.history_valid = false;
+        self.diagnostics.history_age = 0;
         for timing in [
             &mut self.diagnostics.capture_ms,
             &mut self.diagnostics.luma_ms,
@@ -1793,12 +1942,43 @@ impl SwapchainRuntime {
             .prepare(queue, self.pool, index, &mut self.diagnostics)?;
         if let Some(quality) = frame.requested_quality {
             self.temporal.pending_quality = Some(motion_quality(quality));
+            self.requested_config.motion_quality = quality;
+            self.diagnostics.requested_quality = Some(quality);
         }
         if let Some(selection) = frame.requested_upscaler {
             self.temporal.request_upscaler(selection);
+            self.requested_config.upscaler = selection;
+            self.diagnostics.requested_upscaler = Some(selection);
         }
         if let Some(scale) = frame.requested_guidance_scale {
             self.temporal.pending_guidance_scale = Some(scale);
+            self.requested_config.guidance_scale = scale;
+            self.diagnostics.requested_guidance_scale = Some(scale);
+        }
+        if let Some(mode) = frame.requested_guidance_mode {
+            self.temporal.request_guidance_mode(mode);
+            self.requested_config.guidance_mode = mode;
+            self.diagnostics.requested_guidance_mode = Some(mode);
+        }
+        if let Some(enabled) = frame.requested_sharpening_enabled {
+            self.temporal.request_sharpening_enabled(enabled);
+            self.requested_config.sharpening_enabled = enabled;
+            self.diagnostics.requested_sharpening_enabled = Some(enabled);
+        }
+        if let Some(sharpness) = frame.requested_sharpness {
+            self.temporal.request_sharpness(sharpness);
+            self.requested_config.sharpness = sharpness;
+            self.diagnostics.requested_sharpness = Some(sharpness);
+        }
+        if let Some(enabled) = frame.requested_comparison_enabled {
+            self.temporal.request_comparison_enabled(enabled);
+            self.requested_config.comparison_enabled = enabled;
+            self.diagnostics.requested_comparison_enabled = Some(enabled);
+        }
+        if let Some(split) = frame.requested_comparison_split {
+            self.temporal.request_comparison_split(split);
+            self.requested_config.comparison_split = split;
+            self.diagnostics.requested_comparison_split = Some(split);
         }
         unsafe {
             self.device
@@ -1886,18 +2066,34 @@ impl SwapchainRuntime {
     }
 
     pub fn submitted(&mut self) {
-        self.temporal.history.commit(self.temporal.pending_time);
+        if self.temporal.active_upscaler == Upscaler::Off {
+            self.diagnostics.history_valid = false;
+            self.diagnostics.history_age = 0;
+        } else {
+            self.temporal.history.commit(self.temporal.pending_time);
+            self.temporal.history_age = self.temporal.history_age.saturating_add(1);
+        }
         if let Some(index) = self.pending_output.take() {
             self.output_presented[index] = true;
         }
         self.diagnostics.frame_id = self.temporal.history.frame_id;
+        if self.temporal.active_upscaler != Upscaler::Off {
+            self.diagnostics.history_valid = true;
+            self.diagnostics.history_age = self.temporal.history_age;
+        }
         if self.last_backend_dispatch && self.evidence_reconstructed_presents == 0 {
-            self.evidence_reconstructed_presents = 1;
+            self.evidence_reconstructed_presents =
+                self.evidence_reconstructed_presents.saturating_add(1);
+            self.diagnostics.reconstructed_presents = self.evidence_reconstructed_presents;
             eprintln!(
                 "TuxScaling evidence event=reconstructed_present backend={} frame={}",
                 upscaler_name(self.temporal.active_upscaler),
                 self.diagnostics.frame_id,
             );
+        } else if self.last_backend_dispatch {
+            self.evidence_reconstructed_presents =
+                self.evidence_reconstructed_presents.saturating_add(1);
+            self.diagnostics.reconstructed_presents = self.evidence_reconstructed_presents;
         }
         self.last_backend_dispatch = false;
     }

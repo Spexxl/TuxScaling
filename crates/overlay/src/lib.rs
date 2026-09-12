@@ -2,7 +2,7 @@ use egui::{
     ClippedPrimitive, Color32, Context, Id, LayerId, Order, Pos2, RawInput, Rect, Shape, Stroke,
     TexturesDelta, vec2,
 };
-use tuxscaling_config::{DebugView, JitterMode, MotionQuality, Upscaler};
+use tuxscaling_config::{DebugView, GuidanceMode, JitterMode, MotionQuality, Upscaler};
 
 pub const CRATE_NAME: &str = "tuxscaling-overlay";
 
@@ -15,8 +15,19 @@ pub struct FrameDiagnostics {
     pub requested_upscaler: Option<Upscaler>,
     pub active_upscaler: Upscaler,
     pub quality: MotionQuality,
+    pub active_quality: MotionQuality,
     pub requested_quality: Option<MotionQuality>,
     pub requested_guidance_scale: Option<f32>,
+    pub active_guidance_mode: GuidanceMode,
+    pub requested_guidance_mode: Option<GuidanceMode>,
+    pub active_sharpening_enabled: bool,
+    pub requested_sharpening_enabled: Option<bool>,
+    pub active_sharpness: f32,
+    pub requested_sharpness: Option<f32>,
+    pub active_comparison_enabled: bool,
+    pub requested_comparison_enabled: Option<bool>,
+    pub active_comparison_split: f32,
+    pub requested_comparison_split: Option<f32>,
     pub requested_jitter_mode: Option<JitterMode>,
     pub requested_debug_view: Option<DebugView>,
     pub jitter_mode: JitterMode,
@@ -26,8 +37,16 @@ pub struct FrameDiagnostics {
     pub guidance_extent: [u32; 2],
     pub output_extent: [u32; 2],
     pub presentation_mode: String,
+    pub active_path: String,
+    pub presenter_state: String,
     pub window_mode: String,
     pub monitor: String,
+    pub input_to_output_scale: [f32; 2],
+    pub history_valid: bool,
+    pub history_age: u64,
+    pub fsr_dispatches: u64,
+    pub reconstructed_presents: u64,
+    pub fallback_reason: Option<String>,
     pub frame_delta_ms: f32,
     pub frame_delta_raw_ms: f32,
     pub frame_delta_validated_ms: f32,
@@ -99,6 +118,24 @@ pub fn guidance_scale_request(value: f32) -> Option<f32> {
         .filter(|value| (0.5..=1.0).contains(value))
 }
 
+pub fn input_to_output_scale(game_extent: [u32; 2], output_extent: [u32; 2]) -> [f32; 2] {
+    if game_extent.contains(&0) {
+        [0.0, 0.0]
+    } else {
+        [
+            output_extent[0] as f32 / game_extent[0] as f32,
+            output_extent[1] as f32 / game_extent[1] as f32,
+        ]
+    }
+}
+
+pub fn comparison_split_request(value: f32) -> Option<f32> {
+    value
+        .is_finite()
+        .then_some(value)
+        .filter(|value| (0.0..=1.0).contains(value))
+}
+
 pub fn software_cursor_is_visible(
     overlay_owns_input: bool,
     pointer_present: bool,
@@ -140,6 +177,11 @@ pub fn render_diagnostics(
     diagnostics.requested_quality = None;
     diagnostics.requested_upscaler = None;
     diagnostics.requested_guidance_scale = None;
+    diagnostics.requested_guidance_mode = None;
+    diagnostics.requested_sharpening_enabled = None;
+    diagnostics.requested_sharpness = None;
+    diagnostics.requested_comparison_enabled = None;
+    diagnostics.requested_comparison_split = None;
     diagnostics.requested_jitter_mode = None;
     diagnostics.requested_debug_view = None;
     let software_cursor_visible =
@@ -162,22 +204,37 @@ pub fn render_diagnostics(
                         size[0], size[1], diagnostics.frame_id
                     ));
                     ui.label(format!("View: {}", diagnostics.mode));
+                    ui.label(format!(
+                        "Input {}x{} -> Guidance {}x{} -> Output {}x{}",
+                        diagnostics.game_extent[0],
+                        diagnostics.game_extent[1],
+                        diagnostics.guidance_extent[0],
+                        diagnostics.guidance_extent[1],
+                        diagnostics.output_extent[0],
+                        diagnostics.output_extent[1]
+                    ));
+                    ui.label(format!(
+                        "Scale: {:.3}x x {:.3}x",
+                        diagnostics.input_to_output_scale[0],
+                        diagnostics.input_to_output_scale[1]
+                    ));
                     egui::ComboBox::from_label("Upscaler")
-                        .selected_text(format_upscaler(diagnostics.upscaler))
+                        .selected_text(format_upscaler(diagnostics.active_upscaler))
                         .show_ui(ui, |ui| {
+                            let mut selected = diagnostics.active_upscaler;
                             for upscaler in
                                 [Upscaler::Reference, Upscaler::Fsr314, Upscaler::Off]
                             {
                                 if ui
                                     .selectable_value(
-                                        &mut diagnostics.upscaler,
+                                        &mut selected,
                                         upscaler,
                                         format_upscaler(upscaler),
                                     )
                                     .changed()
                                 {
                                     diagnostics.requested_upscaler =
-                                        upscaler_request(diagnostics.active_upscaler, upscaler);
+                                        upscaler_request(diagnostics.active_upscaler, selected);
                                 }
                             }
                         });
@@ -186,8 +243,9 @@ pub fn render_diagnostics(
                         format_upscaler(diagnostics.active_upscaler)
                     ));
                     egui::ComboBox::from_label("Quality")
-                        .selected_text(format_quality(diagnostics.quality))
+                        .selected_text(format_quality(diagnostics.active_quality))
                         .show_ui(ui, |ui| {
+                            let mut selected = diagnostics.active_quality;
                             for quality in [
                                 MotionQuality::Ultra,
                                 MotionQuality::High,
@@ -196,7 +254,7 @@ pub fn render_diagnostics(
                             ] {
                                 if ui
                                     .selectable_value(
-                                        &mut diagnostics.quality,
+                                        &mut selected,
                                         quality,
                                         format_quality(quality),
                                     )
@@ -206,9 +264,48 @@ pub fn render_diagnostics(
                                 }
                             }
                         });
+                    egui::ComboBox::from_label("Guidance")
+                        .selected_text(format_guidance_mode(diagnostics.active_guidance_mode))
+                        .show_ui(ui, |ui| {
+                            let mut selected = diagnostics.active_guidance_mode;
+                            for mode in [GuidanceMode::Estimated, GuidanceMode::Zero] {
+                                if ui
+                                    .selectable_value(
+                                        &mut selected,
+                                        mode,
+                                        format_guidance_mode(mode),
+                                    )
+                                    .changed()
+                                {
+                                    diagnostics.requested_guidance_mode = Some(mode);
+                                }
+                            }
+                        });
                     ui.label(format!(
                         "Guidance scale: {:.0}%",
                         diagnostics.guidance_scale * 100.0
+                    ));
+                    ui.label(format!(
+                        "Backend: requested {} | active {}",
+                        format_upscaler(diagnostics.upscaler),
+                        format_upscaler(diagnostics.active_upscaler)
+                    ));
+                    ui.label(format!(
+                        "Path: {} | Presenter: {}",
+                        diagnostics.active_path, diagnostics.presenter_state
+                    ));
+                    ui.label(format!(
+                        "FSR dispatches: {} | Reconstructed presents: {}",
+                        diagnostics.fsr_dispatches, diagnostics.reconstructed_presents
+                    ));
+                    ui.label(format!(
+                        "History: {} (age {})",
+                        if diagnostics.history_valid {
+                            "valid"
+                        } else {
+                            "invalid"
+                        },
+                        diagnostics.history_age
                     ));
                     if diagnostics.game_extent[0] > 0 && diagnostics.output_extent[0] > 0 {
                         ui.label(format!(
@@ -242,6 +339,46 @@ pub fn render_diagnostics(
                             ui.small(
                                 "This does not reduce the game's rendering workload.",
                             );
+                            let mut sharpening_enabled = diagnostics.active_sharpening_enabled;
+                            if ui
+                                .checkbox(&mut sharpening_enabled, "Output sharpening")
+                                .changed()
+                            {
+                                diagnostics.requested_sharpening_enabled =
+                                    Some(sharpening_enabled);
+                            }
+                            let mut sharpness = diagnostics.active_sharpness;
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut sharpness, 0.0..=1.0)
+                                        .text("Sharpness"),
+                                )
+                                .changed()
+                            {
+                                diagnostics.requested_sharpness = sharpness_request(sharpness);
+                            }
+                            let mut comparison_enabled = diagnostics.active_comparison_enabled;
+                            if ui
+                                .checkbox(&mut comparison_enabled, "Compare active vs Off")
+                                .changed()
+                            {
+                                diagnostics.requested_comparison_enabled =
+                                    Some(comparison_enabled);
+                            }
+                            if comparison_enabled {
+                                let mut split = diagnostics.active_comparison_split;
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut split, 0.0..=1.0)
+                                            .text("Comparison wipe"),
+                                    )
+                                    .changed()
+                                {
+                                    diagnostics.requested_comparison_split =
+                                        comparison_split_request(split);
+                                }
+                                ui.small("Left: Off | Right: active backend");
+                            }
                             let mut jitter_mode = diagnostics.jitter_mode;
                             egui::ComboBox::from_label("Capture jitter")
                                 .selected_text(format_jitter_mode(jitter_mode))
@@ -371,6 +508,11 @@ pub fn render_diagnostics(
         requested_upscaler: diagnostics.requested_upscaler,
         requested_quality: diagnostics.requested_quality,
         requested_guidance_scale: diagnostics.requested_guidance_scale,
+        requested_guidance_mode: diagnostics.requested_guidance_mode,
+        requested_sharpening_enabled: diagnostics.requested_sharpening_enabled,
+        requested_sharpness: diagnostics.requested_sharpness,
+        requested_comparison_enabled: diagnostics.requested_comparison_enabled,
+        requested_comparison_split: diagnostics.requested_comparison_split,
         requested_jitter_mode: diagnostics.requested_jitter_mode,
         requested_debug_view: diagnostics.requested_debug_view,
         software_cursor_visible,
@@ -387,6 +529,20 @@ fn format_upscaler(upscaler: Upscaler) -> &'static str {
         Upscaler::Fsr314 => "FSR 3.1.4",
         Upscaler::Off => "Off",
     }
+}
+
+fn format_guidance_mode(mode: GuidanceMode) -> &'static str {
+    match mode {
+        GuidanceMode::Estimated => "Estimated",
+        GuidanceMode::Zero => "Zero",
+    }
+}
+
+fn sharpness_request(value: f32) -> Option<f32> {
+    value
+        .is_finite()
+        .then_some(value)
+        .filter(|value| (0.0..=1.0).contains(value))
 }
 
 fn format_quality(quality: MotionQuality) -> &'static str {
@@ -413,6 +569,11 @@ pub struct OverlayFrame {
     pub requested_upscaler: Option<Upscaler>,
     pub requested_quality: Option<MotionQuality>,
     pub requested_guidance_scale: Option<f32>,
+    pub requested_guidance_mode: Option<GuidanceMode>,
+    pub requested_sharpening_enabled: Option<bool>,
+    pub requested_sharpness: Option<f32>,
+    pub requested_comparison_enabled: Option<bool>,
+    pub requested_comparison_split: Option<f32>,
     pub requested_jitter_mode: Option<JitterMode>,
     pub requested_debug_view: Option<DebugView>,
     pub software_cursor_visible: bool,
@@ -451,6 +612,11 @@ pub fn render_smoke_frame(
         requested_upscaler: None,
         requested_quality: None,
         requested_guidance_scale: None,
+        requested_guidance_mode: None,
+        requested_sharpening_enabled: None,
+        requested_sharpness: None,
+        requested_comparison_enabled: None,
+        requested_comparison_split: None,
         requested_jitter_mode: None,
         requested_debug_view: None,
         software_cursor_visible: false,
@@ -482,9 +648,10 @@ impl Default for OverlayState {
 mod tests {
     use super::{
         FrameDiagnostics, OverlayState, debug_view_label, guidance_scale_request,
-        render_diagnostics, render_smoke_frame, resolution_mode, software_cursor_is_visible,
+        input_to_output_scale, render_diagnostics, render_smoke_frame, resolution_mode,
+        software_cursor_is_visible,
     };
-    use tuxscaling_config::{DebugView, Upscaler};
+    use tuxscaling_config::{DebugView, GuidanceMode, MotionQuality, Upscaler};
 
     #[test]
     fn starts_hidden() {
@@ -520,6 +687,71 @@ mod tests {
         assert_eq!(guidance_scale_request(0.49), None);
         assert_eq!(guidance_scale_request(1.01), None);
         assert_eq!(guidance_scale_request(f32::NAN), None);
+    }
+
+    #[test]
+    fn diagnostic_snapshot_keeps_requested_and_active_state_typed() {
+        let mut diagnostics = FrameDiagnostics {
+            game_extent: [1280, 720],
+            guidance_extent: [1280, 720],
+            output_extent: [2160, 1440],
+            input_to_output_scale: input_to_output_scale([1280, 720], [2160, 1440]),
+            active_upscaler: Upscaler::Fsr314,
+            active_quality: MotionQuality::Balanced,
+            active_guidance_mode: GuidanceMode::Estimated,
+            active_sharpening_enabled: true,
+            active_sharpness: 0.2,
+            active_comparison_enabled: false,
+            active_comparison_split: 0.5,
+            ..Default::default()
+        };
+        diagnostics.requested_upscaler = Some(Upscaler::Off);
+        diagnostics.requested_quality = Some(MotionQuality::Performance);
+        diagnostics.requested_guidance_mode = Some(GuidanceMode::Zero);
+        diagnostics.requested_sharpening_enabled = Some(false);
+        diagnostics.requested_sharpness = Some(1.0);
+        diagnostics.requested_comparison_enabled = Some(true);
+        diagnostics.requested_comparison_split = Some(0.25);
+        diagnostics.history_valid = true;
+        diagnostics.history_age = 17;
+        diagnostics.fsr_dispatches = 42;
+        diagnostics.reconstructed_presents = 41;
+
+        assert_eq!(diagnostics.input_to_output_scale, [1.6875, 2.0]);
+        assert_eq!(diagnostics.active_upscaler, Upscaler::Fsr314);
+        assert_eq!(diagnostics.requested_upscaler, Some(Upscaler::Off));
+        assert_eq!(diagnostics.active_quality, MotionQuality::Balanced);
+        assert_eq!(
+            diagnostics.requested_quality,
+            Some(MotionQuality::Performance)
+        );
+        assert_eq!(diagnostics.active_guidance_mode, GuidanceMode::Estimated);
+        assert_eq!(
+            diagnostics.requested_guidance_mode,
+            Some(GuidanceMode::Zero)
+        );
+        assert!(diagnostics.active_sharpening_enabled);
+        assert_eq!(diagnostics.requested_sharpening_enabled, Some(false));
+        assert_eq!(diagnostics.active_sharpness, 0.2);
+        assert_eq!(diagnostics.requested_sharpness, Some(1.0));
+        assert!(!diagnostics.active_comparison_enabled);
+        assert_eq!(diagnostics.requested_comparison_enabled, Some(true));
+        assert_eq!(diagnostics.active_comparison_split, 0.5);
+        assert_eq!(diagnostics.requested_comparison_split, Some(0.25));
+        assert!(diagnostics.history_valid);
+        assert_eq!(diagnostics.history_age, 17);
+        assert_eq!(diagnostics.fsr_dispatches, 42);
+        assert_eq!(diagnostics.reconstructed_presents, 41);
+    }
+
+    #[test]
+    fn comparison_split_request_accepts_only_finite_normalized_positions() {
+        assert_eq!(super::comparison_split_request(0.0), Some(0.0));
+        assert_eq!(super::comparison_split_request(0.5), Some(0.5));
+        assert_eq!(super::comparison_split_request(1.0), Some(1.0));
+        assert_eq!(super::comparison_split_request(-0.1), None);
+        assert_eq!(super::comparison_split_request(1.1), None);
+        assert_eq!(super::comparison_split_request(f32::NAN), None);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use ash::vk;
 use thiserror::Error;
 use tuxscaling_temporal::{GuidanceCapabilities, GuidanceSignal, GuidanceView, SignalState};
+use tuxscaling_vulkan::{Image, image_barrier};
 
 mod reference;
 pub use reference::{ReferenceUpscaler, scaled_extent};
@@ -279,6 +280,348 @@ impl BackendFrame {
             }
         }
         Ok(())
+    }
+}
+
+/// Computes an Off-versus-active wipe into the same output image before the
+/// overlay is composited. The active image is copied to a per-slot scratch
+/// image first so the sampled and storage images never alias.
+pub struct ComparisonRenderer {
+    device: ash::Device,
+    input_extent: vk::Extent2D,
+    output_extent: vk::Extent2D,
+    scratch: Vec<Image>,
+    initialized: Vec<bool>,
+    sampler: vk::Sampler,
+    descriptor_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_sets: Vec<vk::DescriptorSet>,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+}
+
+impl ComparisonRenderer {
+    /// Creates the comparison pipeline and one scratch image per frame slot.
+    ///
+    /// # Safety
+    ///
+    /// The caller must provide a live Vulkan device and memory properties
+    /// belonging to that device.
+    pub unsafe fn new(
+        device: &ash::Device,
+        memory: &vk::PhysicalDeviceMemoryProperties,
+        input_extent: vk::Extent2D,
+        output_extent: vk::Extent2D,
+        format: vk::Format,
+        image_count: usize,
+    ) -> Result<Self, BackendError> {
+        if !is_valid_extent(input_extent) || !is_valid_extent(output_extent) || image_count == 0 {
+            return Err(BackendError::InvalidMetadata("comparison extents or slots"));
+        }
+        let usage = vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::STORAGE;
+        let mut scratch = Vec::with_capacity(image_count);
+        for _ in 0..image_count {
+            scratch.push(
+                unsafe { Image::new(device, memory, output_extent, format, usage) }.map_err(
+                    |error| BackendError::Internal(format!("comparison scratch image: {error:?}")),
+                )?,
+            );
+        }
+        let sampler = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )
+        }
+        .map_err(|error| BackendError::Internal(format!("comparison sampler: {error:?}")))?;
+        let descriptor_layout = unsafe {
+            device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(0)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(1)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(2)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                ]),
+                None,
+            )
+        }
+        .map_err(|error| {
+            BackendError::Internal(format!("comparison descriptor layout: {error:?}"))
+        })?;
+        let descriptor_pool = unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(image_count as u32)
+                    .pool_sizes(&[
+                        vk::DescriptorPoolSize {
+                            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                            descriptor_count: (2 * image_count) as u32,
+                        },
+                        vk::DescriptorPoolSize {
+                            ty: vk::DescriptorType::STORAGE_IMAGE,
+                            descriptor_count: image_count as u32,
+                        },
+                    ]),
+                None,
+            )
+        }
+        .map_err(|error| {
+            BackendError::Internal(format!("comparison descriptor pool: {error:?}"))
+        })?;
+        let descriptor_sets = unsafe {
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&vec![descriptor_layout; image_count]),
+            )
+        }
+        .map_err(|error| {
+            BackendError::Internal(format!("comparison descriptor sets: {error:?}"))
+        })?;
+        let pipeline_layout = unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&[descriptor_layout])
+                    .push_constant_ranges(&[vk::PushConstantRange {
+                        stage_flags: vk::ShaderStageFlags::COMPUTE,
+                        offset: 0,
+                        size: 20,
+                    }]),
+                None,
+            )
+        }
+        .map_err(|error| {
+            BackendError::Internal(format!("comparison pipeline layout: {error:?}"))
+        })?;
+        let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/compare.spv"));
+        let words = ash::util::read_spv(&mut std::io::Cursor::new(bytes))
+            .map_err(|_| BackendError::Internal("invalid comparison shader".into()))?;
+        let module = unsafe {
+            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+        }
+        .map_err(|error| BackendError::Internal(format!("comparison shader: {error:?}")))?;
+        let pipeline = unsafe {
+            device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(
+                        vk::PipelineShaderStageCreateInfo::default()
+                            .stage(vk::ShaderStageFlags::COMPUTE)
+                            .module(module)
+                            .name(c"main"),
+                    )
+                    .layout(pipeline_layout)],
+                None,
+            )
+        };
+        unsafe { device.destroy_shader_module(module, None) };
+        let pipeline = pipeline
+            .map_err(|(_, error)| {
+                BackendError::Internal(format!("comparison pipeline: {error:?}"))
+            })?
+            .into_iter()
+            .next()
+            .ok_or_else(|| BackendError::Internal("comparison pipeline was not created".into()))?;
+
+        Ok(Self {
+            device: device.clone(),
+            input_extent,
+            output_extent,
+            scratch,
+            initialized: vec![false; image_count],
+            sampler,
+            descriptor_layout,
+            descriptor_pool,
+            descriptor_sets,
+            pipeline_layout,
+            pipeline,
+        })
+    }
+
+    /// Records the wipe before the overlay is rendered.
+    ///
+    /// # Safety
+    ///
+    /// The command buffer must be recording, and the source/output images
+    /// must remain alive until the submission completes.
+    pub unsafe fn record(
+        &mut self,
+        command: vk::CommandBuffer,
+        slot: usize,
+        source: BackendImage,
+        output: BackendImage,
+        split: f32,
+    ) -> Result<(), BackendError> {
+        if !split.is_finite()
+            || !(0.0..=1.0).contains(&split)
+            || source.extent != self.input_extent
+            || output.extent != self.output_extent
+            || source.layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+            || output.layout != vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+            || slot >= self.scratch.len()
+        {
+            return Err(BackendError::InvalidMetadata("comparison frame"));
+        }
+        let scratch = &self.scratch[slot];
+        let descriptor_set = self.descriptor_sets[slot];
+        let sampled_source = vk::DescriptorImageInfo::default()
+            .sampler(self.sampler)
+            .image_view(source.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let sampled_active = vk::DescriptorImageInfo::default()
+            .sampler(self.sampler)
+            .image_view(scratch.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let output_info = vk::DescriptorImageInfo::default()
+            .image_view(output.view)
+            .image_layout(vk::ImageLayout::GENERAL);
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&sampled_source)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&sampled_active)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&output_info)),
+        ];
+        unsafe {
+            self.device.update_descriptor_sets(&writes, &[]);
+            image_barrier(
+                &self.device,
+                command,
+                output.image,
+                output.layout,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+            image_barrier(
+                &self.device,
+                command,
+                scratch.handle,
+                if self.initialized[slot] {
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                } else {
+                    vk::ImageLayout::UNDEFINED
+                },
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            );
+            self.device.cmd_copy_image(
+                command,
+                output.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                scratch.handle,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::ImageCopy::default()
+                    .src_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .dst_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .extent(vk::Extent3D {
+                        width: self.output_extent.width,
+                        height: self.output_extent.height,
+                        depth: 1,
+                    })],
+            );
+            image_barrier(
+                &self.device,
+                command,
+                scratch.handle,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
+            image_barrier(
+                &self.device,
+                command,
+                output.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::ImageLayout::GENERAL,
+            );
+            self.device
+                .cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                command,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            let params = [
+                self.output_extent.width,
+                self.output_extent.height,
+                self.input_extent.width,
+                self.input_extent.height,
+                split.to_bits(),
+            ];
+            self.device.cmd_push_constants(
+                command,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::cast_slice(&params),
+            );
+            self.device.cmd_dispatch(
+                command,
+                self.output_extent.width.div_ceil(8),
+                self.output_extent.height.div_ceil(8),
+                1,
+            );
+            image_barrier(
+                &self.device,
+                command,
+                output.image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            );
+        }
+        self.initialized[slot] = true;
+        Ok(())
+    }
+}
+
+impl Drop for ComparisonRenderer {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_layout, None);
+            self.device.destroy_sampler(self.sampler, None);
+        }
     }
 }
 
@@ -759,5 +1102,20 @@ mod tests {
         assert_eq!(full.game_extent, reduced.game_extent);
         assert_eq!(full.output_extent, reduced.output_extent);
         assert_ne!(full.guidance_extent, reduced.guidance_extent);
+    }
+
+    #[test]
+    fn comparison_shader_contract_keeps_both_inputs_and_a_normalized_wipe() {
+        let shader = include_str!("../../../shaders/upscaler/compare.comp");
+
+        for token in [
+            "off_image",
+            "active_image",
+            "output_image",
+            "split",
+            "content_min",
+        ] {
+            assert!(shader.contains(token), "comparison shader lacks {token}");
+        }
     }
 }

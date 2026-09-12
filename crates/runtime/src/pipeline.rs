@@ -2,14 +2,14 @@ use super::{Capture, GpuTimingWindow, SwapchainInfo};
 use ash::vk;
 use std::time::{Duration, Instant};
 use tuxscaling_capture::{GuidanceCapture, JitterState};
-use tuxscaling_config::{Config, Upscaler};
+use tuxscaling_config::{Config, GuidanceMode, Upscaler};
 use tuxscaling_motion::{MotionEstimator, MotionQuality};
 use tuxscaling_temporal::{
     FrameTiming, GuidanceEstimator, GuidanceReset, GuidanceResolver, GuidanceView, History,
 };
 use tuxscaling_upscaler::{
     BackendColorEncoding, BackendConfig, BackendEnvironment, BackendError, BackendFrame,
-    ReferenceUpscaler, ResolutionPlan, UpscalerBackend, content_viewport,
+    ComparisonRenderer, ReferenceUpscaler, ResolutionPlan, UpscalerBackend, content_viewport,
 };
 
 pub(crate) unsafe fn record_backend(
@@ -192,6 +192,11 @@ pub struct TemporalPipeline {
     pub(crate) reset_reason: GuidanceReset,
     pub(crate) pending_quality: Option<MotionQuality>,
     pub(crate) pending_guidance_scale: Option<f32>,
+    pub(crate) pending_guidance_mode: Option<GuidanceMode>,
+    pub(crate) pending_sharpening_enabled: Option<bool>,
+    pub(crate) pending_sharpness: Option<f32>,
+    pub(crate) pending_comparison_enabled: Option<bool>,
+    pub(crate) pending_comparison_split: Option<f32>,
     pub(crate) active_upscaler: Upscaler,
     pub(crate) pending_upscaler: Option<Upscaler>,
     pub(crate) unavailable_upscaler: Option<Upscaler>,
@@ -202,6 +207,8 @@ pub struct TemporalPipeline {
     pub(crate) timings: GpuTimingWindow,
     pub(crate) config: Config,
     pub(crate) jitter: JitterState,
+    pub(crate) comparison: Option<ComparisonRenderer>,
+    pub(crate) history_age: u64,
 }
 
 impl TemporalPipeline {
@@ -392,6 +399,17 @@ impl TemporalPipeline {
         } else {
             0.0
         };
+        let comparison = unsafe {
+            ComparisonRenderer::new(
+                device,
+                &memory,
+                resolution.game_extent,
+                resolution.output_extent,
+                info.format,
+                image_count,
+            )
+        }
+        .ok();
         Ok(Self {
             resolution,
             vulkan_api_version,
@@ -408,6 +426,11 @@ impl TemporalPipeline {
             reset_reason: GuidanceReset::Initialize,
             pending_quality: None,
             pending_guidance_scale: None,
+            pending_guidance_mode: None,
+            pending_sharpening_enabled: None,
+            pending_sharpness: None,
+            pending_comparison_enabled: None,
+            pending_comparison_split: None,
             active_upscaler,
             pending_upscaler: None,
             unavailable_upscaler: None,
@@ -418,6 +441,8 @@ impl TemporalPipeline {
             timings: GpuTimingWindow::default(),
             config: config.clone(),
             jitter: JitterState::new(config.jitter_mode),
+            comparison,
+            history_age: 0,
         })
     }
 
@@ -583,6 +608,60 @@ impl TemporalPipeline {
         }
     }
 
+    pub(crate) fn request_guidance_mode(&mut self, mode: GuidanceMode) {
+        self.pending_guidance_mode = (mode != self.config.guidance_mode).then_some(mode);
+    }
+
+    pub(crate) fn request_sharpening_enabled(&mut self, enabled: bool) {
+        self.pending_sharpening_enabled =
+            (enabled != self.config.sharpening_enabled).then_some(enabled);
+    }
+
+    pub(crate) fn request_sharpness(&mut self, sharpness: f32) {
+        if sharpness.is_finite() && (0.0..=1.0).contains(&sharpness) {
+            self.pending_sharpness =
+                ((sharpness - self.config.sharpness).abs() >= f32::EPSILON).then_some(sharpness);
+        }
+    }
+
+    pub(crate) fn request_comparison_enabled(&mut self, enabled: bool) {
+        self.pending_comparison_enabled =
+            (enabled != self.config.comparison_enabled).then_some(enabled);
+    }
+
+    pub(crate) fn request_comparison_split(&mut self, split: f32) {
+        if split.is_finite() && (0.0..=1.0).contains(&split) {
+            self.pending_comparison_split =
+                ((split - self.config.comparison_split).abs() >= f32::EPSILON).then_some(split);
+        }
+    }
+
+    pub(crate) fn apply_pending_manual_controls(&mut self) -> bool {
+        let mut reset_history = false;
+        if let Some(mode) = self.pending_guidance_mode.take()
+            && mode != self.config.guidance_mode
+        {
+            self.config.guidance_mode = mode;
+            reset_history = true;
+        }
+        if let Some(enabled) = self.pending_sharpening_enabled.take() {
+            self.config.sharpening_enabled = enabled;
+        }
+        if let Some(sharpness) = self.pending_sharpness.take() {
+            self.config.sharpness = sharpness;
+        }
+        if let Some(enabled) = self.pending_comparison_enabled.take() {
+            self.config.comparison_enabled = enabled;
+        }
+        if let Some(split) = self.pending_comparison_split.take() {
+            self.config.comparison_split = split;
+        }
+        if reset_history {
+            self.reset_history(GuidanceReset::PresetChanged);
+        }
+        reset_history
+    }
+
     /// Tears down the backend and every simulation stage. They only come back
     /// when another upscaler is selected and applied.
     pub(crate) fn disable_upscaler(&mut self) {
@@ -676,6 +755,11 @@ impl TemporalPipeline {
             reset_reason: GuidanceReset::Initialize,
             pending_quality: None,
             pending_guidance_scale: None,
+            pending_guidance_mode: None,
+            pending_sharpening_enabled: None,
+            pending_sharpness: None,
+            pending_comparison_enabled: None,
+            pending_comparison_split: None,
             active_upscaler: Upscaler::Reference,
             pending_upscaler: None,
             unavailable_upscaler: None,
@@ -686,16 +770,20 @@ impl TemporalPipeline {
             timings: GpuTimingWindow::default(),
             config: Config::default(),
             jitter: JitterState::default(),
+            comparison: None,
+            history_age: 0,
         }
     }
 
     pub(crate) fn reset_history(&mut self, reason: GuidanceReset) {
         self.reset_history_preserving_jitter(reason);
         self.jitter.reset();
+        self.history_age = 0;
     }
 
     pub(crate) fn reset_history_preserving_jitter(&mut self, reason: GuidanceReset) {
         self.history.reset();
+        self.history_age = 0;
         self.reset_reason = reason;
         if let Some(guidance) = &mut self.guidance {
             guidance.reset_history();
@@ -1029,5 +1117,38 @@ mod tests {
         // Selecting another upscaler stages a resume.
         pipeline.request_upscaler(Upscaler::Reference);
         assert_eq!(pipeline.pending_upscaler, Some(Upscaler::Reference));
+    }
+
+    #[test]
+    fn manual_diagnostic_controls_apply_at_the_next_frame_boundary() {
+        let mut pipeline = TemporalPipeline::for_test(tuxscaling_upscaler::ResolutionPlan::new(
+            vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            },
+            1.0,
+        ));
+
+        pipeline.request_guidance_mode(tuxscaling_config::GuidanceMode::Zero);
+        pipeline.request_sharpening_enabled(false);
+        pipeline.request_sharpness(1.0);
+        pipeline.request_comparison_enabled(true);
+        pipeline.request_comparison_split(0.25);
+
+        assert!(pipeline.apply_pending_manual_controls());
+        assert_eq!(
+            pipeline.config.guidance_mode,
+            tuxscaling_config::GuidanceMode::Zero
+        );
+        assert!(!pipeline.config.sharpening_enabled);
+        assert_eq!(pipeline.config.sharpness, 1.0);
+        assert!(pipeline.config.comparison_enabled);
+        assert_eq!(pipeline.config.comparison_split, 0.25);
+        assert_eq!(pipeline.reset_reason, GuidanceReset::PresetChanged);
+        assert_eq!(pipeline.history_age, 0);
     }
 }

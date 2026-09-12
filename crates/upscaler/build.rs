@@ -10,7 +10,7 @@ fn main() {
         &shader_root.join("reconstruct.comp"),
         &out.join("reconstruct.spv"),
     );
-    for name in ["fidelityfx_input", "fidelityfx_output"] {
+    for name in ["compare", "fidelityfx_input", "fidelityfx_output"] {
         let source = shader_root.join(format!("{name}.comp"));
         println!("cargo:rerun-if-changed={}", source.display());
         if source.is_file() {
