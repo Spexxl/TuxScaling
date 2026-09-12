@@ -19,6 +19,12 @@ use x11rb::{
 
 pub const CRATE_NAME: &str = "tuxscaling-display";
 
+mod presenter;
+pub use presenter::{
+    PresenterEvent, PresenterLifecycle, PresenterSurfaceInfo, PresenterWindow,
+    presenter_event_mask, presenter_geometry, presenter_lifecycle_transition,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     pub x: i32,
