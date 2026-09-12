@@ -2030,6 +2030,271 @@ fn run_visual_quality(root: &Path, options: &VisualQualityOptions) -> bool {
     passed
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ProtonAcceptanceOptions {
+    evidence_dir: PathBuf,
+    game_command: Vec<String>,
+}
+
+fn parse_proton_acceptance_args(args: &[String]) -> Result<ProtonAcceptanceOptions, String> {
+    let mut evidence_dir = None;
+    let mut game_command = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--evidence-dir" => {
+                index += 1;
+                let path = args
+                    .get(index)
+                    .ok_or_else(|| "--evidence-dir requires a path".to_owned())?;
+                if evidence_dir.replace(PathBuf::from(path)).is_some() {
+                    return Err("--evidence-dir may only be specified once".into());
+                }
+            }
+            "--game-command" => {
+                if game_command.is_some() {
+                    return Err("--game-command may only be specified once".into());
+                }
+                let mut command = args[index + 1..].to_vec();
+                if command.first().is_some_and(|value| value == "--") {
+                    command.remove(0);
+                }
+                if command.is_empty() {
+                    return Err("--game-command requires an executable and arguments".into());
+                }
+                game_command = Some(command);
+                break;
+            }
+            value => return Err(format!("unknown proton-acceptance argument: {value}")),
+        }
+        index += 1;
+    }
+    Ok(ProtonAcceptanceOptions {
+        evidence_dir: evidence_dir.ok_or_else(|| "--evidence-dir is required".to_owned())?,
+        game_command: game_command.ok_or_else(|| "--game-command is required".to_owned())?,
+    })
+}
+
+fn writable_directory(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path)
+        .map_err(|error| format!("create evidence directory {}: {error}", path.display()))?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |value| value.as_nanos());
+    let probe = path.join(format!(
+        ".tuxscaling-proton-probe-{}-{stamp}",
+        std::process::id()
+    ));
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|error| format!("evidence directory is not writable: {error}"))?;
+    fs::remove_file(&probe).map_err(|error| format!("remove evidence directory probe: {error}"))
+}
+
+fn validation_layer_is_available() -> bool {
+    let Ok(output) = Command::new("vulkaninfo")
+        .args(["--summary"])
+        .env("VK_LOADER_LAYERS_ENABLE", "VK_LAYER_KHRONOS_validation")
+        .output()
+    else {
+        return false;
+    };
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    text.contains("VK_LAYER_KHRONOS_validation")
+}
+
+fn x11_display_is_available() -> bool {
+    let Some(display) = std::env::var_os("DISPLAY") else {
+        return false;
+    };
+    !display.is_empty()
+        && Command::new("xdpyinfo")
+            .env("DISPLAY", display)
+            .output()
+            .is_ok_and(|output| output.status.success())
+}
+
+fn fidelityfx_abi_symbols_are_available(root: &Path) -> bool {
+    let library = std::env::var_os("TUXSCALING_FIDELITYFX_LIBRARY")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| root.join("lib/libtuxscaling_fidelityfx_vk.so"));
+    let Ok(output) = Command::new("nm")
+        .args(["-D", "--defined-only"])
+        .arg(library)
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    fidelityfx_symbols_are_complete(&text)
+}
+
+fn run_gate_command(root: &Path, evidence_dir: &Path, name: &str, args: &[&str]) -> bool {
+    let Ok(output) = Command::new(args[0])
+        .args(&args[1..])
+        .current_dir(root)
+        .output()
+    else {
+        return false;
+    };
+    let log = format!(
+        "command={:?}\nstatus={}\n{}{}",
+        args,
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::write(evidence_dir.join(format!("pre-{name}.log")), log);
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    output.status.success()
+}
+
+fn run_proton_acceptance(root: &Path, options: &ProtonAcceptanceOptions) -> bool {
+    let checks = [
+        (
+            "display",
+            x11_display_is_available(),
+            "an accessible X11/XWayland DISPLAY is required",
+        ),
+        (
+            "validation",
+            validation_layer_is_available(),
+            "VK_LAYER_KHRONOS_validation is unavailable",
+        ),
+        (
+            "layer",
+            root.join("target/release/libtuxscaling_layer.so").is_file()
+                || root.join("target/debug/libtuxscaling_layer.so").is_file(),
+            "the built TuxScaling layer is unavailable",
+        ),
+        (
+            "fidelityfx",
+            fidelityfx_abi_symbols_are_available(root),
+            "the FidelityFX ABI 2 companion is unavailable",
+        ),
+    ];
+    if let Err(error) = writable_directory(&options.evidence_dir) {
+        eprintln!("cargo xtask proton-acceptance: {error}");
+        return false;
+    }
+    let mut preflight_ok = true;
+    let mut preflight = String::new();
+    for (name, passed, reason) in checks {
+        preflight_ok &= passed;
+        preflight.push_str(&format!("{name}={passed}"));
+        if !passed {
+            preflight.push_str(&format!(" reason={reason}"));
+        }
+        preflight.push('\n');
+        if !passed {
+            eprintln!("cargo xtask proton-acceptance: {reason}");
+        }
+    }
+    let _ = fs::write(options.evidence_dir.join("preflight.txt"), preflight);
+    if !preflight_ok {
+        return false;
+    }
+
+    let gates = [
+        ("fmt", vec!["cargo", "fmt", "--all", "--", "--check"]),
+        ("test", vec!["cargo", "test", "--workspace"]),
+        ("build", vec!["cargo", "build", "--workspace"]),
+        (
+            "clippy",
+            vec![
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        ),
+        (
+            "fidelityfx-check",
+            vec!["cargo", "xtask", "fidelityfx-check"],
+        ),
+        ("gpu-check", vec!["cargo", "xtask", "gpu-check"]),
+        (
+            "wsi-compatibility",
+            vec!["cargo", "xtask", "wsi-compatibility"],
+        ),
+        ("vkcube", vec!["cargo", "xtask", "vkcube"]),
+        (
+            "visual-quality",
+            vec![
+                "cargo",
+                "xtask",
+                "visual-quality",
+                "--display",
+                "nested-xwayland",
+                "--input",
+                "1280x720",
+                "--output",
+                "2160x1440",
+                "--warmup",
+                "180",
+                "--frames",
+                "120",
+            ],
+        ),
+    ];
+    for (name, args) in gates {
+        if !run_gate_command(root, &options.evidence_dir, name, &args) {
+            eprintln!("cargo xtask proton-acceptance: pre-Proton gate failed: {name}");
+            return false;
+        }
+    }
+
+    let log = match fs::File::create(options.evidence_dir.join("proton-session.log")) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("cargo xtask proton-acceptance: create session log: {error}");
+            return false;
+        }
+    };
+    let mut command = Command::new(&options.game_command[0]);
+    command
+        .args(&options.game_command[1..])
+        .current_dir(root)
+        .env("TUXSCALING_VIEW", "reconstructed")
+        .env(
+            "TUXSCALING_CAPTURE_DIR",
+            options.evidence_dir.join("capture"),
+        )
+        .env("VK_ADD_LAYER_PATH", root.join("assets/vulkan-layer"))
+        .env(
+            "VK_INSTANCE_LAYERS",
+            "VK_LAYER_TUXSCALING_overlay:VK_LAYER_KHRONOS_validation",
+        )
+        .stdout(Stdio::from(log.try_clone().expect("session log clone")))
+        .stderr(Stdio::from(log));
+    let status = match command.status() {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("cargo xtask proton-acceptance: game command failed to start: {error}");
+            return false;
+        }
+    };
+    let _ = fs::write(
+        options.evidence_dir.join("proton-session-status.txt"),
+        format!("status={status}\nrestarts=0\n"),
+    );
+    status.success()
+}
+
 #[cfg(test)]
 fn visual_quality_metrics_for_test(
     reference: &[[f32; 4]],
@@ -2797,6 +3062,18 @@ fn main() -> ExitCode {
             let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
             run_visual_quality(root, &options)
         }
+        "proton-acceptance" => {
+            let arguments = std::env::args().skip(2).collect::<Vec<_>>();
+            let options = match parse_proton_acceptance_args(&arguments) {
+                Ok(options) => options,
+                Err(error) => {
+                    eprintln!("cargo xtask proton-acceptance: {error}");
+                    return ExitCode::from(2);
+                }
+            };
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+            run_proton_acceptance(root, &options)
+        }
         "check" => {
             run("cargo", &["fmt", "--all", "--", "--check"])
                 && run("cargo", &["test", "--workspace"])
@@ -2814,7 +3091,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "Usage: cargo xtask <benchmark|check|fidelityfx-check|gpu-check|smoke|vkcube|wsi-compatibility|visual-quality> [command options]"
+                "Usage: cargo xtask <benchmark|check|fidelityfx-check|gpu-check|smoke|vkcube|wsi-compatibility|visual-quality|proton-acceptance> [command options]"
             );
             return ExitCode::from(2);
         }
@@ -2829,15 +3106,64 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        BENCHMARK_SAMPLE_COUNT, BackendSelection, VkcubeExit, benchmark_cases,
-        benchmark_output_is_operationally_valid, classify_vkcube_exit, classify_vkcube_output,
-        fidelityfx_elf_architecture_is_valid, fidelityfx_symbols_are_complete, generated_config,
-        maintenance_evidence_complete, maintenance_output_is_valid, parse_backend_args,
-        parse_maintenance_evidence, parse_visual_quality_args, parse_vkcube_args,
+        BENCHMARK_SAMPLE_COUNT, BackendSelection, ProtonAcceptanceOptions, VkcubeExit,
+        benchmark_cases, benchmark_output_is_operationally_valid, classify_vkcube_exit,
+        classify_vkcube_output, fidelityfx_elf_architecture_is_valid,
+        fidelityfx_symbols_are_complete, generated_config, maintenance_evidence_complete,
+        maintenance_output_is_valid, parse_backend_args, parse_maintenance_evidence,
+        parse_proton_acceptance_args, parse_visual_quality_args, parse_vkcube_args,
         parse_vkcube_evidence, quality_fixture_passes, visual_quality_metrics_for_test,
         vkcube_launch, vkcube_output_is_valid, wsi_compatibility_output_is_valid,
     };
     use std::path::Path;
+
+    #[test]
+    fn proton_acceptance_requires_an_evidence_directory_and_explicit_command() {
+        assert!(parse_proton_acceptance_args(&[]).is_err());
+        assert!(
+            parse_proton_acceptance_args(&["--evidence-dir".into(), "target/proton".into(),])
+                .is_err()
+        );
+        assert!(parse_proton_acceptance_args(&["--game-command".into(), "true".into(),]).is_err());
+    }
+
+    #[test]
+    fn proton_acceptance_preserves_the_explicit_game_command() {
+        let options = parse_proton_acceptance_args(&[
+            "--evidence-dir".into(),
+            "target/proton".into(),
+            "--game-command".into(),
+            "--".into(),
+            "steam".into(),
+            "-applaunch".into(),
+            "123".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            options,
+            ProtonAcceptanceOptions {
+                evidence_dir: Path::new("target/proton").to_path_buf(),
+                game_command: vec!["steam".into(), "-applaunch".into(), "123".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn proton_acceptance_rejects_duplicate_or_unknown_options() {
+        assert!(
+            parse_proton_acceptance_args(&[
+                "--evidence-dir".into(),
+                "one".into(),
+                "--evidence-dir".into(),
+                "two".into(),
+                "--game-command".into(),
+                "true".into(),
+            ])
+            .is_err()
+        );
+        assert!(parse_proton_acceptance_args(&["--unknown".into()]).is_err());
+    }
 
     fn portable_wsi_fixture(scenario: &str) -> String {
         format!(
