@@ -5,7 +5,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tuxscaling_vulkan::image_barrier;
+use tuxscaling_vulkan::{Buffer, image_barrier};
 use x11rb::{
     connection::Connection,
     protocol::{
@@ -52,6 +52,236 @@ fn game_extent_for(scenario: Option<&str>) -> vk::Extent2D {
             height: 300,
         },
     }
+}
+
+const SCENE_BUFFER_BYTES: u64 = 3840 * 2160 * 4;
+
+fn scene_put_pixel(pixels: &mut [u8], width: u32, height: u32, x: i32, y: i32, color: [u8; 4]) {
+    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+        return;
+    }
+    let index = (y as usize * width as usize + x as usize) * 4;
+    // The WSI example uses B8G8R8A8_UNORM swapchain images.
+    pixels[index..index + 4].copy_from_slice(&[color[2], color[1], color[0], color[3]]);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scene_rect(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    rect_width: i32,
+    rect_height: i32,
+    color: [u8; 4],
+) {
+    for py in y..y.saturating_add(rect_height) {
+        for px in x..x.saturating_add(rect_width) {
+            scene_put_pixel(pixels, width, height, px, py, color);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scene_line(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    mut x0: i32,
+    mut y0: i32,
+    x1: i32,
+    y1: i32,
+    color: [u8; 4],
+) {
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut error = dx + dy;
+    loop {
+        scene_put_pixel(pixels, width, height, x0, y0, color);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let doubled = error.saturating_mul(2);
+        if doubled >= dy {
+            error += dy;
+            x0 += sx;
+        }
+        if doubled <= dx {
+            error += dx;
+            y0 += sy;
+        }
+    }
+}
+
+fn scene_pixels(width: u32, height: u32, frame: u32, chain_index: usize) -> Vec<u8> {
+    let mut pixels = vec![0_u8; width as usize * height as usize * 4];
+    let phase = frame / 8;
+    let cut = (frame / 48).is_multiple_of(2);
+    for y in 0..height {
+        for x in 0..width {
+            let noise = ((x.wrapping_mul(17)
+                + y.wrapping_mul(31)
+                + frame.wrapping_mul(13)
+                + chain_index as u32 * 7)
+                & 15) as u8;
+            let base: [u8; 3] = if cut { [10, 18, 32] } else { [28, 12, 26] };
+            scene_put_pixel(
+                &mut pixels,
+                width,
+                height,
+                x as i32,
+                y as i32,
+                [
+                    base[0].saturating_add((x * 18 / width.max(1)) as u8),
+                    base[1].saturating_add((y * 24 / height.max(1)) as u8),
+                    base[2].saturating_add(noise),
+                    255,
+                ],
+            );
+        }
+    }
+
+    let w = width as i32;
+    let h = height as i32;
+    let travel = ((phase % 160) as i32 * (w / 3).max(1) / 160) - (w / 6);
+    let paused = (frame / 32).is_multiple_of(2) && frame % 32 >= 16;
+    let object_x = if paused {
+        w / 3 + travel
+    } else {
+        w / 3 + travel / 2
+    };
+    let object_y = h / 2 + ((phase as i32 * 3) % (h / 8).max(1)) - h / 16;
+    let scale = 20 + ((phase % 40) as i32);
+    scene_rect(
+        &mut pixels,
+        width,
+        height,
+        object_x,
+        object_y,
+        scale * 3,
+        scale * 2,
+        [42, 150, 220, 255],
+    );
+    scene_line(
+        &mut pixels,
+        width,
+        height,
+        object_x - scale,
+        object_y - scale,
+        object_x + scale * 4,
+        object_y + scale * 3,
+        [255, 214, 80, 255],
+    );
+    scene_line(
+        &mut pixels,
+        width,
+        height,
+        object_x + scale * 4,
+        object_y - scale,
+        object_x - scale,
+        object_y + scale * 3,
+        [255, 214, 80, 255],
+    );
+
+    // Thin geometry and vegetation silhouettes.
+    for index in 0..12 {
+        let x = (index * w / 12) + ((phase as i32 * (index + 1)) % 7) - 3;
+        let stem = h / 3 + (index * h / 40);
+        scene_line(
+            &mut pixels,
+            width,
+            height,
+            x,
+            h,
+            x + index - 6,
+            stem,
+            [50, 210, 120, 255],
+        );
+        scene_line(
+            &mut pixels,
+            width,
+            height,
+            x,
+            stem + h / 20,
+            x + 10,
+            stem - 8,
+            [75, 230, 140, 255],
+        );
+    }
+
+    // Transparent particles and an emissive strip exercise high-contrast edges.
+    for index in 0..24 {
+        let x = ((index * 97 + frame as usize * 11) % width.max(1) as usize) as i32;
+        let y = ((index * 53 + frame as usize * 7) % height.max(1) as usize) as i32;
+        scene_rect(&mut pixels, width, height, x, y, 3, 3, [180, 80, 240, 220]);
+    }
+    scene_rect(
+        &mut pixels,
+        width,
+        height,
+        w / 8,
+        h / 6,
+        w / 5,
+        4,
+        [255, 245, 180, 255],
+    );
+    scene_rect(
+        &mut pixels,
+        width,
+        height,
+        w / 8 + 2,
+        h / 6 + 1,
+        w / 5 - 4,
+        2,
+        [255, 255, 255, 255],
+    );
+
+    // Occlusion/disocclusion toggles expose history rejection on alternate frames.
+    if (frame / 12).is_multiple_of(2) {
+        scene_rect(
+            &mut pixels,
+            width,
+            height,
+            w / 2,
+            h / 3,
+            w / 5,
+            h / 3,
+            [8, 8, 12, 255],
+        );
+    }
+
+    // A deterministic HUD/text-like overlay remains fixed while the scene moves.
+    scene_rect(
+        &mut pixels,
+        width,
+        height,
+        16,
+        16,
+        w / 5,
+        18,
+        [8, 8, 12, 235],
+    );
+    for glyph in 0..8 {
+        let bar = if (glyph + frame as usize / 16).is_multiple_of(3) {
+            22
+        } else {
+            12
+        };
+        scene_rect(
+            &mut pixels,
+            width,
+            height,
+            26 + glyph as i32 * 18,
+            22,
+            bar,
+            4,
+            [80, 220, 255, 255],
+        );
+    }
+    pixels
 }
 
 fn starts_borderless() -> bool {
@@ -647,6 +877,15 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_scene_changes_without_non_finite_or_empty_pixels() {
+        let first = super::scene_pixels(64, 36, 0, 0);
+        let later = super::scene_pixels(64, 36, 37, 0);
+        assert_eq!(first.len(), 64 * 36 * 4);
+        assert!(first.iter().all(|value| *value <= u8::MAX));
+        assert_ne!(first, later);
+    }
+
+    #[test]
     fn mutable_format_pair_requires_two_surface_formats_with_one_color_space() {
         let formats = [
             ash::vk::SurfaceFormatKHR {
@@ -682,6 +921,8 @@ struct Chain {
     maintenance: Option<MaintenanceConfig>,
     mutable_formats: Option<MutableFormatPair>,
     command: vk::CommandBuffer,
+    extent: vk::Extent2D,
+    staging: Buffer,
 }
 
 struct SwapchainContext<'a> {
@@ -830,6 +1071,7 @@ unsafe fn replace(
         }
         context.swapchains.destroy_swapchain(chain.handle, None);
         chain.handle = new;
+        chain.extent = extent;
         chain.images = context.swapchains.get_swapchain_images(new).unwrap();
         assert_eq!(chain.surface, game_surface, "logical game surface changed");
         let mut count = 0;
@@ -1309,6 +1551,7 @@ unsafe fn run() -> WsiOutcome {
             })
             .collect::<Vec<_>>();
         let physical = instance.enumerate_physical_devices().unwrap()[0];
+        let memory = instance.get_physical_device_memory_properties(physical);
         let device_properties = instance
             .enumerate_device_extension_properties(physical)
             .unwrap();
@@ -1663,6 +1906,15 @@ unsafe fn run() -> WsiOutcome {
                 maintenance: None,
                 mutable_formats: None,
                 command: commands[i],
+                extent: vk::Extent2D::default(),
+                staging: Buffer::new(
+                    &device,
+                    &memory,
+                    SCENE_BUFFER_BYTES,
+                    vk::BufferUsageFlags::TRANSFER_SRC,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )
+                .unwrap(),
             })
             .collect::<Vec<_>>();
         for chain in &mut chains {
@@ -2014,15 +2266,24 @@ unsafe fn run() -> WsiOutcome {
                     vk::ImageLayout::UNDEFINED,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 );
-                let color = vk::ClearColorValue {
-                    float32: [(frame % 60) as f32 / 60.0, 0.15 + i as f32 * 0.2, 0.2, 1.0],
-                };
-                device.cmd_clear_color_image(
+                let pixels = scene_pixels(chain.extent.width, chain.extent.height, frame, i);
+                chain.staging.write(&pixels).unwrap();
+                device.cmd_copy_buffer_to_image(
                     chain.command,
+                    chain.staging.handle,
                     chain.images[index as usize],
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &color,
-                    &[tuxscaling_vulkan::color_range()],
+                    &[vk::BufferImageCopy::default()
+                        .image_subresource(
+                            vk::ImageSubresourceLayers::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .layer_count(1),
+                        )
+                        .image_extent(vk::Extent3D {
+                            width: chain.extent.width,
+                            height: chain.extent.height,
+                            depth: 1,
+                        })],
                 );
                 image_barrier(
                     &device,

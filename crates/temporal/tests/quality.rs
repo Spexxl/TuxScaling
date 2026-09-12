@@ -2,6 +2,8 @@
 mod quality_gates;
 #[path = "../../../tests/support/sequence.rs"]
 mod sequence;
+#[path = "fixtures.rs"]
+mod visual_fixtures;
 
 use ash::vk;
 use sequence::{
@@ -476,6 +478,20 @@ fn optical_flow_baseline_catalog_covers_motion_and_timing_axes() {
     assert_eq!(first.motion, second.motion);
     assert!(!first.long_pause);
     assert!(pause(width, height).long_pause);
+}
+
+#[test]
+fn visual_quality_fixture_catalog_exposes_all_report_categories() {
+    let catalog = visual_fixtures::catalog(64, 48);
+    assert_eq!(
+        catalog.len(),
+        visual_fixtures::VISUAL_QUALITY_CATEGORIES.len()
+    );
+    assert!(
+        catalog
+            .iter()
+            .all(|(_, fixture)| fixture.valid.iter().any(|value| *value))
+    );
 }
 
 #[test]

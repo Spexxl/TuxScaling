@@ -1,10 +1,17 @@
+use png::{BitDepth, ColorType, Encoder};
+use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
+    collections::BTreeMap,
+    fs,
     io::Read,
     path::{Path, PathBuf},
     process::{Child, Command, ExitCode, Output, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tuxscaling_motion::MotionQuality;
 
 const VKCUBE_LAYER_EVIDENCE_MARKER: &str = "TuxScaling swapchain:";
 const PORTABLE_WSI_SCENARIOS: [&str; 5] = [
@@ -642,6 +649,1287 @@ fn run_vkcube(root: &Path, options: VkcubeOptions) -> VkcubeExit {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => VkcubeExit::MissingExecutable,
         Err(_) => VkcubeExit::UnexpectedExit,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VisualQualityOptions {
+    display: String,
+    input: (u32, u32),
+    output: (u32, u32),
+    warmup: usize,
+    frames: usize,
+}
+
+fn parse_extent_argument(name: &str, value: &str) -> Result<(u32, u32), String> {
+    let (width, height) = value
+        .split_once('x')
+        .ok_or_else(|| format!("{name} requires WIDTHxHEIGHT"))?;
+    let width = width
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("{name} width must be positive"))?;
+    let height = height
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("{name} height must be positive"))?;
+    Ok((width, height))
+}
+
+fn parse_visual_quality_args(args: &[&str]) -> Result<VisualQualityOptions, String> {
+    let mut display = "nested-xwayland".to_owned();
+    let mut input = None;
+    let mut output = None;
+    let mut warmup = 180_usize;
+    let mut frames = 120_usize;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index];
+        index += 1;
+        let value = |index: &mut usize, flag: &str| {
+            let value = args
+                .get(*index)
+                .copied()
+                .ok_or_else(|| format!("{flag} requires a value"))?;
+            *index += 1;
+            Ok::<_, String>(value)
+        };
+        match argument {
+            "--display" => {
+                display = value(&mut index, "--display")?.to_owned();
+                if display != "nested-xwayland" {
+                    return Err("--display currently supports only nested-xwayland".into());
+                }
+            }
+            "--input" => {
+                input = Some(parse_extent_argument(
+                    "--input",
+                    value(&mut index, "--input")?,
+                )?)
+            }
+            "--output" => {
+                output = Some(parse_extent_argument(
+                    "--output",
+                    value(&mut index, "--output")?,
+                )?);
+            }
+            "--warmup" => {
+                warmup = value(&mut index, "--warmup")?
+                    .parse()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| "--warmup requires a positive integer".to_owned())?;
+            }
+            "--frames" => {
+                frames = value(&mut index, "--frames")?
+                    .parse()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| "--frames requires a positive integer".to_owned())?;
+            }
+            value => return Err(format!("unknown visual-quality argument: {value}")),
+        }
+    }
+    Ok(VisualQualityOptions {
+        display,
+        input: input.ok_or_else(|| "--input is required".to_owned())?,
+        output: output.ok_or_else(|| "--output is required".to_owned())?,
+        warmup,
+        frames,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct VisualQualityMetrics {
+    mse: f32,
+    psnr: f32,
+    ssim: f32,
+    flicker_mse: f32,
+    ghost_trail: f32,
+    shimmer: f32,
+    difference_map: Vec<[f32; 4]>,
+}
+
+fn image_mse(reference: &[[f32; 4]], estimate: &[[f32; 4]]) -> f32 {
+    let count = reference.len().min(estimate.len());
+    if count == 0 {
+        return 0.0;
+    }
+    reference
+        .iter()
+        .zip(estimate.iter())
+        .take(count)
+        .flat_map(|(reference, estimate)| reference.iter().zip(estimate.iter()))
+        .map(|(reference, estimate)| (reference - estimate).powi(2))
+        .sum::<f32>()
+        / (count * 4) as f32
+}
+
+fn luma_value(pixel: [f32; 4]) -> f32 {
+    pixel[0] * 0.2126 + pixel[1] * 0.7152 + pixel[2] * 0.0722
+}
+
+fn global_ssim(reference: &[[f32; 4]], estimate: &[[f32; 4]]) -> f32 {
+    let count = reference.len().min(estimate.len());
+    if count == 0 {
+        return 0.0;
+    }
+    let reference_mean = reference
+        .iter()
+        .take(count)
+        .map(|pixel| luma_value(*pixel))
+        .sum::<f32>()
+        / count as f32;
+    let estimate_mean = estimate
+        .iter()
+        .take(count)
+        .map(|pixel| luma_value(*pixel))
+        .sum::<f32>()
+        / count as f32;
+    let mut reference_variance = 0.0;
+    let mut estimate_variance = 0.0;
+    let mut covariance = 0.0;
+    for (reference, estimate) in reference.iter().zip(estimate.iter()).take(count) {
+        let reference_delta = luma_value(*reference) - reference_mean;
+        let estimate_delta = luma_value(*estimate) - estimate_mean;
+        reference_variance += reference_delta * reference_delta;
+        estimate_variance += estimate_delta * estimate_delta;
+        covariance += reference_delta * estimate_delta;
+    }
+    let denominator = (count.saturating_sub(1).max(1)) as f32;
+    reference_variance /= denominator;
+    estimate_variance /= denominator;
+    covariance /= denominator;
+    let c1 = 0.01_f32.powi(2);
+    let c2 = 0.03_f32.powi(2);
+    ((2.0 * reference_mean * estimate_mean + c1) * (2.0 * covariance + c2))
+        / ((reference_mean.powi(2) + estimate_mean.powi(2) + c1)
+            * (reference_variance + estimate_variance + c2))
+}
+
+fn visual_quality_metrics(
+    reference: &[[f32; 4]],
+    estimate: &[[f32; 4]],
+    previous_estimate: &[[f32; 4]],
+) -> VisualQualityMetrics {
+    let mse = image_mse(reference, estimate);
+    let psnr = if mse <= f32::EPSILON {
+        120.0
+    } else {
+        10.0 * (1.0 / mse).log10()
+    };
+    let difference_map = reference
+        .iter()
+        .zip(estimate.iter())
+        .map(|(reference, estimate)| {
+            [
+                (reference[0] - estimate[0]).abs(),
+                (reference[1] - estimate[1]).abs(),
+                (reference[2] - estimate[2]).abs(),
+                1.0,
+            ]
+        })
+        .collect();
+    let flicker_mse = image_mse(estimate, previous_estimate);
+    let ghost_trail = reference
+        .iter()
+        .zip(estimate.iter())
+        .flat_map(|(reference, estimate)| reference[..3].iter().zip(estimate[..3].iter()))
+        .map(|(reference, estimate)| (reference - estimate).abs())
+        .sum::<f32>()
+        / (reference.len().min(estimate.len()).max(1) * 3) as f32;
+    let shimmer = estimate
+        .iter()
+        .zip(previous_estimate.iter())
+        .flat_map(|(estimate, previous)| estimate[..3].iter().zip(previous[..3].iter()))
+        .map(|(estimate, previous)| (estimate - previous).abs())
+        .sum::<f32>()
+        / (estimate.len().min(previous_estimate.len()).max(1) * 3) as f32;
+    VisualQualityMetrics {
+        mse,
+        psnr,
+        ssim: global_ssim(reference, estimate),
+        flicker_mse,
+        ghost_trail,
+        shimmer,
+        difference_map,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CaptureManifest {
+    frame_id: u64,
+    generation_id: u64,
+    game_extent: [u32; 2],
+    guidance_extent: [u32; 2],
+    output_extent: [u32; 2],
+    viewport: [f32; 4],
+    reset_reason: String,
+    backend: String,
+    guidance_mode: String,
+    ablations: CaptureAblations,
+    sharpening: CaptureSharpening,
+    history_age: u64,
+    gpu_timings_ms: Vec<f32>,
+    resources: Vec<CaptureResource>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CaptureAblations {
+    motion: bool,
+    relative_depth: bool,
+    reactive: bool,
+    composition: bool,
+    exposure: bool,
+    confidence_disocclusion: bool,
+    post_capture_jitter: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CaptureSharpening {
+    enabled: bool,
+    sharpness: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct CaptureResource {
+    name: String,
+    file: String,
+    format: String,
+    extent: [u32; 2],
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct CapturedVisualFrame {
+    manifest: CaptureManifest,
+    source: Vec<[f32; 4]>,
+    output: Vec<[f32; 4]>,
+}
+
+fn read_capture_resource(
+    directory: &Path,
+    manifest: &CaptureManifest,
+    name: &str,
+) -> Result<(Vec<[f32; 4]>, [u32; 2]), String> {
+    let resource = manifest
+        .resources
+        .iter()
+        .find(|resource| resource.name == name)
+        .ok_or_else(|| format!("capture is missing resource {name}"))?;
+    let bytes = fs::read(directory.join(&resource.file))
+        .map_err(|error| format!("read {}: {error}", resource.file))?;
+    if bytes.len() != resource.bytes {
+        return Err(format!(
+            "capture resource {} has {} bytes, metadata declares {}",
+            resource.name,
+            bytes.len(),
+            resource.bytes
+        ));
+    }
+    let expected_pixels = resource.extent[0] as usize * resource.extent[1] as usize;
+    if !matches!(
+        resource.format.as_str(),
+        "R8G8B8A8_UNORM" | "B8G8R8A8_UNORM" | "R8G8B8A8_SRGB" | "B8G8R8A8_SRGB"
+    ) {
+        return Err(format!(
+            "visual-quality currently requires an RGBA8 color resource, got {} for {name}",
+            resource.format
+        ));
+    }
+    if bytes.len() != expected_pixels.saturating_mul(4) {
+        return Err(format!(
+            "capture resource {name} has an invalid RGBA8 extent/byte count"
+        ));
+    }
+    let image = bytes
+        .chunks(4)
+        .map(|pixel| {
+            if resource.format.starts_with('B') {
+                [
+                    f32::from(pixel[2]) / 255.0,
+                    f32::from(pixel[1]) / 255.0,
+                    f32::from(pixel[0]) / 255.0,
+                    f32::from(pixel[3]) / 255.0,
+                ]
+            } else {
+                [
+                    f32::from(pixel[0]) / 255.0,
+                    f32::from(pixel[1]) / 255.0,
+                    f32::from(pixel[2]) / 255.0,
+                    f32::from(pixel[3]) / 255.0,
+                ]
+            }
+        })
+        .collect();
+    Ok((image, resource.extent))
+}
+
+fn read_capture_series(
+    directory: &Path,
+    options: &VisualQualityOptions,
+    output_resource: &str,
+    expected_backend: &str,
+) -> Result<Vec<CapturedVisualFrame>, String> {
+    let mut manifests = fs::read_dir(directory)
+        .map_err(|error| format!("read capture directory {}: {error}", directory.display()))?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|value| value == "json")
+        })
+        .filter_map(|entry| {
+            fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|text| serde_json::from_str::<CaptureManifest>(&text).ok())
+        })
+        .collect::<Vec<_>>();
+    manifests.sort_by_key(|manifest| manifest.frame_id);
+    let end_frame = options
+        .warmup
+        .checked_add(options.frames)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or_else(|| "visual-quality frame range overflowed".to_owned())?
+        as u64;
+    let selected = manifests
+        .into_iter()
+        .filter(|manifest| {
+            manifest.frame_id >= options.warmup as u64 && manifest.frame_id <= end_frame
+        })
+        .collect::<Vec<_>>();
+    if selected.len() != options.frames {
+        return Err(format!(
+            "expected {} captured frames in {}..={}, found {}",
+            options.frames,
+            options.warmup,
+            end_frame,
+            selected.len()
+        ));
+    }
+    let mut frames = Vec::with_capacity(selected.len());
+    for manifest in selected {
+        if manifest.game_extent != [options.input.0, options.input.1]
+            || manifest.output_extent != [options.output.0, options.output.1]
+            || manifest.guidance_extent != manifest.game_extent
+        {
+            return Err(format!(
+                "frame {} has incorrect capture extents",
+                manifest.frame_id
+            ));
+        }
+        if manifest.backend != expected_backend {
+            return Err(format!(
+                "frame {} active backend is {}, expected {expected_backend}",
+                manifest.frame_id, manifest.backend
+            ));
+        }
+        if manifest.generation_id == u64::MAX
+            || manifest.gpu_timings_ms.len() != 15
+            || manifest.guidance_mode.is_empty()
+            || !manifest.viewport.iter().all(|value| value.is_finite())
+            || !manifest
+                .gpu_timings_ms
+                .iter()
+                .all(|value| value.is_finite())
+            || !manifest.sharpening.sharpness.is_finite()
+        {
+            return Err(format!(
+                "frame {} has invalid diagnostic metadata",
+                manifest.frame_id
+            ));
+        }
+        if expected_backend != "Off" && manifest.history_age == 0 {
+            return Err(format!(
+                "frame {} has stale history after warmup",
+                manifest.frame_id
+            ));
+        }
+        if expected_backend == "Off" && manifest.sharpening.enabled {
+            return Err(format!(
+                "frame {} unexpectedly has sharpening enabled in the Off capture",
+                manifest.frame_id
+            ));
+        }
+        if manifest.reset_reason == "ProviderFailure" {
+            return Err(format!(
+                "frame {} reports active provider fallback",
+                manifest.frame_id
+            ));
+        }
+        let (source, source_extent) = read_capture_resource(directory, &manifest, "source")?;
+        let (output, output_extent) = read_capture_resource(directory, &manifest, output_resource)?;
+        if source_extent != manifest.game_extent || output_extent != manifest.output_extent {
+            return Err(format!(
+                "frame {} resource extents do not match metadata",
+                manifest.frame_id
+            ));
+        }
+        frames.push(CapturedVisualFrame {
+            manifest,
+            source,
+            output,
+        });
+    }
+    Ok(frames)
+}
+
+fn scene_category(frame_id: u64) -> &'static str {
+    [
+        "translation",
+        "rotation_scaling",
+        "thin_geometry_vegetation",
+        "hud_text",
+        "transparency_particles",
+        "emissive_noise",
+        "occlusion_disocclusion",
+        "pause_resume_scene_cut",
+    ][frame_id as usize % 8]
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CategoryReport {
+    category: String,
+    frames: usize,
+    psnr_db: f32,
+    ssim: f32,
+    flicker_mse: f32,
+    ghost_trail: f32,
+    shimmer: f32,
+    gate_passed: bool,
+    status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AblationReport {
+    signal: String,
+    estimated: String,
+    fallback: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PresetReport {
+    preset: String,
+    quality_baseline: bool,
+    work_units: u64,
+    timing_status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticReport {
+    guidance_mode: String,
+    frames: usize,
+    history_age_min: u64,
+    history_age_max: u64,
+    gpu_timing_mean_ms: Vec<f32>,
+    guidance_resources: Vec<String>,
+    guidance_resource_bytes_valid: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct VisualQualityReport {
+    command: String,
+    display: String,
+    input: [u32; 2],
+    output: [u32; 2],
+    warmup: usize,
+    frames: usize,
+    source_frames_match: bool,
+    fsr_backend: String,
+    off_backend: String,
+    categories: Vec<CategoryReport>,
+    ablations: Vec<AblationReport>,
+    presets: Vec<PresetReport>,
+    diagnostics: DiagnosticReport,
+    artifacts: Vec<String>,
+    gate: String,
+}
+
+fn finite_image(image: &[[f32; 4]]) -> bool {
+    image.iter().flatten().all(|value| value.is_finite())
+}
+
+fn write_png(path: &Path, image: &[[f32; 4]], width: u32, height: u32) -> Result<(), String> {
+    if image.len() != width as usize * height as usize || !finite_image(image) {
+        return Err(format!("cannot encode invalid image at {}", path.display()));
+    }
+    let mut bytes = Vec::with_capacity(image.len() * 4);
+    for pixel in image {
+        for value in pixel {
+            bytes.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
+        }
+    }
+    let file =
+        fs::File::create(path).map_err(|error| format!("create {}: {error}", path.display()))?;
+    let mut encoder = Encoder::new(file, width, height);
+    encoder.set_color(ColorType::Rgba);
+    encoder.set_depth(BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|error| format!("write {} header: {error}", path.display()))?;
+    writer
+        .write_image_data(&bytes)
+        .map_err(|error| format!("write {}: {error}", path.display()))
+}
+
+fn side_by_side(left: &[[f32; 4]], right: &[[f32; 4]], width: u32, height: u32) -> Vec<[f32; 4]> {
+    let mut result = Vec::with_capacity(left.len() + right.len());
+    for row in 0..height as usize {
+        let start = row * width as usize;
+        result.extend_from_slice(&left[start..start + width as usize]);
+        result.extend_from_slice(&right[start..start + width as usize]);
+    }
+    result
+}
+
+fn vertical_wipe(left: &[[f32; 4]], right: &[[f32; 4]], width: u32, height: u32) -> Vec<[f32; 4]> {
+    left.iter()
+        .zip(right.iter())
+        .enumerate()
+        .map(|(index, (left, right))| {
+            if index % (width as usize) < width as usize / 2 {
+                *left
+            } else {
+                *right
+            }
+        })
+        .take(width as usize * height as usize)
+        .collect()
+}
+
+fn magnified_crop(image: &[[f32; 4]], width: u32, height: u32) -> (Vec<[f32; 4]>, u32, u32) {
+    let crop_width = (width / 4).max(1);
+    let crop_height = (height / 4).max(1);
+    let left = (width - crop_width) / 2;
+    let top = (height - crop_height) / 2;
+    let scale = 4_u32;
+    let mut crop = Vec::with_capacity((crop_width * scale * crop_height * scale) as usize);
+    for y in 0..crop_height {
+        for _ in 0..scale {
+            for x in 0..crop_width {
+                for _ in 0..scale {
+                    crop.push(image[(top + y) as usize * width as usize + (left + x) as usize]);
+                }
+            }
+        }
+    }
+    (crop, crop_width * scale, crop_height * scale)
+}
+
+fn amplified_difference(
+    reference: &[[f32; 4]],
+    estimate: &[[f32; 4]],
+    multiplier: f32,
+) -> Vec<[f32; 4]> {
+    reference
+        .iter()
+        .zip(estimate.iter())
+        .map(|(reference, estimate)| {
+            [
+                ((reference[0] - estimate[0]).abs() * multiplier).clamp(0.0, 1.0),
+                ((reference[1] - estimate[1]).abs() * multiplier).clamp(0.0, 1.0),
+                ((reference[2] - estimate[2]).abs() * multiplier).clamp(0.0, 1.0),
+                1.0,
+            ]
+        })
+        .collect()
+}
+
+struct NestedMutter {
+    mutter: Child,
+    xwayland: Child,
+    runtime_dir: PathBuf,
+    wayland_display: String,
+    display: String,
+}
+
+impl NestedMutter {
+    fn environment(&self) -> [(&str, &str); 3] {
+        [
+            (
+                "XDG_RUNTIME_DIR",
+                self.runtime_dir.to_str().unwrap_or("/tmp"),
+            ),
+            ("WAYLAND_DISPLAY", &self.wayland_display),
+            ("DISPLAY", &self.display),
+        ]
+    }
+}
+
+impl Drop for NestedMutter {
+    fn drop(&mut self) {
+        for child in [&mut self.xwayland, &mut self.mutter] {
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+fn wait_for_path(path: &Path, child: &mut Child, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return Ok(());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("poll compositor: {error}"))?
+        {
+            return Err(format!("nested compositor exited with {status}"));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!("timed out waiting for {}", path.display()))
+}
+
+fn start_nested_mutter(width: u32, height: u32) -> Result<NestedMutter, String> {
+    let runtime_dir =
+        std::env::temp_dir().join(format!("tuxscaling-wayland-{}", std::process::id()));
+    fs::create_dir_all(&runtime_dir)
+        .map_err(|error| format!("create private Wayland runtime directory: {error}"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("secure private Wayland runtime directory: {error}"))?;
+    let wayland_display = format!("tuxscaling-visual-{}", std::process::id());
+    let wayland_socket = runtime_dir.join(&wayland_display);
+    let mut mutter = Command::new("mutter")
+        .args([
+            "--wayland",
+            "--no-x11",
+            "--headless",
+            "--virtual-monitor",
+            &format!("{width}x{height}"),
+            "--wayland-display",
+            &wayland_display,
+        ])
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("XDG_CONFIG_HOME", &runtime_dir)
+        .env("GSETTINGS_BACKEND", "memory")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("start nested Mutter: {error}"))?;
+    if let Err(error) = wait_for_path(&wayland_socket, &mut mutter, Duration::from_secs(5)) {
+        let _ = mutter.kill();
+        let _ = mutter.wait();
+        return Err(error);
+    }
+
+    for number in 80..200 {
+        let display = format!(":{number}");
+        let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
+        if socket.exists() {
+            continue;
+        }
+        let mut xwayland = match Command::new("Xwayland")
+            .args([display.as_str(), "-rootless", "-terminate"])
+            .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("WAYLAND_DISPLAY", &wayland_display)
+            .env("XDG_CONFIG_HOME", &runtime_dir)
+            .env("GSETTINGS_BACKEND", "memory")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = mutter.kill();
+                let _ = mutter.wait();
+                return Err(format!("start nested Xwayland: {error}"));
+            }
+        };
+        if wait_for_path(&socket, &mut xwayland, Duration::from_secs(5)).is_ok() {
+            return Ok(NestedMutter {
+                mutter,
+                xwayland,
+                runtime_dir,
+                wayland_display,
+                display,
+            });
+        }
+        let _ = xwayland.kill();
+        let _ = xwayland.wait();
+    }
+    let _ = mutter.kill();
+    let _ = mutter.wait();
+    Err("could not allocate a private Xwayland display".into())
+}
+
+fn capture_command(
+    root: &Path,
+    binary: &Path,
+    config: &Path,
+    capture_dir: &Path,
+    guard: &NestedMutter,
+    options: &VisualQualityOptions,
+    libraries: &std::ffi::OsString,
+) -> Command {
+    let end_frame = options
+        .warmup
+        .saturating_add(options.frames)
+        .saturating_sub(1);
+    let mut command = Command::new(binary);
+    validation(&mut command)
+        .env("VK_ADD_LAYER_PATH", root.join("assets/vulkan-layer"))
+        .env("LD_LIBRARY_PATH", libraries)
+        .env(
+            "VK_INSTANCE_LAYERS",
+            "VK_LAYER_TUXSCALING_overlay:VK_LAYER_KHRONOS_validation",
+        )
+        .env("TUXSCALING_VIEW", "reconstructed")
+        .env("TUXSCALING_CONFIG", config)
+        .env("TUXSCALING_TEST_SCENARIO", "upscale")
+        .env("TUXSCALING_TEST_RESIZE_INTERVAL", "0")
+        .env("TUXSCALING_TEST_FORCE_VIRTUAL", "1")
+        .env(
+            "TUXSCALING_TEST_FRAMES",
+            end_frame.saturating_add(1).to_string(),
+        )
+        .env("TUXSCALING_TEST_SINGLE_WINDOW", "1")
+        .env("TUXSCALING_TEST_FORCE_TEMPORAL_FAILURE", "0")
+        .env("TUXSCALING_TEST_FORCE_RESIZE_FAILURE", "0")
+        .env("TUXSCALING_CAPTURE_DIR", capture_dir)
+        .env("TUXSCALING_CAPTURE_MAX_FRAMES", options.frames.to_string())
+        .env("TUXSCALING_CAPTURE_START_FRAME", options.warmup.to_string())
+        .env("TUXSCALING_CAPTURE_END_FRAME", end_frame.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in guard.environment() {
+        command.env(name, value);
+    }
+    command
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_visual_capture(
+    root: &Path,
+    binary: &Path,
+    config: &Path,
+    capture_dir: &Path,
+    guard: &NestedMutter,
+    options: &VisualQualityOptions,
+    libraries: &std::ffi::OsString,
+    log_path: &Path,
+) -> Result<(), String> {
+    let result = command_output_with_timeout(
+        capture_command(root, binary, config, capture_dir, guard, options, libraries),
+        90,
+    )
+    .map_err(|error| format!("visual scene could not start: {error}"))?;
+    let (output, timed_out) = result;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    fs::write(log_path, format!("{stdout}\n{stderr}"))
+        .map_err(|error| format!("write visual scene log {}: {error}", log_path.display()))?;
+    if timed_out {
+        return Err("visual scene timed out".into());
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "visual scene exited with {} (see {})",
+            output.status,
+            log_path.display()
+        ));
+    }
+    if stdout.to_ascii_lowercase().contains("validation error")
+        || stderr.to_ascii_lowercase().contains("validation error")
+    {
+        return Err(format!(
+            "visual scene emitted validation errors (see {})",
+            log_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn update_category(
+    categories: &mut BTreeMap<String, (usize, f32, f32, f32, f32, f32)>,
+    category: &str,
+    metrics: &VisualQualityMetrics,
+) {
+    let entry = categories
+        .entry(category.to_owned())
+        .or_insert((0, 0.0, 0.0, 0.0, 0.0, 0.0));
+    entry.0 += 1;
+    entry.1 += metrics.psnr;
+    entry.2 += metrics.ssim;
+    entry.3 += metrics.flicker_mse;
+    entry.4 += metrics.ghost_trail;
+    entry.5 += metrics.shimmer;
+}
+
+fn validate_diagnostic_resources(
+    directory: &Path,
+    manifest: &CaptureManifest,
+) -> Result<Vec<String>, String> {
+    let required = [
+        "motion",
+        "confidence",
+        "disocclusion",
+        "reactive",
+        "composition",
+        "relative_depth",
+        "exposure",
+    ];
+    for name in required {
+        let resource = manifest
+            .resources
+            .iter()
+            .find(|resource| resource.name == name)
+            .ok_or_else(|| format!("capture is missing diagnostic resource {name}"))?;
+        let bytes = fs::read(directory.join(&resource.file))
+            .map_err(|error| format!("read diagnostic resource {}: {error}", resource.file))?;
+        if bytes.len() != resource.bytes || resource.extent.contains(&0) {
+            return Err(format!(
+                "diagnostic resource {name} has invalid metadata or bytes"
+            ));
+        }
+    }
+    Ok(required.into_iter().map(String::from).collect())
+}
+
+fn category_gate_passed(psnr: f32, ssim: f32, flicker: f32, ghost: f32, shimmer: f32) -> bool {
+    // These are conservative engineering gates for an 8-bit Off-baseline
+    // comparison. They reject broken output without treating the baseline as
+    // ground truth.
+    psnr >= 10.0 && ssim >= 0.75 && flicker <= 0.10 && ghost <= 0.50 && shimmer <= 0.50
+}
+
+fn visual_quality_report(
+    options: &VisualQualityOptions,
+    fsr: &[CapturedVisualFrame],
+    off: &[CapturedVisualFrame],
+    report_dir: &Path,
+) -> Result<VisualQualityReport, String> {
+    if fsr.len() != off.len() || fsr.is_empty() {
+        return Err("FSR and Off capture series have different or empty lengths".into());
+    }
+    let source_frames_match = fsr.iter().zip(off.iter()).all(|(fsr, off)| {
+        fsr.manifest.frame_id == off.manifest.frame_id
+            && fsr.source.len() == off.source.len()
+            && image_mse(&fsr.source, &off.source) <= f32::EPSILON
+    });
+    if !source_frames_match {
+        return Err("FSR and Off captures do not share identical source frames".into());
+    }
+    let width = options.output.0;
+    let height = options.output.1;
+    let mut categories = BTreeMap::new();
+    let mut previous = off[0].output.as_slice();
+    let mut all_finite = true;
+    for (fsr_frame, off_frame) in fsr.iter().zip(off.iter()) {
+        if fsr_frame.output.len() != off_frame.output.len()
+            || fsr_frame.output.len() != width as usize * height as usize
+        {
+            return Err(format!(
+                "frame {} output extent does not match requested output",
+                fsr_frame.manifest.frame_id
+            ));
+        }
+        let metrics = visual_quality_metrics(&off_frame.output, &fsr_frame.output, previous);
+        all_finite &= metrics.mse.is_finite()
+            && metrics.psnr.is_finite()
+            && metrics.ssim.is_finite()
+            && metrics.flicker_mse.is_finite()
+            && metrics.ghost_trail.is_finite()
+            && metrics.shimmer.is_finite()
+            && finite_image(&metrics.difference_map);
+        update_category(
+            &mut categories,
+            scene_category(fsr_frame.manifest.frame_id),
+            &metrics,
+        );
+        previous = fsr_frame.output.as_slice();
+    }
+    if !all_finite {
+        return Err("visual-quality metrics contain non-finite values".into());
+    }
+
+    let first_fsr = &fsr[0];
+    let first_off = &off[0];
+    let guidance_resources = validate_diagnostic_resources(
+        report_dir.join("capture-fsr").as_path(),
+        &first_fsr.manifest,
+    )?;
+    write_png(
+        &report_dir.join("fsr.png"),
+        &first_fsr.output,
+        width,
+        height,
+    )?;
+    write_png(
+        &report_dir.join("off.png"),
+        &first_off.output,
+        width,
+        height,
+    )?;
+    write_png(
+        &report_dir.join("side-by-side.png"),
+        &side_by_side(&first_off.output, &first_fsr.output, width, height),
+        width.saturating_mul(2),
+        height,
+    )?;
+    write_png(
+        &report_dir.join("wipe.png"),
+        &vertical_wipe(&first_off.output, &first_fsr.output, width, height),
+        width,
+        height,
+    )?;
+    let (crop, crop_width, crop_height) = magnified_crop(&first_fsr.output, width, height);
+    write_png(
+        &report_dir.join("magnified.png"),
+        &crop,
+        crop_width,
+        crop_height,
+    )?;
+    write_png(
+        &report_dir.join("amplified-diff.png"),
+        &amplified_difference(&first_off.output, &first_fsr.output, 8.0),
+        width,
+        height,
+    )?;
+
+    let categories = categories
+        .into_iter()
+        .map(
+            |(category, (frames, psnr, ssim, flicker, ghost, shimmer))| CategoryReport {
+                category,
+                frames,
+                psnr_db: psnr / frames as f32,
+                ssim: ssim / frames as f32,
+                flicker_mse: flicker / frames as f32,
+                ghost_trail: ghost / frames as f32,
+                shimmer: shimmer / frames as f32,
+                gate_passed: category_gate_passed(
+                    psnr / frames as f32,
+                    ssim / frames as f32,
+                    flicker / frames as f32,
+                    ghost / frames as f32,
+                    shimmer / frames as f32,
+                ),
+                status: "measured against the captured Off baseline".into(),
+            },
+        )
+        .collect::<Vec<_>>();
+    let category_gates_passed = categories.iter().all(|category| category.gate_passed);
+    let ablations = [
+        ("motion", first_fsr.manifest.ablations.motion),
+        ("relative_depth", first_fsr.manifest.ablations.relative_depth),
+        ("reactive", first_fsr.manifest.ablations.reactive),
+        ("composition", first_fsr.manifest.ablations.composition),
+        ("exposure", first_fsr.manifest.ablations.exposure),
+        (
+            "confidence_disocclusion",
+            first_fsr.manifest.ablations.confidence_disocclusion,
+        ),
+        (
+            "post_capture_jitter",
+            first_fsr.manifest.ablations.post_capture_jitter,
+        ),
+    ]
+    .into_iter()
+    .map(|(signal, disabled)| AblationReport {
+        signal: signal.into(),
+        estimated: (!disabled).to_string(),
+        fallback: disabled.to_string(),
+        status: "default Estimated run; dedicated per-signal ablation is recorded as a follow-up dimension".into(),
+    })
+    .collect();
+    let presets = [MotionQuality::Balanced, MotionQuality::Performance]
+        .into_iter()
+        .map(|quality| PresetReport {
+            preset: format!("{quality:?}"),
+            quality_baseline: quality == MotionQuality::Balanced,
+            work_units: quality
+                .dispatch_plan(options.input.0, options.input.1)
+                .candidate_evaluations,
+            timing_status:
+                "capture GPU timings are present; preset comparison requires separate run".into(),
+        })
+        .collect();
+    let mut timing_sum = vec![0.0_f32; first_fsr.manifest.gpu_timings_ms.len()];
+    for frame in fsr {
+        for (sum, value) in timing_sum
+            .iter_mut()
+            .zip(frame.manifest.gpu_timings_ms.iter())
+        {
+            *sum += *value;
+        }
+    }
+    let diagnostics = DiagnosticReport {
+        guidance_mode: first_fsr.manifest.guidance_mode.clone(),
+        frames: fsr.len(),
+        history_age_min: fsr
+            .iter()
+            .map(|frame| frame.manifest.history_age)
+            .min()
+            .unwrap_or(0),
+        history_age_max: fsr
+            .iter()
+            .map(|frame| frame.manifest.history_age)
+            .max()
+            .unwrap_or(0),
+        gpu_timing_mean_ms: timing_sum
+            .into_iter()
+            .map(|value| value / fsr.len() as f32)
+            .collect(),
+        guidance_resources,
+        guidance_resource_bytes_valid: true,
+    };
+    let artifacts = [
+        "fsr.png",
+        "off.png",
+        "side-by-side.png",
+        "wipe.png",
+        "magnified.png",
+        "amplified-diff.png",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    Ok(VisualQualityReport {
+        command: format!(
+            "cargo xtask visual-quality --display {} --input {}x{} --output {}x{} --warmup {} --frames {}",
+            options.display,
+            options.input.0,
+            options.input.1,
+            options.output.0,
+            options.output.1,
+            options.warmup,
+            options.frames
+        ),
+        display: options.display.clone(),
+        input: [options.input.0, options.input.1],
+        output: [options.output.0, options.output.1],
+        warmup: options.warmup,
+        frames: options.frames,
+        source_frames_match,
+        fsr_backend: first_fsr.manifest.backend.clone(),
+        off_backend: first_off.manifest.backend.clone(),
+        categories,
+        ablations,
+        presets,
+        diagnostics,
+        artifacts,
+        gate: if category_gates_passed {
+            "passed: captures, extents, history, validation, finite metrics, source-frame identity, and category thresholds are valid; values are an Off-baseline comparison, not a ground-truth claim".into()
+        } else {
+            "failed: one or more category thresholds did not pass against the captured Off baseline"
+                .into()
+        },
+    })
+}
+
+fn write_visual_quality_markdown(report: &VisualQualityReport, path: &Path) -> Result<(), String> {
+    let mut markdown = format!(
+        "# Temporal visual quality\n\n- Command: `{}`\n- Display: `{}`\n- Input: `{}x{}`\n- Output: `{}x{}`\n- Warmup: `{}` frames\n- Measured: `{}` frames\n- Source frames match: `{}`\n- Gate: {}\n\n",
+        report.command,
+        report.display,
+        report.input[0],
+        report.input[1],
+        report.output[0],
+        report.output[1],
+        report.warmup,
+        report.frames,
+        report.source_frames_match,
+        report.gate
+    );
+    markdown.push_str("## Categories\n\n| Category | Frames | PSNR (dB) | SSIM | Flicker MSE | Ghost trail | Shimmer | Gate | Status |\n|---|---:|---:|---:|---:|---:|---:|---|---|\n");
+    for category in &report.categories {
+        markdown.push_str(&format!(
+            "| {} | {} | {:.6} | {:.6} | {:.6} | {:.6} | {:.6} | {} | {} |\n",
+            category.category,
+            category.frames,
+            category.psnr_db,
+            category.ssim,
+            category.flicker_mse,
+            category.ghost_trail,
+            category.shimmer,
+            category.gate_passed,
+            category.status
+        ));
+    }
+    markdown.push_str(
+        "\n## Ablation matrix\n\n| Signal | Estimated | Fallback | Status |\n|---|---|---|---|\n",
+    );
+    for ablation in &report.ablations {
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            ablation.signal, ablation.estimated, ablation.fallback, ablation.status
+        ));
+    }
+    markdown.push_str("\n## Presets\n\n| Preset | Balanced baseline | Candidate work units | Timing status |\n|---|---|---:|---|\n");
+    for preset in &report.presets {
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            preset.preset, preset.quality_baseline, preset.work_units, preset.timing_status
+        ));
+    }
+    markdown.push_str(&format!(
+        "\n## Diagnostics\n\n- Guidance mode: `{}`\n- History age: `{}`..`{}`\n- GPU timing means (ms): `{}`\n- Guidance resources: `{}`\n- Diagnostic bytes valid: `{}`\n",
+        report.diagnostics.guidance_mode,
+        report.diagnostics.history_age_min,
+        report.diagnostics.history_age_max,
+        report
+            .diagnostics
+            .gpu_timing_mean_ms
+            .iter()
+            .map(|value| format!("{value:.6}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        report.diagnostics.guidance_resources.join(", "),
+        report.diagnostics.guidance_resource_bytes_valid
+    ));
+    markdown.push_str("\n## Artifacts\n\n");
+    for artifact in &report.artifacts {
+        markdown.push_str(&format!("- `{artifact}`\n"));
+    }
+    fs::write(path, markdown).map_err(|error| format!("write {}: {error}", path.display()))
+}
+
+fn run_visual_quality(root: &Path, options: &VisualQualityOptions) -> bool {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |value| value.as_secs());
+    let report_dir = root.join(format!("target/visual-quality/{timestamp}"));
+    let fsr_capture = report_dir.join("capture-fsr");
+    let off_capture = report_dir.join("capture-off");
+    if fs::create_dir_all(&fsr_capture).is_err() || fs::create_dir_all(&off_capture).is_err() {
+        eprintln!(
+            "cargo xtask visual-quality: unable to create {}",
+            report_dir.display()
+        );
+        return false;
+    }
+    if !run(
+        "cargo",
+        &[
+            "build",
+            "-p",
+            "tuxscaling-layer",
+            "--lib",
+            "--example",
+            "wsi",
+            "--release",
+        ],
+    ) {
+        return false;
+    }
+    let guard = match start_nested_mutter(options.output.0, options.output.1) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("cargo xtask visual-quality: unverified nested display: {error}");
+            return false;
+        }
+    };
+    let fsr_config = report_dir.join("fsr.toml");
+    let off_config = report_dir.join("off.toml");
+    if fs::write(
+        &fsr_config,
+        generated_config_with_backend_and_sharpening(
+            "native",
+            1.0,
+            Some("balanced"),
+            BackendSelection::Fsr314,
+            true,
+            0.2,
+        ),
+    )
+    .is_err()
+        || fs::write(
+            &off_config,
+            "output_resolution = \"native\"\nguidance_scale = 1.0\nmotion_quality = \"balanced\"\nsharpening_enabled = false\nsharpness = 0.0\nupscaler = \"off\"\n",
+        )
+        .is_err()
+    {
+        eprintln!("cargo xtask visual-quality: unable to write capture configs");
+        return false;
+    }
+    let binary = root.join("target/release/examples/wsi");
+    let inherited = std::env::var_os("LD_LIBRARY_PATH").unwrap_or_default();
+    let libraries = std::env::join_paths(
+        std::iter::once(root.join("target/release")).chain(std::env::split_paths(&inherited)),
+    )
+    .unwrap_or(inherited);
+    let fsr_result = run_visual_capture(
+        root,
+        &binary,
+        &fsr_config,
+        &fsr_capture,
+        &guard,
+        options,
+        &libraries,
+        &report_dir.join("fsr-run.log"),
+    );
+    if let Err(error) = fsr_result {
+        eprintln!("cargo xtask visual-quality: FSR capture failed: {error}");
+        return false;
+    }
+    let off_result = run_visual_capture(
+        root,
+        &binary,
+        &off_config,
+        &off_capture,
+        &guard,
+        options,
+        &libraries,
+        &report_dir.join("off-run.log"),
+    );
+    if let Err(error) = off_result {
+        eprintln!("cargo xtask visual-quality: Off capture failed: {error}");
+        return false;
+    }
+    let fsr = match read_capture_series(&fsr_capture, options, "reconstructed", "FSR 3.1.4") {
+        Ok(frames) => frames,
+        Err(error) => {
+            eprintln!("cargo xtask visual-quality: invalid FSR capture: {error}");
+            return false;
+        }
+    };
+    let off = match read_capture_series(&off_capture, options, "spatial_off", "Off") {
+        Ok(frames) => frames,
+        Err(error) => {
+            eprintln!("cargo xtask visual-quality: invalid Off capture: {error}");
+            return false;
+        }
+    };
+    let report = match visual_quality_report(options, &fsr, &off, &report_dir) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("cargo xtask visual-quality: quality gate failed: {error}");
+            return false;
+        }
+    };
+    let json = match serde_json::to_string_pretty(&report) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("cargo xtask visual-quality: serialize report: {error}");
+            return false;
+        }
+    };
+    let passed = report.gate.starts_with("passed:");
+    if fs::write(report_dir.join("report.json"), json).is_err()
+        || write_visual_quality_markdown(&report, &report_dir.join("report.md")).is_err()
+    {
+        eprintln!("cargo xtask visual-quality: unable to write report artifacts");
+        return false;
+    }
+    println!("TuxScaling visual-quality report: {}", report_dir.display());
+    passed
+}
+
+#[cfg(test)]
+fn visual_quality_metrics_for_test(
+    reference: &[[f32; 4]],
+    estimate: &[[f32; 4]],
+    previous_estimate: &[[f32; 4]],
+) -> VisualQualityMetrics {
+    visual_quality_metrics(reference, estimate, previous_estimate)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1389,6 +2677,19 @@ fn main() -> ExitCode {
             let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
             run_wsi_compatibility(root, backend)
         }
+        "visual-quality" => {
+            let arguments = std::env::args().skip(2).collect::<Vec<_>>();
+            let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+            let options = match parse_visual_quality_args(&arguments) {
+                Ok(options) => options,
+                Err(error) => {
+                    eprintln!("cargo xtask visual-quality: {error}");
+                    return ExitCode::from(2);
+                }
+            };
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+            run_visual_quality(root, &options)
+        }
         "check" => {
             run("cargo", &["fmt", "--all", "--", "--check"])
                 && run("cargo", &["test", "--workspace"])
@@ -1406,7 +2707,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "Usage: cargo xtask <benchmark|check|fidelityfx-check|gpu-check|smoke|vkcube|wsi-compatibility> [--sharpness 0.0..=1.0|--disable-sharpening]"
+                "Usage: cargo xtask <benchmark|check|fidelityfx-check|gpu-check|smoke|vkcube|wsi-compatibility|visual-quality> [command options]"
             );
             return ExitCode::from(2);
         }
@@ -1425,7 +2726,8 @@ mod tests {
         benchmark_output_is_operationally_valid, classify_vkcube_exit, classify_vkcube_output,
         fidelityfx_elf_architecture_is_valid, fidelityfx_symbols_are_complete, generated_config,
         maintenance_evidence_complete, maintenance_output_is_valid, parse_backend_args,
-        parse_maintenance_evidence, parse_vkcube_args, quality_fixture_passes, vkcube_launch,
+        parse_maintenance_evidence, parse_visual_quality_args, parse_vkcube_args,
+        quality_fixture_passes, visual_quality_metrics_for_test, vkcube_launch,
         wsi_compatibility_output_is_valid,
     };
     use std::path::Path;
@@ -1739,6 +3041,61 @@ mod tests {
                 "{scenario}"
             );
         }
+    }
+
+    #[test]
+    fn visual_quality_parser_accepts_the_nested_xwayland_contract() {
+        let options = parse_visual_quality_args(&[
+            "--display",
+            "nested-xwayland",
+            "--input",
+            "1280x720",
+            "--output",
+            "2160x1440",
+            "--warmup",
+            "180",
+            "--frames",
+            "120",
+        ])
+        .unwrap();
+        assert_eq!(options.display, "nested-xwayland");
+        assert_eq!(options.input, (1280, 720));
+        assert_eq!(options.output, (2160, 1440));
+        assert_eq!(options.warmup, 180);
+        assert_eq!(options.frames, 120);
+    }
+
+    #[test]
+    fn visual_quality_parser_rejects_incomplete_or_invalid_extents() {
+        for args in [
+            vec!["--input", "1280x720"],
+            vec!["--output", "2160x1440"],
+            vec!["--input", "0x720", "--output", "2160x1440"],
+            vec![
+                "--input",
+                "1280x720",
+                "--output",
+                "2160x1440",
+                "--frames",
+                "0",
+            ],
+        ] {
+            assert!(parse_visual_quality_args(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn visual_quality_metrics_match_tiny_known_images_exactly() {
+        let reference = vec![[0.0, 0.25, 0.5, 1.0], [1.0, 0.75, 0.5, 1.0]];
+        let estimate = vec![[0.0, 0.25, 0.25, 1.0], [0.5, 0.75, 0.5, 1.0]];
+        let metrics = visual_quality_metrics_for_test(&reference, &estimate, &estimate);
+        assert_eq!(metrics.mse, 0.0390625);
+        assert_eq!(metrics.psnr, 14.082399);
+        assert_eq!(metrics.ssim, 0.9774446);
+        assert_eq!(metrics.flicker_mse, 0.0);
+        assert_eq!(metrics.ghost_trail, 0.125);
+        assert_eq!(metrics.shimmer, 0.0);
+        assert_eq!(metrics.difference_map.len(), 2);
     }
 
     #[test]
