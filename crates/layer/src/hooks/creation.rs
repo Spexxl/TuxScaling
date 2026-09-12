@@ -1,5 +1,6 @@
 use super::swapchain_create::{
-    SwapchainCompatibilityError, SwapchainCreateChain, supported_swapchain_flags,
+    SwapchainCompatibilityError, SwapchainCreateChain, physical_surface_for_swapchain,
+    supported_swapchain_flags,
 };
 use super::*;
 use crate::mapping::{LogicalSwapchainHandle, Mapping, OldSwapchain};
@@ -183,9 +184,14 @@ fn publish_negotiation(
             continue;
         }
         if let Ok(mut swapchain) = swapchain.lock()
-            && swapchain.surface == surface_handle
+            && swapchain.game_surface == surface_handle
         {
-            if negotiation.public_state() == tuxscaling_display::PresentationState::Direct
+            let public_state = if swapchain.present_surface.is_some() {
+                tuxscaling_display::PresentationState::Virtualized
+            } else {
+                negotiation.public_state()
+            };
+            if public_state == tuxscaling_display::PresentationState::Direct
                 && swapchain
                     .contract
                     .as_ref()
@@ -195,7 +201,7 @@ fn publish_negotiation(
             }
             swapchain.negotiation = negotiation;
             if let Some(contract) = swapchain.contract.as_mut() {
-                contract.set_state(negotiation.public_state());
+                contract.set_state(public_state);
             }
         }
     }
@@ -229,7 +235,8 @@ fn translate_old_swapchain(logical: vk::SwapchainKHR) -> Result<vk::SwapchainKHR
 
 #[derive(Clone)]
 struct ActiveLogicalSwapchain {
-    surface: vk::SurfaceKHR,
+    game_surface: vk::SurfaceKHR,
+    present_surface: Option<vk::SurfaceKHR>,
     contract: LogicalSwapchainContract,
     negotiation: PresentationNegotiation,
 }
@@ -248,7 +255,8 @@ fn active_logical_swapchain(logical: vk::SwapchainKHR) -> Option<ActiveLogicalSw
                 .contract
                 .clone()
                 .map(|contract| ActiveLogicalSwapchain {
-                    surface: state.surface,
+                    game_surface: state.game_surface,
+                    present_surface: state.present_surface,
                     contract,
                     negotiation: state.negotiation,
                 })
@@ -319,6 +327,13 @@ struct PhysicalCreateTarget {
     old_swapchain: vk::SwapchainKHR,
 }
 
+fn presenter_matches_generation(
+    old_present_surface: Option<vk::SurfaceKHR>,
+    current_present_surface: Option<vk::SurfaceKHR>,
+) -> bool {
+    old_present_surface.is_none_or(|surface| current_present_surface == Some(surface))
+}
+
 unsafe fn create_physical_swapchain(
     create: vk::PFN_vkCreateSwapchainKHR,
     device: vk::Device,
@@ -338,6 +353,101 @@ unsafe fn create_physical_swapchain(
     } else {
         unsafe { create(device, fallback_info, allocation_callbacks, swapchain) }
     }
+}
+
+unsafe fn destroy_physical_swapchain(
+    device: vk::Device,
+    allocation_callbacks: *const vk::AllocationCallbacks<'_>,
+    swapchain: vk::SwapchainKHR,
+) {
+    if swapchain == vk::SwapchainKHR::null() {
+        return;
+    }
+    let Some(proc) = (unsafe { device_downstream(device, c"vkDestroySwapchainKHR") }) else {
+        return;
+    };
+    let destroy: vk::PFN_vkDestroySwapchainKHR = unsafe { std::mem::transmute(proc) };
+    unsafe { destroy(device, swapchain, allocation_callbacks) };
+}
+
+// Keep the raw Vulkan create inputs explicit: this fallback must be able to
+// retry with the application's original surface after destroying a failed
+// presenter-owned physical swapchain.
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_direct_fallback(
+    create_swapchain: vk::PFN_vkCreateSwapchainKHR,
+    device: vk::Device,
+    allocation_callbacks: *const vk::AllocationCallbacks<'_>,
+    original: &vk::SwapchainCreateInfoKHR<'_>,
+    replacing_logical_swapchain: bool,
+    physical_swapchain: vk::SwapchainKHR,
+    swapchain: *mut vk::SwapchainKHR,
+    reason: crate::state::PresenterFallbackReason,
+) -> vk::Result {
+    unsafe { destroy_physical_swapchain(device, allocation_callbacks, physical_swapchain) };
+    crate::state::record_presenter_fallback(original.surface, reason);
+    let mut direct = *original;
+    direct.old_swapchain = if replacing_logical_swapchain {
+        vk::SwapchainKHR::null()
+    } else {
+        original.old_swapchain
+    };
+    let result = unsafe {
+        create_physical_swapchain(
+            create_swapchain,
+            device,
+            allocation_callbacks,
+            None,
+            &direct,
+            PhysicalCreateTarget {
+                surface: original.surface,
+                extent: original.image_extent,
+                old_swapchain: direct.old_swapchain,
+            },
+            swapchain,
+        )
+    };
+    eprintln!(
+        "TuxScaling evidence event=presenter_fallback_to_direct surface=0x{:x} result={result:?}",
+        original.surface.as_raw(),
+    );
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn fallback_presenter_to_direct(
+    create_swapchain: vk::PFN_vkCreateSwapchainKHR,
+    device: vk::Device,
+    allocation_callbacks: *const vk::AllocationCallbacks<'_>,
+    original: &vk::SwapchainCreateInfoKHR<'_>,
+    replacing_logical_swapchain: bool,
+    physical_swapchain: vk::SwapchainKHR,
+    swapchain: *mut vk::SwapchainKHR,
+    presenter_created_here: &mut bool,
+    presenter_surface: &mut Option<vk::SurfaceKHR>,
+    reason: crate::state::PresenterFallbackReason,
+) -> vk::Result {
+    let result = unsafe {
+        create_direct_fallback(
+            create_swapchain,
+            device,
+            allocation_callbacks,
+            original,
+            replacing_logical_swapchain,
+            physical_swapchain,
+            swapchain,
+            reason,
+        )
+    };
+    if *presenter_created_here {
+        unsafe { super::surface::destroy_presenter_for_surface(original.surface) };
+        *presenter_created_here = false;
+    }
+    *presenter_surface = None;
+    if !has_live_presenter_swapchain(original.surface) {
+        super::lifetime::restore_surface_window(original.surface);
+    }
+    result
 }
 
 fn allocate_logical_swapchain(physical: vk::SwapchainKHR) -> Option<vk::SwapchainKHR> {
@@ -520,7 +630,21 @@ fn has_live_virtual_swapchain(surface: vk::SurfaceKHR) -> bool {
         .any(|state| {
             state
                 .lock()
-                .is_ok_and(|state| state.surface == surface && state.mapping.is_some())
+                .is_ok_and(|state| state.game_surface == surface && state.mapping.is_some())
+        })
+}
+
+fn has_live_presenter_swapchain(surface: vk::SurfaceKHR) -> bool {
+    swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .values()
+        .any(|state| {
+            state.lock().is_ok_and(|state| {
+                state.game_surface == surface
+                    && state.mapping.is_some()
+                    && state.present_surface.is_some()
+            })
         })
 }
 
@@ -553,6 +677,12 @@ pub(super) unsafe fn observe_surface_negotiation(
     else {
         return tuxscaling_display::PresentationState::Direct;
     };
+    // A presenter-owned swapchain already has a separate downstream WSI
+    // surface. Its game window is deliberately kept at the logical extent;
+    // never feed it into the legacy native-publication path.
+    if has_live_presenter_swapchain(surface) {
+        return tuxscaling_display::PresentationState::Virtualized;
+    }
     if snapshot.window == super::surface::PENDING_WIN32_WINDOW {
         return snapshot.negotiation.public_state();
     }
@@ -618,7 +748,7 @@ fn begin_native_generation(
     surface_extent: SurfaceExtent,
 ) -> Option<(NativeGenerationSnapshot, OverlaySwapchain)> {
     let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
-    if guard.surface != surface
+    if guard.game_surface != surface
         || !guard
             .mapping
             .as_ref()
@@ -634,6 +764,10 @@ fn begin_native_generation(
             .contract
             .as_ref()
             .is_none_or(|contract| contract.generation().id() != guard.generation)
+        || guard
+            .contract
+            .as_ref()
+            .is_some_and(|contract| contract.generation().present_surface().is_some())
     {
         return None;
     }
@@ -700,10 +834,10 @@ unsafe fn destroy_abandoned_generation(
         .values()
         .any(|state| {
             let state = state.lock().unwrap_or_else(|error| error.into_inner());
-            state.surface == snapshot.ticket.surface() && state.mapping.is_some()
+            state.game_surface == snapshot.ticket.game_surface() && state.mapping.is_some()
         });
     if owns_old_physical && !another_virtual_swapchain {
-        super::lifetime::restore_surface_window(snapshot.ticket.surface());
+        super::lifetime::restore_surface_window(snapshot.ticket.game_surface());
     }
 }
 
@@ -790,7 +924,7 @@ unsafe fn finish_native_generation_failure(
         } else if guard.lifecycle.can_publish(
             snapshot.ticket,
             guard.logical_handle,
-            guard.surface,
+            guard.game_surface,
             guard.generation,
             is_retired_swapchain(guard.logical_handle),
         ) {
@@ -826,6 +960,12 @@ pub(super) unsafe fn publish_native_generation(
     device_state: &DeviceState,
     surface: vk::SurfaceKHR,
 ) -> bool {
+    if has_live_presenter_swapchain(surface) {
+        eprintln!(
+            "TuxScaling evidence event=native_publication_skipped reason=presenter_owned_surface"
+        );
+        return false;
+    }
     let Some(_recreation_guard) = SurfaceRecreationGuard::try_new(surface) else {
         return false;
     };
@@ -838,7 +978,7 @@ pub(super) unsafe fn publish_native_generation(
                 && state
                     .lock()
                     .ok()
-                    .is_some_and(|state| state.surface == surface && state.mapping.is_some())
+                    .is_some_and(|state| state.game_surface == surface && state.mapping.is_some())
         })
         .map(|(_, state)| state.clone());
     let Some(state) = state else {
@@ -1007,7 +1147,7 @@ pub(super) unsafe fn publish_native_generation(
                 let valid = guard.lifecycle.can_publish(
                     snapshot.ticket,
                     guard.logical_handle,
-                    guard.surface,
+                    guard.game_surface,
                     guard.generation,
                     is_retired_swapchain(guard.logical_handle),
                 );
@@ -1029,7 +1169,7 @@ pub(super) unsafe fn publish_native_generation(
         };
         let next_generation = snapshot.ticket.generation().saturating_add(1);
         let logical_handle = guard.logical_handle;
-        let current_surface = guard.surface;
+        let current_surface = guard.game_surface;
         let current_generation = guard.generation;
         let retired = is_retired_swapchain(logical_handle);
         let published = prepared
@@ -1859,7 +1999,7 @@ unsafe fn create_swapchain_inner(
     let old_logical = active_logical_swapchain(original.old_swapchain);
     if old_logical
         .as_ref()
-        .is_some_and(|old| old.surface != original.surface)
+        .is_some_and(|old| old.game_surface != original.surface)
     {
         return vk::Result::ERROR_OUT_OF_DATE_KHR;
     }
@@ -1956,8 +2096,18 @@ unsafe fn create_swapchain_inner(
                 || extent.height != original.image_extent.height
         })
     };
+    let old_present_surface = old_logical.as_ref().and_then(|old| old.present_surface);
     let mut presenter_surface = crate::state::presenter_surface(original.surface);
     let mut presenter_created_here = false;
+    if !presenter_matches_generation(old_present_surface, presenter_surface) {
+        crate::state::record_presenter_fallback(
+            original.surface,
+            crate::state::PresenterFallbackReason::PresenterSurfaceUnavailable,
+        );
+        presenter_surface = None;
+        virtualization_plan = None;
+        virtual_preflight_eligible = false;
+    }
     if let Some(target) = initial_target
         && virtualization_plan.is_some()
         && let Some(device_state) = state.as_ref()
@@ -1985,27 +2135,90 @@ unsafe fn create_swapchain_inner(
                     original.surface,
                     crate::state::PresenterFallbackReason::PresenterQueueUnsupported,
                 );
-                unsafe { super::surface::destroy_presenter_for_surface(original.surface) };
-                presenter_surface = None;
+                if !had_presenter {
+                    unsafe { super::surface::destroy_presenter_for_surface(original.surface) };
+                    presenter_surface = None;
+                }
                 virtualization_plan = None;
                 virtual_preflight_eligible = false;
             }
             Err(reason) => {
                 crate::state::record_presenter_fallback(original.surface, reason);
-                // The existing borderless promotion remains the migration
-                // fallback until native output is routed through this surface.
+                virtualization_plan = None;
+                virtual_preflight_eligible = false;
             }
         }
     }
-    // A native request on a promoted surface means the application adopted the
-    // promoted window as its own resolution. There is nothing to upscale, so
-    // no logical predecessor is inferred: the request below goes direct, and
-    // the stale-override guard afterwards keeps capability queries truthful.
-    // The lease is kept, so a later smaller request promotes idempotently and
-    // virtualizes again without disturbing the window.
-    let virtual_intent = old_logical.is_some() || initial_target.is_some();
+    // A virtual swapchain now requires an independently owned presenter. An
+    // old logical token from the migration path without that owner is treated
+    // as a direct recreation rather than resizing the application's window.
+    if (initial_target.is_some() || old_logical.is_some()) && presenter_surface.is_none() {
+        if old_logical.is_some() {
+            crate::state::record_presenter_fallback(
+                original.surface,
+                crate::state::PresenterFallbackReason::PresenterSurfaceUnavailable,
+            );
+        }
+        virtualization_plan = None;
+        virtual_preflight_eligible = false;
+    }
+
+    let mut physical_capabilities = logical_capabilities;
+    if let Some(present_surface) = presenter_surface
+        && virtualization_plan.is_some()
+        && let Some(device_state) = state.as_ref()
+    {
+        match unsafe { downstream_surface_capabilities(device_state, present_surface) } {
+            Some(capabilities) => match preflight_swapchain_virtualization(
+                &device_state.wsi,
+                &modified,
+                Some(capabilities),
+                format_features,
+            ) {
+                Ok(plan) => {
+                    physical_capabilities = Some(capabilities);
+                    virtualization_plan = Some(plan);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "TuxScaling evidence event=virtualization_preflight result=direct reason={}",
+                        error.reason()
+                    );
+                    crate::state::record_presenter_fallback(
+                        original.surface,
+                        crate::state::PresenterFallbackReason::PresenterSurfaceUnavailable,
+                    );
+                    if presenter_created_here {
+                        unsafe { super::surface::destroy_presenter_for_surface(original.surface) };
+                        presenter_surface = None;
+                        presenter_created_here = false;
+                    }
+                    virtualization_plan = None;
+                    virtual_preflight_eligible = false;
+                    physical_capabilities = logical_capabilities;
+                }
+            },
+            None => {
+                crate::state::record_presenter_fallback(
+                    original.surface,
+                    crate::state::PresenterFallbackReason::PresenterSurfaceUnavailable,
+                );
+                if presenter_created_here {
+                    unsafe { super::surface::destroy_presenter_for_surface(original.surface) };
+                    presenter_surface = None;
+                    presenter_created_here = false;
+                }
+                virtualization_plan = None;
+                virtual_preflight_eligible = false;
+            }
+        }
+    }
+    let mut virtual_intent = old_logical.is_some() || initial_target.is_some();
+    if presenter_surface.is_none() || virtualization_plan.is_none() {
+        virtual_intent = false;
+    }
     let mut preallocated_virtual_images = None;
-    if let Some(plan) = virtualization_plan.as_ref() {
+    if virtual_intent && let Some(plan) = virtualization_plan.as_ref() {
         if let Some(count) = preflight_logical_image_count(original.min_image_count) {
             match unsafe {
                 allocate_logical_images(
@@ -2036,7 +2249,7 @@ unsafe fn create_swapchain_inner(
             virtual_preflight_eligible = false;
         }
     }
-    if !virtual_preflight_eligible {
+    if !virtual_preflight_eligible && !has_live_presenter_swapchain(original.surface) {
         super::lifetime::restore_surface_window(original.surface);
     }
     if virtualization_plan.is_some() && !virtual_intent && old_logical.is_none() {
@@ -2049,33 +2262,63 @@ unsafe fn create_swapchain_inner(
     }
     if virtual_intent
         && virtual_preflight_eligible
-        && let Some(capabilities) = logical_capabilities
+        && let Some(target) = initial_target
+    {
+        let target_extent = target.monitor.rect.extent();
+        if !physical_capabilities.is_some_and(|capabilities| {
+            surface_extent_accepts(
+                surface_extent(capabilities),
+                vk::Extent2D {
+                    width: target_extent.width,
+                    height: target_extent.height,
+                },
+            )
+        }) {
+            crate::state::record_presenter_fallback(
+                original.surface,
+                crate::state::PresenterFallbackReason::PresenterSurfaceUnavailable,
+            );
+            if presenter_created_here {
+                unsafe { super::surface::destroy_presenter_for_surface(original.surface) };
+                presenter_surface = None;
+                presenter_created_here = false;
+            }
+            virtualization_plan = None;
+            virtual_preflight_eligible = false;
+            virtual_intent = false;
+        } else {
+            modified.image_extent = vk::Extent2D {
+                width: target_extent.width,
+                height: target_extent.height,
+            };
+        }
+    }
+    if virtual_intent
+        && virtual_preflight_eligible
+        && initial_target.is_none()
+        && let Some(capabilities) = physical_capabilities
     {
         modified.image_extent =
             initial_physical_extent(original.image_extent, surface_extent(capabilities), true);
     }
-    // Probe X11 only.  The physical swapchain is intentionally created at
-    // the extent accepted by the surface now; promotion happens only after
-    // the logical token and images have been installed below.
-    if old_logical.is_some() && !virtual_preflight_eligible {
-        return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+    let physical_surface = physical_surface_for_swapchain(
+        original.surface,
+        presenter_surface,
+        virtual_intent && virtual_preflight_eligible,
+    );
+    if old_logical.is_some() && !virtual_intent {
+        // The old logical token may refer to a presenter generation. A direct
+        // fallback cannot pass that handle to the application's surface.
+        modified.old_swapchain = vk::SwapchainKHR::null();
     }
-    if let Some(target) = initial_target {
-        eprintln!(
-            "TuxScaling evidence event=borderless_target extent={}x{} origin={}+{}",
-            target.monitor.rect.width,
-            target.monitor.rect.height,
-            target.monitor.rect.x,
-            target.monitor.rect.y,
-        );
-    }
-    if let Some(old) = old_logical.as_ref() {
-        let Some(device_state) = state.as_ref() else {
+    if let Some(old) = old_logical.as_ref()
+        && virtual_intent
+        && virtual_preflight_eligible
+    {
+        let Some(_device_state) = state.as_ref() else {
             return vk::Result::ERROR_INITIALIZATION_FAILED;
         };
-        let Some(capabilities) =
-            (unsafe { downstream_surface_capabilities(device_state, original.surface) })
-        else {
+        let Some(capabilities) = physical_capabilities else {
             return vk::Result::ERROR_INITIALIZATION_FAILED;
         };
         let Some(_plan) = virtualization_plan.as_ref() else {
@@ -2109,7 +2352,7 @@ unsafe fn create_swapchain_inner(
             virtualization_plan.as_ref().map(|plan| &plan.template),
             &modified,
             PhysicalCreateTarget {
-                surface: original.surface,
+                surface: physical_surface,
                 extent: physical_extent,
                 old_swapchain: physical_old_swapchain,
             },
@@ -2127,7 +2370,7 @@ unsafe fn create_swapchain_inner(
                 match preflight_swapchain_virtualization(
                     &state.wsi,
                     &modified,
-                    logical_capabilities,
+                    physical_capabilities,
                     format_features,
                 ) {
                     Ok(plan) => Some(plan),
@@ -2154,7 +2397,7 @@ unsafe fn create_swapchain_inner(
                     retry_plan.as_ref().map(|plan| &plan.template),
                     &modified,
                     PhysicalCreateTarget {
-                        surface: original.surface,
+                        surface: physical_surface,
                         extent: physical_extent,
                         old_swapchain: physical_old_swapchain,
                     },
@@ -2167,6 +2410,22 @@ unsafe fn create_swapchain_inner(
         }
     }
     if result != vk::Result::SUCCESS {
+        if physical_surface != original.surface {
+            return unsafe {
+                fallback_presenter_to_direct(
+                    create_swapchain,
+                    device,
+                    allocation_callbacks,
+                    original,
+                    old_logical.is_some(),
+                    vk::SwapchainKHR::null(),
+                    swapchain,
+                    &mut presenter_created_here,
+                    &mut presenter_surface,
+                    crate::state::PresenterFallbackReason::PresenterSurfaceUnavailable,
+                )
+            };
+        }
         if presenter_created_here {
             unsafe { super::surface::destroy_presenter_for_surface(original.surface) };
         }
@@ -2174,12 +2433,29 @@ unsafe fn create_swapchain_inner(
         return result;
     }
     let post_result = catch_unwind(AssertUnwindSafe(|| {
+        let handle = unsafe { *swapchain };
         let Some(device_state) = devices()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&device)
             .cloned()
         else {
+            if physical_surface != original.surface {
+                return unsafe {
+                    fallback_presenter_to_direct(
+                        create_swapchain,
+                        device,
+                        allocation_callbacks,
+                        original,
+                        old_logical.is_some(),
+                        handle,
+                        swapchain,
+                        &mut presenter_created_here,
+                        &mut presenter_surface,
+                        crate::state::PresenterFallbackReason::PresenterSurfaceUnavailable,
+                    )
+                };
+            }
             return result;
         };
         if !modified
@@ -2188,9 +2464,24 @@ unsafe fn create_swapchain_inner(
             || original.image_array_layers != 1
             || !supported_swapchain_flags(original.flags)
         {
+            if physical_surface != original.surface {
+                return unsafe {
+                    fallback_presenter_to_direct(
+                        create_swapchain,
+                        device,
+                        allocation_callbacks,
+                        original,
+                        old_logical.is_some(),
+                        handle,
+                        swapchain,
+                        &mut presenter_created_here,
+                        &mut presenter_surface,
+                        crate::state::PresenterFallbackReason::PresenterSurfaceUnavailable,
+                    )
+                };
+            }
             return result;
         }
-        let handle = unsafe { *swapchain };
         eprintln!(
             "TuxScaling swapchain: format={:?} color_space={:?} flags={:?} capture={capture_enabled} usage={:?}",
             original.image_format, original.image_color_space, original.flags, modified.image_usage
@@ -2199,6 +2490,22 @@ unsafe fn create_swapchain_inner(
         let loader = ash::khr::swapchain::Device::new(&device_state.instance, &device_state.device);
         let output_images = match unsafe { loader.get_swapchain_images(handle) } {
             Ok(images) => images,
+            Err(_) if physical_surface != original.surface => {
+                return unsafe {
+                    fallback_presenter_to_direct(
+                        create_swapchain,
+                        device,
+                        allocation_callbacks,
+                        original,
+                        old_logical.is_some(),
+                        handle,
+                        swapchain,
+                        &mut presenter_created_here,
+                        &mut presenter_surface,
+                        crate::state::PresenterFallbackReason::PresenterSurfaceUnavailable,
+                    )
+                };
+            }
             Err(_) => return result,
         };
         let mut virtual_eligible = virtual_intent
@@ -2212,6 +2519,22 @@ unsafe fn create_swapchain_inner(
             match allocate_logical_swapchain(handle) {
                 Some(logical) => logical,
                 None => {
+                    if physical_surface != original.surface {
+                        return unsafe {
+                            fallback_presenter_to_direct(
+                                create_swapchain,
+                                device,
+                                allocation_callbacks,
+                                original,
+                                old_logical.is_some(),
+                                handle,
+                                swapchain,
+                                &mut presenter_created_here,
+                                &mut presenter_surface,
+                                crate::state::PresenterFallbackReason::PresenterSurfaceUnavailable,
+                            )
+                        };
+                    }
                     virtual_eligible = false;
                     handle
                 }
@@ -2224,9 +2547,26 @@ unsafe fn create_swapchain_inner(
         } else {
             None
         };
+        if !virtual_eligible && physical_surface != original.surface {
+            return unsafe {
+                fallback_presenter_to_direct(
+                    create_swapchain,
+                    device,
+                    allocation_callbacks,
+                    original,
+                    old_logical.is_some(),
+                    handle,
+                    swapchain,
+                    &mut presenter_created_here,
+                    &mut presenter_surface,
+                    crate::state::PresenterFallbackReason::PresenterSurfaceUnavailable,
+                )
+            };
+        }
         if !virtual_eligible && presenter_created_here {
             unsafe { super::surface::destroy_presenter_for_surface(original.surface) };
             presenter_surface = None;
+            presenter_created_here = false;
         }
         let game_images = virtual_images.as_ref().map_or_else(
             || output_images.clone(),
@@ -2272,20 +2612,39 @@ unsafe fn create_swapchain_inner(
                         })
                         .is_some_and(|target| target.is_fullscreen()),
                     monitor,
-                    temporal_enabled: temporal_enabled_for_logical_creation(
-                        virtual_eligible,
-                        old_logical
-                            .as_ref()
-                            .map(|old| old.negotiation.public_state()),
-                    ),
+                    temporal_enabled: virtual_eligible
+                        && (presenter_surface.is_some()
+                            || temporal_enabled_for_logical_creation(
+                                virtual_eligible,
+                                old_logical
+                                    .as_ref()
+                                    .map(|old| old.negotiation.public_state()),
+                            )),
                 },
                 device_state.set_loader_data,
             )
         };
         let Ok(overlay) = overlay else {
             eprintln!("TuxScaling: overlay disabled for swapchain");
+            if physical_surface != original.surface {
+                return unsafe {
+                    fallback_presenter_to_direct(
+                        create_swapchain,
+                        device,
+                        allocation_callbacks,
+                        original,
+                        old_logical.is_some(),
+                        handle,
+                        swapchain,
+                        &mut presenter_created_here,
+                        &mut presenter_surface,
+                        crate::state::PresenterFallbackReason::PresenterSurfaceUnavailable,
+                    )
+                };
+            }
             if presenter_created_here {
                 unsafe { super::surface::destroy_presenter_for_surface(original.surface) };
+                presenter_created_here = false;
             }
             return result;
         };
@@ -2296,20 +2655,10 @@ unsafe fn create_swapchain_inner(
                 .template
                 .clone()
         });
-        let mut negotiation = if let Some(old) = old_logical.as_ref() {
-            old.negotiation
-        } else if virtual_eligible {
-            let mut negotiation =
-                persisted_negotiation.unwrap_or_else(PresentationNegotiation::direct);
-            if let Some(target) = initial_target
-                && negotiation.public_state() == PresentationState::Direct
-            {
-                let _ = negotiation.request_borderless(target.monitor.rect, Instant::now());
-            }
-            negotiation
-        } else {
-            persisted_negotiation.unwrap_or_else(PresentationNegotiation::direct)
-        };
+        let negotiation = old_logical.as_ref().map_or_else(
+            || persisted_negotiation.unwrap_or_else(PresentationNegotiation::direct),
+            |old| old.negotiation,
+        );
         let prior_logical_capabilities = surfaces()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -2324,20 +2673,49 @@ unsafe fn create_swapchain_inner(
         } else {
             logical_capabilities
         };
+        let present_surface = virtual_eligible.then_some(presenter_surface).flatten();
+        let contract_state = present_surface.map_or_else(
+            || negotiation.public_state(),
+            |_| PresentationState::Virtualized,
+        );
+        let physical_generation =
+            PhysicalGeneration::new(0, handle, info.extent, output_images.len());
+        let physical_generation = present_surface.map_or(physical_generation, |surface| {
+            physical_generation.with_present_surface(surface)
+        });
         let contract = virtual_images.as_ref().and_then(|images| {
             LogicalSwapchainContract::new(
                 logical_handle,
                 images.iter().map(|image| image.handle).collect(),
                 original.image_extent,
-                PhysicalGeneration::new(0, handle, info.extent, output_images.len()),
-                negotiation.public_state(),
+                physical_generation,
+                contract_state,
             )
             .ok()
         });
+        let Some(contract) = contract else {
+            if physical_surface != original.surface {
+                return unsafe {
+                    fallback_presenter_to_direct(
+                        create_swapchain,
+                        device,
+                        allocation_callbacks,
+                        original,
+                        old_logical.is_some(),
+                        handle,
+                        swapchain,
+                        &mut presenter_created_here,
+                        &mut presenter_surface,
+                        crate::state::PresenterFallbackReason::PresenterSurfaceUnavailable,
+                    )
+                };
+            }
+            return result;
+        };
         let state = Arc::new(Mutex::new(SwapchainState {
             device,
-            surface: original.surface,
-            presenter_surface: virtual_eligible.then_some(presenter_surface).flatten(),
+            game_surface: original.surface,
+            present_surface,
             logical_handle,
             physical_handle: handle,
             mapping: virtual_images
@@ -2353,7 +2731,7 @@ unsafe fn create_swapchain_inner(
             maintenance_release_reported: false,
             generation: 0,
             template,
-            contract,
+            contract: Some(contract),
             hdr_metadata: None,
             present_ids: crate::hooks::present_id::PresentIdHistory::new(),
             lifecycle: crate::recovery::ReconfigurationLifecycle::new(),
@@ -2369,7 +2747,10 @@ unsafe fn create_swapchain_inner(
             retire_swapchain(original.old_swapchain);
         }
         eprintln!(
-            "TuxScaling evidence event=logical_swapchain_created logical_handle=0x{:x} physical_handle=0x{:x} logical={}x{} physical={}x{} virtual={} mutable_format={} view_formats={} negotiation={}",
+            "TuxScaling evidence event=logical_swapchain_created game_surface=0x{:x} present_surface=0x{:x} physical_surface=0x{:x} logical_handle=0x{:x} physical_handle=0x{:x} logical={}x{} physical={}x{} virtual={} presenter_state={} virtualization_state={} fallback_reason=none mutable_format={} view_formats={} negotiation={}",
+            original.surface.as_raw(),
+            present_surface.map_or(0, |surface| surface.as_raw()),
+            physical_surface.as_raw(),
             logical_handle.as_raw(),
             handle.as_raw(),
             original.image_extent.width,
@@ -2377,6 +2758,16 @@ unsafe fn create_swapchain_inner(
             info.extent.width,
             info.extent.height,
             u8::from(virtual_eligible),
+            if present_surface.is_some() {
+                "active"
+            } else {
+                "none"
+            },
+            if virtual_eligible {
+                "virtual"
+            } else {
+                "direct"
+            },
             u8::from(
                 virtual_eligible
                     && virtualization_plan.as_ref().is_some_and(|plan| {
@@ -2391,126 +2782,53 @@ unsafe fn create_swapchain_inner(
             } else {
                 0
             },
-            if virtual_eligible {
+            if present_surface.is_some() {
+                "virtualized"
+            } else if virtual_eligible {
                 "negotiating"
             } else {
                 "direct"
             },
         );
         if virtual_eligible {
-            if let Some(target) = initial_target {
-                let display = match tuxscaling_display::X11Display::connect() {
-                    Ok(display) => display,
-                    Err(_) => {
-                        if let Some(state) = swapchains()
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .remove(&logical_handle)
-                            && let Ok(state) = Arc::try_unwrap(state)
-                        {
-                            let overlay = state
-                                .into_inner()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .overlay;
-                            if let Some(overlay) = overlay {
-                                unsafe { overlay.destroy(&device_state.device) };
-                            }
-                        }
-                        if presenter_created_here {
-                            unsafe {
-                                super::surface::destroy_presenter_for_surface(original.surface)
-                            };
-                        }
-                        return result;
-                    }
-                };
-                let existing_lease = surface_snapshot
-                    .and_then(|surface| surface.borderless_lease)
-                    .filter(|lease| {
-                        lease.window == target.window && lease.monitor == target.monitor
-                    });
-                let lease = match existing_lease
-                    .map(Ok)
-                    .unwrap_or_else(|| display.promote_borderless(target.window))
-                {
-                    Ok(lease) => lease,
-                    Err(_) => {
-                        if let Some(state) = swapchains()
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .remove(&logical_handle)
-                            && let Ok(state) = Arc::try_unwrap(state)
-                        {
-                            let overlay = state
-                                .into_inner()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .overlay;
-                            if let Some(overlay) = overlay {
-                                unsafe { overlay.destroy(&device_state.device) };
-                            }
-                        }
-                        if presenter_created_here {
-                            unsafe {
-                                super::surface::destroy_presenter_for_surface(original.surface)
-                            };
-                        }
-                        return result;
-                    }
-                };
-                let state = swapchains()
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .get(&logical_handle)
-                    .cloned()
-                    .expect("initial virtual state is installed before promotion");
-                negotiation = {
-                    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-                    let _ = state.negotiation.borderless_requested(Instant::now());
-                    state.negotiation
-                };
-                {
-                    let mut surfaces = surfaces().lock().unwrap_or_else(|error| error.into_inner());
-                    if let Some(surface) = surfaces.get_mut(&original.surface) {
-                        surface.logical_extent = Some(original.image_extent);
-                        surface.logical_capabilities = advertised_logical_capabilities;
-                        surface.negotiation = negotiation;
-                        surface.borderless_lease = Some(lease);
-                    }
-                }
-                unsafe { *swapchain = logical_handle };
-                publish_negotiation(original.surface, negotiation);
-                eprintln!(
-                    "TuxScaling evidence event=virtual_swapchain_negotiating logical_handle=0x{:x} logical={}x{} physical={}x{}",
-                    logical_handle.as_raw(),
-                    original.image_extent.width,
-                    original.image_extent.height,
-                    info.extent.width,
-                    info.extent.height,
-                );
-            } else {
-                {
-                    let mut surfaces = surfaces().lock().unwrap_or_else(|error| error.into_inner());
-                    if let Some(surface) = surfaces.get_mut(&original.surface) {
-                        surface.logical_extent = Some(original.image_extent);
-                        surface.logical_capabilities = advertised_logical_capabilities;
-                        surface.negotiation = negotiation;
-                    }
-                }
-                unsafe { *swapchain = logical_handle };
-                publish_negotiation(original.surface, negotiation);
-                eprintln!(
-                    "TuxScaling evidence event=logical_swapchain_recreated logical_handle=0x{:x} logical={}x{} physical={}x{}",
-                    logical_handle.as_raw(),
-                    original.image_extent.width,
-                    original.image_extent.height,
-                    info.extent.width,
-                    info.extent.height,
-                );
+            let mut surfaces = surfaces().lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(surface) = surfaces.get_mut(&original.surface) {
+                surface.logical_extent = Some(original.image_extent);
+                surface.logical_capabilities = advertised_logical_capabilities;
+                surface.negotiation = negotiation;
             }
+            unsafe { *swapchain = logical_handle };
+            publish_negotiation(original.surface, negotiation);
+            eprintln!(
+                "TuxScaling evidence event=virtual_swapchain_active logical_handle=0x{:x} logical={}x{} physical={}x{} presenter_surface={}",
+                logical_handle.as_raw(),
+                original.image_extent.width,
+                original.image_extent.height,
+                info.extent.width,
+                info.extent.height,
+                u8::from(present_surface.is_some()),
+            );
         }
         result
     }));
     if post_result.is_err() {
+        let handle = unsafe { *swapchain };
+        if physical_surface != original.surface {
+            return unsafe {
+                fallback_presenter_to_direct(
+                    create_swapchain,
+                    device,
+                    allocation_callbacks,
+                    original,
+                    old_logical.is_some(),
+                    handle,
+                    swapchain,
+                    &mut presenter_created_here,
+                    &mut presenter_surface,
+                    crate::state::PresenterFallbackReason::PresenterSurfaceUnavailable,
+                )
+            };
+        }
         if presenter_created_here {
             unsafe { super::surface::destroy_presenter_for_surface(original.surface) };
         }
@@ -2535,7 +2853,8 @@ pub(super) unsafe extern "system" fn create_swapchain_khr(
 mod tests {
     use super::{
         augment_instance_extensions, initial_physical_extent, logical_image_count,
-        native_generation_failure_can_restore, preflight_swapchain_virtualization,
+        native_generation_failure_can_restore, physical_surface_for_swapchain,
+        preflight_swapchain_virtualization, presenter_matches_generation,
         temporal_enabled_for_logical_creation, translate_old_swapchain,
         translate_recreation_create_info, virtual_swapchain_supported,
     };
@@ -2645,6 +2964,37 @@ mod tests {
 
         assert_eq!(plan.names.len(), requested.len());
         assert!(plan.presenter_enabled);
+    }
+
+    #[test]
+    fn virtual_swapchain_targets_presenter_surface_without_changing_game_surface() {
+        let game_surface = vk::SurfaceKHR::from_raw(0x101);
+        let present_surface = vk::SurfaceKHR::from_raw(0x202);
+
+        assert_eq!(
+            physical_surface_for_swapchain(game_surface, Some(present_surface), true),
+            present_surface
+        );
+        assert_eq!(
+            physical_surface_for_swapchain(game_surface, None, true),
+            game_surface
+        );
+        assert_eq!(
+            physical_surface_for_swapchain(game_surface, Some(present_surface), false),
+            game_surface
+        );
+    }
+
+    #[test]
+    fn presenter_recreation_requires_the_same_owned_surface() {
+        let previous = Some(vk::SurfaceKHR::from_raw(0x202));
+        assert!(presenter_matches_generation(previous, previous));
+        assert!(!presenter_matches_generation(
+            previous,
+            Some(vk::SurfaceKHR::from_raw(0x303))
+        ));
+        assert!(!presenter_matches_generation(previous, None));
+        assert!(presenter_matches_generation(None, None));
     }
 
     fn compatible_wsi() -> crate::hooks::wsi_compatibility::DeviceWsiCapabilities {

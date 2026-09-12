@@ -44,10 +44,10 @@ fn take_swapchain_teardown(
             state.physical_handle,
             &state.retired_physical_generations,
         ),
-        restore_surface: virtualized.then_some(state.surface).filter(|_| {
+        restore_surface: virtualized.then_some(state.game_surface).filter(|_| {
             should_restore_surface_on_destroy(state.negotiation.public_state(), force_restore)
         }),
-        presenter_owner: state.presenter_surface.map(|_| state.surface),
+        presenter_owner: state.present_surface.map(|_| state.game_surface),
         virtualized,
         overlay: state.overlay.take(),
     }
@@ -60,7 +60,7 @@ fn has_live_presenter_swapchain(game_surface: vk::SurfaceKHR) -> bool {
         .values()
         .any(|state| {
             state.lock().is_ok_and(|state| {
-                state.surface == game_surface && state.presenter_surface.is_some()
+                state.game_surface == game_surface && state.present_surface.is_some()
             })
         })
 }
@@ -133,7 +133,7 @@ unsafe fn destroy_swapchain_inner(
                 .values()
                 .any(|state| {
                     let state = state.lock().unwrap_or_else(|e| e.into_inner());
-                    state.surface == surface && state.mapping.is_some()
+                    state.game_surface == surface && state.mapping.is_some()
                 });
             if !another_virtual_swapchain {
                 restore_surface_window(surface);
@@ -179,7 +179,7 @@ pub(super) fn restore_surface_window(surface: vk::SurfaceKHR) {
         .values()
     {
         if let Ok(mut state) = state.lock()
-            && state.surface == surface
+            && state.game_surface == surface
         {
             let has_contract = state.contract.is_some();
             if has_contract {
@@ -287,7 +287,7 @@ unsafe fn destroy_device_inner(
                 .values()
                 .any(|state| {
                     let state = state.lock().unwrap_or_else(|error| error.into_inner());
-                    state.surface == surface && state.mapping.is_some()
+                    state.game_surface == surface && state.mapping.is_some()
                 });
             if !another_virtual_swapchain {
                 restore_surface_window(surface);

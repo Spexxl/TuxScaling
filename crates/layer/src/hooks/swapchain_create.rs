@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ash::vk;
+    use ash::{vk, vk::Handle};
 
     fn base_info(flags: vk::SwapchainCreateFlagsKHR) -> vk::SwapchainCreateInfoKHR<'static> {
         vk::SwapchainCreateInfoKHR::default()
@@ -90,6 +90,25 @@ mod tests {
         let chain = unsafe { SwapchainCreateChain::from_create_info(&info) }.unwrap();
 
         assert_eq!(chain.view_formats.as_deref(), Some(formats.as_slice()));
+    }
+
+    #[test]
+    fn virtual_creation_routes_only_the_physical_swapchain_to_the_presenter_surface() {
+        let game_surface = vk::SurfaceKHR::from_raw(0x101);
+        let presenter_surface = vk::SurfaceKHR::from_raw(0x202);
+
+        assert_eq!(
+            physical_surface_for_swapchain(game_surface, Some(presenter_surface), true),
+            presenter_surface
+        );
+        assert_eq!(
+            physical_surface_for_swapchain(game_surface, Some(presenter_surface), false),
+            game_surface
+        );
+        assert_eq!(
+            physical_surface_for_swapchain(game_surface, None, true),
+            game_surface
+        );
     }
 
     #[test]
@@ -192,6 +211,17 @@ pub(crate) fn supported_swapchain_flags(flags: vk::SwapchainCreateFlagsKHR) -> b
     let supported = vk::SwapchainCreateFlagsKHR::DEFERRED_MEMORY_ALLOCATION_EXT
         | vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT;
     flags.as_raw() & !supported.as_raw() == 0
+}
+
+pub(crate) fn physical_surface_for_swapchain(
+    game_surface: vk::SurfaceKHR,
+    present_surface: Option<vk::SurfaceKHR>,
+    virtualized: bool,
+) -> vk::SurfaceKHR {
+    virtualized
+        .then_some(present_surface)
+        .flatten()
+        .unwrap_or(game_surface)
 }
 
 impl SwapchainCreateChain {

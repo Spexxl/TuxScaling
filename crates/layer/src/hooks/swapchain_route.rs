@@ -37,6 +37,8 @@ pub(crate) enum SwapchainRoute {
     CurrentVirtual {
         state: Arc<Mutex<SwapchainState>>,
         physical: vk::SwapchainKHR,
+        game_surface: vk::SurfaceKHR,
+        present_surface: Option<vk::SurfaceKHR>,
     },
 }
 
@@ -70,6 +72,8 @@ pub(crate) fn resolve_swapchain_route(
     Ok(SwapchainRoute::CurrentVirtual {
         state: state.clone(),
         physical: state_guard.physical_handle,
+        game_surface: state_guard.game_surface,
+        present_surface: state_guard.present_surface,
     })
 }
 

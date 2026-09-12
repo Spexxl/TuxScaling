@@ -141,7 +141,7 @@ fn release_info_with_plan<'a>(
 
 struct ReleaseTranslation {
     state: Arc<Mutex<SwapchainState>>,
-    surface: vk::SurfaceKHR,
+    game_surface: vk::SurfaceKHR,
     physical_swapchain: vk::SwapchainKHR,
     plan: ReleasePlan,
 }
@@ -194,7 +194,7 @@ fn prepare_release_target(
         .map_err(|_| vk::Result::ERROR_OUT_OF_DATE_KHR)?;
     Ok(ReleaseTarget::Virtual(ReleaseTranslation {
         state: state.clone(),
-        surface: state_guard.surface,
+        game_surface: state_guard.game_surface,
         physical_swapchain: state_guard.physical_handle,
         plan,
     }))
@@ -271,7 +271,7 @@ unsafe fn release_swapchain_images_inner(
         unsafe {
             super::creation::observe_surface_negotiation(
                 &device_state,
-                translation.surface,
+                translation.game_surface,
                 Instant::now(),
             );
         }

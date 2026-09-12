@@ -85,6 +85,52 @@ fn native_monitor_rect() -> Option<(i32, i32, u32, u32)> {
     ))
 }
 
+fn presenter_window_rects() -> Vec<(u64, tuxscaling_display::Rect)> {
+    let Ok((connection, screen)) = x11rb::connect(None) else {
+        return Vec::new();
+    };
+    let Some(root) = connection
+        .setup()
+        .roots
+        .get(screen)
+        .map(|screen| screen.root)
+    else {
+        return Vec::new();
+    };
+    let mut pending = vec![root];
+    let mut windows = Vec::new();
+    while let Some(parent) = pending.pop() {
+        let Ok(cookie) = connection.query_tree(parent) else {
+            continue;
+        };
+        let Ok(tree) = cookie.reply() else {
+            continue;
+        };
+        for window in tree.children {
+            let is_presenter = connection
+                .get_property(
+                    false,
+                    window,
+                    x11rb::protocol::xproto::AtomEnum::WM_NAME,
+                    x11rb::protocol::xproto::AtomEnum::STRING,
+                    0,
+                    64,
+                )
+                .ok()
+                .and_then(|cookie| cookie.reply().ok())
+                .is_some_and(|property| property.value == b"TuxScaling Presenter");
+            if is_presenter
+                && let Ok(display) = tuxscaling_display::X11Display::connect()
+                && let Ok(rect) = display.window_rect(window.into())
+            {
+                windows.push((window.into(), rect));
+            }
+            pending.push(window);
+        }
+    }
+    windows
+}
+
 fn pin_fullscreen_monitor(windows: &[c_ulong]) {
     let Ok((connection, screen)) = x11rb::connect(None) else {
         return;
@@ -544,6 +590,24 @@ mod tests {
     }
 
     #[test]
+    fn upscale_scenario_separates_logical_game_and_native_presenter_extents() {
+        assert_eq!(
+            super::game_extent_for(Some("upscale")),
+            ash::vk::Extent2D {
+                width: 1280,
+                height: 720,
+            }
+        );
+        assert_eq!(
+            super::game_extent_for(Some("native")),
+            ash::vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            }
+        );
+    }
+
+    #[test]
     fn mutable_format_pair_requires_two_surface_formats_with_one_color_space() {
         let formats = [
             ash::vk::SurfaceFormatKHR {
@@ -598,6 +662,7 @@ unsafe fn replace(
 ) {
     unsafe {
         context.device.device_wait_idle().unwrap();
+        let game_surface = chain.surface;
         let caps = context
             .surfaces
             .get_physical_device_surface_capabilities(context.physical, chain.surface)
@@ -727,6 +792,7 @@ unsafe fn replace(
         context.swapchains.destroy_swapchain(chain.handle, None);
         chain.handle = new;
         chain.images = context.swapchains.get_swapchain_images(new).unwrap();
+        assert_eq!(chain.surface, game_surface, "logical game surface changed");
         let mut count = 0;
         assert_eq!(
             (context.swapchains.fp().get_swapchain_images_khr)(
@@ -738,6 +804,22 @@ unsafe fn replace(
             vk::Result::SUCCESS
         );
         assert_eq!(count as usize, chain.images.len());
+        let mut queried_images = vec![vk::Image::null(); count as usize];
+        let mut queried_count = count;
+        assert_eq!(
+            (context.swapchains.fp().get_swapchain_images_khr)(
+                context.device.handle(),
+                new,
+                &mut queried_count,
+                queried_images.as_mut_ptr()
+            ),
+            vk::Result::SUCCESS
+        );
+        assert_eq!(queried_count, count);
+        assert_eq!(
+            queried_images, chain.images,
+            "logical image identity changed"
+        );
         if count > 1 {
             let mut first = vk::Image::null();
             count = 1;
@@ -1021,12 +1103,14 @@ unsafe fn run() -> WsiOutcome {
         let scenario_active = scenario.is_some();
         let scenario_name = scenario.as_deref().unwrap_or("default");
         let maintenance_scenario = scenario.as_deref() == Some("maintenance1");
+        let presenter_scenario = scenario.as_deref() == Some("upscale");
         let mutable_scenario = scenario.as_deref() == Some("mutable_format");
         let present_wait_scenario = scenario.as_deref() == Some("present_wait_generation");
         let hdr_scenario = scenario.as_deref() == Some("hdr_replacement");
         let timing_scenario = scenario.as_deref() == Some("display_timing");
         let incompatible_scenario = scenario.as_deref() == Some("incompatible_direct");
-        let portable_wsi_scenario = mutable_scenario
+        let portable_wsi_scenario = presenter_scenario
+            || mutable_scenario
             || present_wait_scenario
             || hdr_scenario
             || timing_scenario
@@ -1590,7 +1674,7 @@ unsafe fn run() -> WsiOutcome {
             // manager applies it to the active fullscreen state.
             pin_fullscreen_monitor(&windows);
         }
-        if portable_wsi_scenario && !incompatible_scenario {
+        if portable_wsi_scenario && !incompatible_scenario && !presenter_scenario {
             for &window in &windows {
                 wait_for_native_window(window);
             }
@@ -1600,10 +1684,11 @@ unsafe fn run() -> WsiOutcome {
             let display = tuxscaling_display::X11Display::connect().unwrap();
             for &window in &windows {
                 let rect = display.window_rect(window).unwrap();
-                let expected = if matches!(
-                    std::env::var("TUXSCALING_TEST_SCENARIO").ok().as_deref(),
-                    Some("native_aa" | "incompatible_direct")
-                ) {
+                let expected = if presenter_scenario
+                    || matches!(
+                        std::env::var("TUXSCALING_TEST_SCENARIO").ok().as_deref(),
+                        Some("native_aa" | "incompatible_direct")
+                    ) {
                     game_extent()
                 } else {
                     let monitor = display_probe.monitor_for_window(window).unwrap();
@@ -1619,6 +1704,30 @@ unsafe fn run() -> WsiOutcome {
                 );
             }
         }
+        let presenter_native = if presenter_scenario {
+            let native = native_monitor_rect().expect("presenter scenario needs a RandR monitor");
+            assert_eq!(
+                [native.2, native.3],
+                [2160, 1440],
+                "presenter scenario requires the 2160x1440 nested Mutter monitor"
+            );
+            let presenter_windows = presenter_window_rects();
+            assert_eq!(
+                presenter_windows.len(),
+                windows.len(),
+                "each game surface must own one presenter window"
+            );
+            for (_, rect) in presenter_windows {
+                assert_eq!(
+                    (rect.x, rect.y, rect.width, rect.height),
+                    (native.0, native.1, native.2, native.3),
+                    "presenter window must cover the selected native monitor"
+                );
+            }
+            Some(native)
+        } else {
+            None
+        };
         let seconds = std::env::var("TUXSCALING_TEST_SECONDS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -2044,6 +2153,14 @@ unsafe fn run() -> WsiOutcome {
             assert_eq!(chains.len(), 1);
             eprintln!(
                 "TuxScaling evidence event=wsi_scenario scenario=incompatible_direct result=verified direct=1"
+            );
+        }
+        if let Some((_, _, width, height)) = presenter_native {
+            eprintln!(
+                "TuxScaling evidence event=wsi_scenario scenario=upscale result=verified logical=1280x720 physical={}x{} presenter_windows={} original_window=logical recreations_after_publish=0",
+                width,
+                height,
+                windows.len(),
             );
         }
         device.device_wait_idle().unwrap();

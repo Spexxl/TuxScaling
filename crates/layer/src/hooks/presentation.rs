@@ -249,7 +249,7 @@ unsafe fn observe_presented_surfaces(queue_state: QueueState, info: &vk::Present
             .filter_map(|handle| states.get(handle))
             .filter_map(|state| {
                 state.lock().ok().and_then(|state| {
-                    (!state.lifecycle.blocks_frame_operations()).then_some(state.surface)
+                    (!state.lifecycle.blocks_frame_operations()).then_some(state.game_surface)
                 })
             })
             .collect::<Vec<_>>()

@@ -6,6 +6,7 @@ use tuxscaling_display::PresentationState;
 pub(crate) struct PhysicalGeneration {
     id: u64,
     handle: vk::SwapchainKHR,
+    present_surface: Option<vk::SurfaceKHR>,
     extent: vk::Extent2D,
     image_count: usize,
 }
@@ -20,9 +21,15 @@ impl PhysicalGeneration {
         Self {
             id,
             handle,
+            present_surface: None,
             extent,
             image_count,
         }
+    }
+
+    pub(crate) const fn with_present_surface(mut self, surface: vk::SurfaceKHR) -> Self {
+        self.present_surface = Some(surface);
+        self
     }
 
     pub(crate) const fn id(self) -> u64 {
@@ -31,6 +38,10 @@ impl PhysicalGeneration {
 
     pub(crate) const fn handle(self) -> vk::SwapchainKHR {
         self.handle
+    }
+
+    pub(crate) const fn present_surface(self) -> Option<vk::SurfaceKHR> {
+        self.present_surface
     }
 
     pub(crate) const fn extent(self) -> vk::Extent2D {
@@ -221,19 +232,19 @@ impl LeaseCleanup {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReconfigurationTicket {
     logical_handle: vk::SwapchainKHR,
-    surface: vk::SurfaceKHR,
+    game_surface: vk::SurfaceKHR,
     generation: u64,
 }
 
 impl ReconfigurationTicket {
     pub(crate) const fn new(
         logical_handle: vk::SwapchainKHR,
-        surface: vk::SurfaceKHR,
+        game_surface: vk::SurfaceKHR,
         generation: u64,
     ) -> Self {
         Self {
             logical_handle,
-            surface,
+            game_surface,
             generation,
         }
     }
@@ -242,8 +253,8 @@ impl ReconfigurationTicket {
         self.logical_handle
     }
 
-    pub(crate) const fn surface(self) -> vk::SurfaceKHR {
-        self.surface
+    pub(crate) const fn game_surface(self) -> vk::SurfaceKHR {
+        self.game_surface
     }
 
     pub(crate) const fn generation(self) -> u64 {
@@ -285,7 +296,7 @@ impl ReconfigurationLifecycle {
         &self,
         ticket: ReconfigurationTicket,
         logical_handle: vk::SwapchainKHR,
-        surface: vk::SurfaceKHR,
+        game_surface: vk::SurfaceKHR,
         generation: u64,
         retired: bool,
     ) -> bool {
@@ -293,7 +304,7 @@ impl ReconfigurationLifecycle {
             && !self.destroy_requested
             && !retired
             && ticket.logical_handle() == logical_handle
-            && ticket.surface() == surface
+            && ticket.game_surface() == game_surface
             && ticket.generation() == generation
     }
 
@@ -301,11 +312,11 @@ impl ReconfigurationLifecycle {
         &mut self,
         ticket: ReconfigurationTicket,
         logical_handle: vk::SwapchainKHR,
-        surface: vk::SurfaceKHR,
+        game_surface: vk::SurfaceKHR,
         generation: u64,
         retired: bool,
     ) -> bool {
-        if !self.can_publish(ticket, logical_handle, surface, generation, retired) {
+        if !self.can_publish(ticket, logical_handle, game_surface, generation, retired) {
             return false;
         }
         self.active = None;
@@ -431,19 +442,20 @@ mod tests {
     fn physical_replacement_preserves_logical_handle_images_extent_and_indices() {
         let logical_handle = vk::SwapchainKHR::from_raw(0x8000_0000_0000_0003);
         let logical_images = vec![vk::Image::from_raw(51), vk::Image::from_raw(52)];
+        let presenter_surface = vk::SurfaceKHR::from_raw(0x6201);
         let mut contract = LogicalSwapchainContract::new(
             logical_handle,
             logical_images.clone(),
             extent(1280, 720),
-            generation(0, 61, 1280, 720, 3),
-            PresentationState::Negotiating,
+            generation(0, 61, 2160, 1440, 3).with_present_surface(presenter_surface),
+            PresentationState::Virtualized,
         )
         .unwrap();
         let before = contract.logical_snapshot();
 
         contract
             .replace_generation(
-                generation(1, 62, 3440, 1440, 3),
+                generation(1, 62, 2160, 1440, 3).with_present_surface(presenter_surface),
                 PresentationState::Virtualized,
             )
             .unwrap();
@@ -452,9 +464,35 @@ mod tests {
         assert_eq!(contract.handle(), logical_handle);
         assert_eq!(contract.logical_images(), logical_images.as_slice());
         assert_eq!(
+            contract.generation().present_surface(),
+            Some(presenter_surface)
+        );
+        assert_eq!(
             contract.bind(FrameBinding::new(1, 2)),
             Ok(FrameBinding::new(1, 2))
         );
+    }
+
+    #[test]
+    fn physical_generation_records_presenter_surface_without_changing_logical_contract() {
+        let game_surface = vk::SurfaceKHR::from_raw(0x3101);
+        let presenter_surface = vk::SurfaceKHR::from_raw(0x3102);
+        let generation = generation(0, 61, 2160, 1440, 3).with_present_surface(presenter_surface);
+        let contract = LogicalSwapchainContract::new(
+            vk::SwapchainKHR::from_raw(0x8000_0000_0000_0007),
+            vec![vk::Image::from_raw(91), vk::Image::from_raw(92)],
+            extent(1280, 720),
+            generation,
+            PresentationState::Virtualized,
+        )
+        .unwrap();
+
+        assert_eq!(contract.game_extent(), extent(1280, 720));
+        assert_eq!(
+            contract.generation().present_surface(),
+            Some(presenter_surface)
+        );
+        assert_ne!(game_surface, presenter_surface);
     }
 
     #[test]
@@ -588,6 +626,6 @@ mod tests {
         assert!(lifecycle.publish(ticket, logical, surface, 21, false));
         assert_eq!(lifecycle.generation(), Some(21));
         assert_eq!(ticket.logical_handle(), logical);
-        assert_eq!(ticket.surface(), surface);
+        assert_eq!(ticket.game_surface(), surface);
     }
 }

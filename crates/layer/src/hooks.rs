@@ -464,7 +464,18 @@ unsafe fn downstream_result(
 fn current_physical_swapchain(swapchain: vk::SwapchainKHR) -> Result<vk::SwapchainKHR, vk::Result> {
     match resolve_swapchain_route(swapchain)? {
         SwapchainRoute::Direct(physical) => Ok(physical),
-        SwapchainRoute::CurrentVirtual { physical, .. } => Ok(physical),
+        SwapchainRoute::CurrentVirtual {
+            physical,
+            game_surface,
+            present_surface,
+            ..
+        } => {
+            if present_surface.is_some_and(|surface| surface == game_surface) {
+                Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+            } else {
+                Ok(physical)
+            }
+        }
     }
 }
 

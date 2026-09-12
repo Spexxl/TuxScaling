@@ -225,8 +225,8 @@ pub(crate) struct X11Surface {
 
 pub(crate) struct SwapchainState {
     pub(crate) device: vk::Device,
-    pub(crate) surface: vk::SurfaceKHR,
-    pub(crate) presenter_surface: Option<vk::SurfaceKHR>,
+    pub(crate) game_surface: vk::SurfaceKHR,
+    pub(crate) present_surface: Option<vk::SurfaceKHR>,
     /// The application-visible key remains stable even if a later task
     /// replaces the downstream WSI generation.
     pub(crate) logical_handle: vk::SwapchainKHR,
