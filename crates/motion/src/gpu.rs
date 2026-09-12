@@ -23,7 +23,54 @@ pub struct MotionProfile {
     pub subpixel_refinement: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MotionDispatchPlan {
+    pub pyramid_levels: usize,
+    pub candidate_evaluations: u64,
+    pub sample_step: u32,
+    pub subpixel_work: bool,
+    pub subpixel_evaluations: u64,
+}
+
 impl MotionQuality {
+    pub fn dispatch_plan(self, width: u32, height: u32) -> MotionDispatchPlan {
+        let levels = pyramid(width, height);
+        let profile = self.profile(levels.len());
+        let active_levels = profile.levels.min(levels.len());
+        let mut candidate_evaluations = 0_u64;
+        let mut subpixel_evaluations = 0_u64;
+
+        for (index, level) in levels.iter().take(active_levels).enumerate() {
+            let invocations =
+                u64::from(level.width.div_ceil(2)) * u64::from(level.height.div_ceil(2));
+            let is_coarsest = index + 1 == active_levels;
+            let radius = if is_coarsest {
+                profile.coarse_radius
+            } else {
+                profile.fine_radius
+            };
+            let side = u64::from((radius * 2 + 1).max(0) as u32);
+            let patch_candidates = side.saturating_mul(side).saturating_sub(1);
+            let parent_seed_candidates = if is_coarsest { 0 } else { 9 };
+            let base_candidates = 1 + parent_seed_candidates + patch_candidates;
+            let subpixel = if index == 0 && profile.subpixel_refinement {
+                9
+            } else {
+                0
+            };
+            subpixel_evaluations += 2 * invocations * subpixel;
+            candidate_evaluations += 2 * invocations * (base_candidates + subpixel);
+        }
+
+        MotionDispatchPlan {
+            pyramid_levels: active_levels,
+            candidate_evaluations,
+            sample_step: profile.sample_step,
+            subpixel_work: profile.subpixel_refinement,
+            subpixel_evaluations,
+        }
+    }
+
     pub const fn mean_epe_limit(self) -> f32 {
         match self {
             Self::Ultra => 1.0,
@@ -567,6 +614,7 @@ impl MotionEstimator {
                         profile.levels,
                     );
                     p[15] = direction
+                        | (u32::from(profile.subpixel_refinement) << 2)
                         | ((self.quality as u32) << 8)
                         | ((profile.patch_radius as u32) << 16)
                         | ((profile.coarse_radius as u32) << 20)

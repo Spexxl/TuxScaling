@@ -77,7 +77,7 @@ void main() {
         if(c<best_cost-1e-7) { second=best_cost;best_cost=c;best=candidate; }
         else second=min(second,c);
     }
-    if(p.level==0) {
+    if(p.level==0 && ((p.direction>>2)&1u)!=0u) {
         vec2 base=best;
         for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++) {
             vec2 candidate=base+vec2(x,y)*0.5;

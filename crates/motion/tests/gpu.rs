@@ -1,6 +1,6 @@
 #![allow(clippy::missing_safety_doc)]
 use ash::vk;
-use tuxscaling_motion::{MotionEstimator, MotionQuality};
+use tuxscaling_motion::{MotionDispatchPlan, MotionEstimator, MotionQuality};
 use tuxscaling_vulkan::{Buffer, Image, image_barrier, memory_barrier};
 #[path = "../../../tests/support/gpu.rs"]
 mod support;
@@ -22,6 +22,183 @@ fn flow_cost_uses_two_axis_luminance_gradients() {
     assert!(shader.contains("vec2 source_gradient"));
     assert!(shader.contains("vec2 target_gradient"));
     assert!(shader.contains("length(source_gradient"));
+}
+
+#[test]
+fn dispatch_plan_records_quality_work_and_keeps_balanced_distinct() {
+    let extent = vk::Extent2D {
+        width: 128,
+        height: 96,
+    };
+    let plans: [(MotionQuality, MotionDispatchPlan); 4] = [
+        (
+            MotionQuality::Ultra,
+            MotionQuality::Ultra.dispatch_plan(extent.width, extent.height),
+        ),
+        (
+            MotionQuality::High,
+            MotionQuality::High.dispatch_plan(extent.width, extent.height),
+        ),
+        (
+            MotionQuality::Balanced,
+            MotionQuality::Balanced.dispatch_plan(extent.width, extent.height),
+        ),
+        (
+            MotionQuality::Performance,
+            MotionQuality::Performance.dispatch_plan(extent.width, extent.height),
+        ),
+    ];
+
+    for (quality, plan) in plans {
+        eprintln!(
+            "quality={quality:?} levels={} candidates={} sample_step={} subpixel_work={}",
+            plan.pyramid_levels, plan.candidate_evaluations, plan.sample_step, plan.subpixel_work,
+        );
+    }
+
+    let balanced = MotionQuality::Balanced.dispatch_plan(extent.width, extent.height);
+    let performance = MotionQuality::Performance.dispatch_plan(extent.width, extent.height);
+    assert_eq!(balanced.pyramid_levels, 3);
+    assert_eq!(balanced.sample_step, 2);
+    assert!(balanced.subpixel_work);
+    assert_eq!(balanced.subpixel_evaluations, 13_824);
+    assert_eq!(performance.pyramid_levels, 2);
+    assert_eq!(performance.sample_step, 2);
+    assert!(!performance.subpixel_work);
+    assert_eq!(performance.subpixel_evaluations, 0);
+    assert!(performance.candidate_evaluations < balanced.candidate_evaluations);
+}
+
+#[test]
+fn performance_flow_omits_only_the_optional_subpixel_refinement() {
+    let shader = include_str!("../../../shaders/motion/flow.comp");
+    assert!(shader.contains("p.direction>>2"));
+    assert!(shader.contains("p.level==0"));
+}
+
+#[test]
+#[ignore = "requires a RADV Vulkan GPU"]
+fn performance_flow_is_faster_than_balanced_after_warmup() {
+    let extent = vk::Extent2D {
+        width: 128,
+        height: 96,
+    };
+    let balanced = unsafe { timed_flow_median(extent, MotionQuality::Balanced) };
+    let performance = unsafe { timed_flow_median(extent, MotionQuality::Performance) };
+
+    eprintln!(
+        "guidance_scale=1.0 balanced_forward_backward_ms={balanced:.4} performance_forward_backward_ms={performance:.4}"
+    );
+    assert!(balanced.is_finite() && performance.is_finite());
+    assert!(performance < balanced);
+}
+
+unsafe fn timed_flow_median(extent: vk::Extent2D, quality: MotionQuality) -> f32 {
+    const WARMUP: usize = 180;
+    const SAMPLES: usize = 30;
+    const QUERY_COUNT: u32 = 9;
+
+    let gpu = unsafe { Gpu::new() };
+    let physical = unsafe { gpu.instance.enumerate_physical_devices() }.unwrap()[0];
+    let properties = unsafe { gpu.instance.get_physical_device_properties(physical) };
+    assert_ne!(properties.limits.timestamp_compute_and_graphics, 0);
+    let color = unsafe {
+        Image::new(
+            &gpu.device,
+            &gpu.memory,
+            extent,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::SAMPLED,
+        )
+    }
+    .unwrap();
+    let mut estimator =
+        unsafe { MotionEstimator::new(&gpu.device, &gpu.memory, extent, color.view, false) }
+            .unwrap();
+    estimator.set_quality(quality);
+    let query_pool = unsafe {
+        gpu.device.create_query_pool(
+            &vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(QUERY_COUNT),
+            None,
+        )
+    }
+    .unwrap();
+    let command = unsafe {
+        gpu.device.allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default()
+                .command_pool(gpu.pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1),
+        )
+    }
+    .unwrap()[0];
+    let fence = unsafe {
+        gpu.device
+            .create_fence(&vk::FenceCreateInfo::default(), None)
+    }
+    .unwrap();
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for frame in 0..(WARMUP + SAMPLES) {
+        unsafe {
+            gpu.device
+                .reset_command_buffer(command, vk::CommandBufferResetFlags::empty())
+                .unwrap();
+            gpu.device
+                .begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())
+                .unwrap();
+            gpu.device
+                .cmd_reset_query_pool(command, query_pool, 0, QUERY_COUNT);
+            if frame == 0 {
+                image_barrier(
+                    &gpu.device,
+                    command,
+                    color.handle,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                );
+            }
+            estimator.record_timed(command, frame & 1, frame != 0, 0, query_pool, 0);
+            gpu.device.end_command_buffer(command).unwrap();
+            gpu.device.reset_fences(&[fence]).unwrap();
+            gpu.device
+                .queue_submit(
+                    gpu.queue,
+                    &[vk::SubmitInfo::default().command_buffers(&[command])],
+                    fence,
+                )
+                .unwrap();
+            gpu.device
+                .wait_for_fences(&[fence], true, 30_000_000_000)
+                .unwrap();
+        }
+        if frame >= WARMUP {
+            let mut timestamps = [0_u64; QUERY_COUNT as usize];
+            unsafe {
+                gpu.device
+                    .get_query_pool_results(
+                        query_pool,
+                        0,
+                        &mut timestamps,
+                        vk::QueryResultFlags::TYPE_64,
+                    )
+                    .unwrap();
+            }
+            let elapsed = timestamps[4].wrapping_sub(timestamps[2]) as f32
+                * properties.limits.timestamp_period
+                / 1_000_000.0;
+            samples.push(elapsed);
+        }
+    }
+    samples.sort_by(f32::total_cmp);
+    let median = samples[samples.len() / 2];
+    unsafe {
+        gpu.device.destroy_fence(fence, None);
+        gpu.device.free_command_buffers(gpu.pool, &[command]);
+        gpu.device.destroy_query_pool(query_pool, None);
+    }
+    median
 }
 
 fn noise(a: i32, b: i32) -> f32 {
