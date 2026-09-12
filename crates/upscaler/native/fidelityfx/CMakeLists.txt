@@ -36,6 +36,7 @@ add_library(tuxscaling_fidelityfx_vk SHARED
 )
 
 target_compile_features(tuxscaling_fidelityfx_vk PRIVATE cxx_std_17)
+target_compile_definitions(tuxscaling_fidelityfx_vk PRIVATE TUX_FFX_ABI_VERSION=2)
 target_include_directories(tuxscaling_fidelityfx_vk PRIVATE
     include
     "${FFX_SDK_ROOT}/ffx-api/src"

@@ -161,6 +161,12 @@ fn image_mse(actual: &[[f32; 4]], expected: &[[f32; 4]]) -> f32 {
         / (actual.len() * 4) as f32
 }
 
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
 fn psnr(actual: &[[f32; 4]], expected: &[[f32; 4]]) -> f32 {
     let mse = image_mse(actual, expected).max(f32::MIN_POSITIVE);
     10.0 * (1.0 / mse).log10()
@@ -514,6 +520,7 @@ fn fsr314_upscale_beats_bilinear_on_deterministic_static_fixture() {
         },
         guidance,
         viewport: config.viewport,
+        output_sharpening: tuxscaling_upscaler::OutputSharpening::default(),
         frame_id: 1,
         reset_history: true,
         debug_view: 0,
@@ -567,4 +574,64 @@ fn fsr314_upscale_beats_bilinear_on_deterministic_static_fixture() {
     assert!(fsr_psnr > bilinear_psnr);
     assert!(fsr_ssim > bilinear_ssim);
     assert!(flicker <= 0.002);
+
+    let mut sharpening_hashes = Vec::new();
+    for sharpening in [
+        tuxscaling_upscaler::OutputSharpening::disabled(),
+        tuxscaling_upscaler::OutputSharpening::new(true, 0.2),
+        tuxscaling_upscaler::OutputSharpening::new(true, 1.0),
+    ] {
+        backend.reset().unwrap();
+        let mut warmup_frame = frame;
+        warmup_frame.output_sharpening = sharpening;
+        warmup_frame.reset_history = true;
+        let mut warmup_bytes = vec![0_u8; first_bytes.len()];
+        run_frame(
+            &gpu,
+            &output,
+            &readback_buffer,
+            &mut warmup_bytes,
+            &mut backend,
+            warmup_frame,
+            &guidance_images,
+            &exposure,
+            &source,
+            &staging,
+            &source_bytes,
+            false,
+        );
+
+        let mut steady_frame = warmup_frame;
+        steady_frame.reset_history = false;
+        assert!(!steady_frame.reset_history);
+        let mut steady_bytes = vec![0_u8; first_bytes.len()];
+        run_frame(
+            &gpu,
+            &output,
+            &readback_buffer,
+            &mut steady_bytes,
+            &mut backend,
+            steady_frame,
+            &guidance_images,
+            &exposure,
+            &source,
+            &staging,
+            &source_bytes,
+            false,
+        );
+        assert!(
+            rgba8_pixels(&steady_bytes)
+                .iter()
+                .flat_map(|pixel| pixel.iter())
+                .all(|value| value.is_finite())
+        );
+        sharpening_hashes.push(hash_bytes(&steady_bytes));
+    }
+    sharpening_hashes.sort_unstable();
+    sharpening_hashes.dedup();
+    assert_eq!(
+        sharpening_hashes.len(),
+        3,
+        "output sharpening variants must produce distinct hashes"
+    );
 }

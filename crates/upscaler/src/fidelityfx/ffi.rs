@@ -71,8 +71,11 @@ pub struct TuxFfxDispatchInfo {
     pub output_width: u32,
     pub output_height: u32,
     pub reset: u32,
+    pub enable_sharpening: u32,
+    pub sharpness: f32,
 }
 
+pub type TuxFfxAbiVersionFn = unsafe extern "C" fn() -> u32;
 pub type TuxFfxVersionFn = unsafe extern "C" fn() -> TuxFfxVersion;
 pub type TuxFfxCreateFn =
     unsafe extern "C" fn(info: *const TuxFfxCreateInfo, context: *mut *mut TuxFfxContext) -> i32;
@@ -86,6 +89,7 @@ pub const TUX_FFX_INVALID_ARGUMENT: i32 = 1;
 pub const TUX_FFX_UNSUPPORTED_VERSION: i32 = 2;
 pub const TUX_FFX_CREATE_FAILED: i32 = 3;
 pub const TUX_FFX_DISPATCH_FAILED: i32 = 4;
+pub const TUX_FFX_ABI_VERSION: u32 = 2;
 
 pub const TUX_FFX_CREATE_HIGH_DYNAMIC_RANGE: u32 = 1 << 0;
 pub const TUX_FFX_CREATE_DISPLAY_RESOLUTION_MOTION: u32 = 1 << 1;
@@ -110,6 +114,23 @@ const _: () = {
     assert!(std::mem::align_of::<TuxFfxImage>() == 8);
     assert!(std::mem::size_of::<TuxFfxCreateInfo>() == 96);
     assert!(std::mem::align_of::<TuxFfxCreateInfo>() == 8);
-    assert!(std::mem::size_of::<TuxFfxDispatchInfo>() == 296);
+    assert!(std::mem::size_of::<TuxFfxDispatchInfo>() == 304);
     assert!(std::mem::align_of::<TuxFfxDispatchInfo>() == 8);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::{TUX_FFX_ABI_VERSION, TuxFfxDispatchInfo};
+
+    #[test]
+    fn dispatch_abi_v2_has_the_expected_layout() {
+        assert_eq!(TUX_FFX_ABI_VERSION, 2);
+        assert_eq!(std::mem::size_of::<TuxFfxDispatchInfo>(), 304);
+        assert_eq!(std::mem::align_of::<TuxFfxDispatchInfo>(), 8);
+        assert_eq!(
+            std::mem::offset_of!(TuxFfxDispatchInfo, enable_sharpening),
+            292
+        );
+        assert_eq!(std::mem::offset_of!(TuxFfxDispatchInfo, sharpness), 296);
+    }
+}

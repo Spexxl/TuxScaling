@@ -7,11 +7,20 @@
 
 #include <FidelityFX/host/ffx_fsr3upscaler.h>
 
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <new>
 #include <unordered_map>
+
+static_assert(sizeof(TuxFfxDispatchInfo) == 304, "TuxFfxDispatchInfo ABI size changed");
+static_assert(alignof(TuxFfxDispatchInfo) == 8, "TuxFfxDispatchInfo ABI alignment changed");
+static_assert(offsetof(TuxFfxDispatchInfo, enable_sharpening) == 292,
+              "TuxFfxDispatchInfo sharpening flag offset changed");
+static_assert(offsetof(TuxFfxDispatchInfo, sharpness) == 296,
+              "TuxFfxDispatchInfo sharpness offset changed");
 
 struct TuxFfxContext {
     ffxContext sdk_context = nullptr;
@@ -324,6 +333,11 @@ extern "C" TUX_FFX_API TuxFfxVersion tux_ffx_version(void)
     };
 }
 
+extern "C" TUX_FFX_API uint32_t tux_ffx_abi_version(void)
+{
+    return TUX_FFX_ABI_VERSION;
+}
+
 extern "C" TUX_FFX_API int32_t tux_ffx_create(
     const TuxFfxCreateInfo* info,
     TuxFfxContext** context)
@@ -400,7 +414,8 @@ extern "C" TUX_FFX_API int32_t tux_ffx_dispatch(
 {
     if (!context || !info || !context->sdk_context || info->command_buffer == 0 ||
         info->render_width == 0 || info->render_height == 0 || info->output_width == 0 ||
-        info->output_height == 0 || info->pre_exposure <= 0.0f) {
+        info->output_height == 0 || info->pre_exposure <= 0.0f ||
+        !std::isfinite(info->sharpness) || info->sharpness < 0.0f || info->sharpness > 1.0f) {
         return TUX_FFX_INVALID_ARGUMENT;
     }
 
@@ -419,8 +434,8 @@ extern "C" TUX_FFX_API int32_t tux_ffx_dispatch(
     dispatch.motionVectorScale = {info->motion_scale_x, info->motion_scale_y};
     dispatch.renderSize = {info->render_width, info->render_height};
     dispatch.upscaleSize = {info->output_width, info->output_height};
-    dispatch.enableSharpening = false;
-    dispatch.sharpness = 0.0f;
+    dispatch.enableSharpening = info->enable_sharpening != 0;
+    dispatch.sharpness = info->sharpness;
     dispatch.frameTimeDelta = info->frame_time_ms;
     dispatch.preExposure = info->pre_exposure;
     dispatch.reset = info->reset != 0 || context->pending_reset;

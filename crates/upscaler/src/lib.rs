@@ -149,6 +149,39 @@ pub struct BackendImage {
     pub layout: vk::ImageLayout,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OutputSharpening {
+    pub enabled: bool,
+    pub sharpness: f32,
+}
+
+impl OutputSharpening {
+    pub const RECOMMENDED_SHARPNESS: f32 = 0.2;
+
+    pub const fn new(enabled: bool, sharpness: f32) -> Self {
+        Self { enabled, sharpness }
+    }
+
+    pub const fn disabled() -> Self {
+        Self::new(false, 0.0)
+    }
+
+    pub fn validate(self) -> Result<(), BackendError> {
+        if !self.sharpness.is_finite() || !(0.0..=1.0).contains(&self.sharpness) {
+            return Err(BackendError::InvalidConfiguration(
+                "output sharpening must be finite in [0.0, 1.0]".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for OutputSharpening {
+    fn default() -> Self {
+        Self::new(true, Self::RECOMMENDED_SHARPNESS)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct BackendConfig {
     pub game_extent: vk::Extent2D,
@@ -212,6 +245,7 @@ pub struct BackendFrame {
     pub output: BackendImage,
     pub guidance: GuidanceView,
     pub viewport: ContentViewport,
+    pub output_sharpening: OutputSharpening,
     pub frame_id: u64,
     pub reset_history: bool,
     pub debug_view: u32,
@@ -224,6 +258,7 @@ impl BackendFrame {
         capabilities: BackendCapabilities,
     ) -> Result<(), BackendError> {
         config.validate(capabilities)?;
+        self.output_sharpening.validate()?;
         if self.command_buffer == vk::CommandBuffer::null()
             || self.source.image == vk::Image::null()
             || self.source.view == vk::ImageView::null()
@@ -743,8 +778,8 @@ mod tests {
     use super::content_viewport;
     use super::{
         BackendCapabilities, BackendColorEncoding, BackendConfig, BackendError, BackendFrame,
-        BackendId, BackendImage, ContentViewport, PresentationMode, ResolutionPlan,
-        UpscalerBackend,
+        BackendId, BackendImage, ContentViewport, OutputSharpening, PresentationMode,
+        ResolutionPlan, UpscalerBackend,
     };
     use ash::vk;
     use ash::vk::Handle;
@@ -886,6 +921,7 @@ mod tests {
             },
             guidance: guidance(),
             viewport: content_viewport(GAME, OUTPUT),
+            output_sharpening: OutputSharpening::default(),
             frame_id: 7,
             reset_history: false,
             debug_view: 0,
@@ -1117,5 +1153,27 @@ mod tests {
         ] {
             assert!(shader.contains(token), "comparison shader lacks {token}");
         }
+    }
+
+    #[test]
+    fn output_sharpening_defaults_to_recommended_enabled_value() {
+        assert_eq!(
+            OutputSharpening::default(),
+            OutputSharpening {
+                enabled: true,
+                sharpness: 0.2,
+            }
+        );
+        assert!(OutputSharpening::default().validate().is_ok());
+    }
+
+    #[test]
+    fn output_sharpening_accepts_disabled_and_normalized_values_only() {
+        assert!(OutputSharpening::disabled().validate().is_ok());
+        assert!(OutputSharpening::new(true, 0.0).validate().is_ok());
+        assert!(OutputSharpening::new(true, 1.0).validate().is_ok());
+        assert!(OutputSharpening::new(true, -0.01).validate().is_err());
+        assert!(OutputSharpening::new(true, 1.01).validate().is_err());
+        assert!(OutputSharpening::new(true, f32::NAN).validate().is_err());
     }
 }

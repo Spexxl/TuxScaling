@@ -8,7 +8,7 @@ use tuxscaling_overlay::{FrameDiagnostics, OverlayFrame};
 use tuxscaling_overlay_vulkan::{InputRouteConfig, OverlayRenderer, SwapchainInfo};
 use tuxscaling_temporal::{DepthSemantics, FrameExtent, GuidanceReset, SignalState};
 use tuxscaling_upscaler::{
-    BackendError, BackendFrame, BackendImage, ResolutionPlan, content_viewport,
+    BackendError, BackendFrame, BackendImage, OutputSharpening, ResolutionPlan, content_viewport,
 };
 use tuxscaling_vulkan::{compute_memory_barrier, image_barrier, transfer_memory_barrier};
 
@@ -1551,6 +1551,10 @@ impl SwapchainRuntime {
                     viewport: content_viewport(
                         self.temporal.resolution.game_extent,
                         self.temporal.resolution.output_extent,
+                    ),
+                    output_sharpening: OutputSharpening::new(
+                        self.temporal.config.sharpening_enabled,
+                        self.temporal.config.sharpness,
                     ),
                     frame_id: guidance.motion.metadata.frame_id,
                     reset_history: !valid,

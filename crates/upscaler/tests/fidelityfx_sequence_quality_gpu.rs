@@ -489,6 +489,7 @@ unsafe fn run_backend_frame<B: UpscalerBackend>(
                 },
                 guidance,
                 viewport: content_viewport(INPUT, OUTPUT),
+                output_sharpening: tuxscaling_upscaler::OutputSharpening::default(),
                 frame_id,
                 reset_history,
                 debug_view: 0,

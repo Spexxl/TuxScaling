@@ -10,7 +10,7 @@ use tuxscaling_temporal::{
 use tuxscaling_upscaler::fidelityfx::Fsr314Upscaler;
 use tuxscaling_upscaler::{
     BackendColorEncoding, BackendConfig, BackendEnvironment, BackendFrame, BackendImage,
-    UpscalerBackend, content_viewport,
+    OutputSharpening, UpscalerBackend, content_viewport,
 };
 use tuxscaling_vulkan::{Image, image_barrier};
 
@@ -38,6 +38,17 @@ fn fsr314_shader_contract_uses_zero_jitter_and_fixed_camera_domain() {
     let shader = include_str!("../../../shaders/upscaler/fidelityfx_output.comp");
     assert!(shader.contains("viewport_offset"));
     assert!(shader.contains("imageStore(output_image"));
+}
+
+#[test]
+fn output_sharpening_configuration_has_distinct_disabled_and_enabled_states() {
+    assert!(OutputSharpening::disabled().validate().is_ok());
+    assert!(OutputSharpening::new(true, 0.2).validate().is_ok());
+    assert!(OutputSharpening::new(true, 1.0).validate().is_ok());
+    assert_ne!(
+        OutputSharpening::disabled(),
+        OutputSharpening::new(true, 0.2)
+    );
 }
 
 #[test]
@@ -198,6 +209,7 @@ fn fsr314_lifecycle_dispatches_reset_and_native_aa() {
         },
         guidance,
         viewport: content_viewport(GAME, GAME),
+        output_sharpening: OutputSharpening::default(),
         frame_id: 1,
         reset_history: true,
         debug_view: 0,

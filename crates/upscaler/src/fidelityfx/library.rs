@@ -11,12 +11,15 @@ const EXPECTED_VERSION: ffi::TuxFfxVersion = ffi::TuxFfxVersion {
     minor: 1,
     patch: 4,
 };
+const EXPECTED_ABI_VERSION: u32 = ffi::TUX_FFX_ABI_VERSION;
 const LIBRARY_NAME: &str = "libtuxscaling_fidelityfx_vk.so";
 
+pub type FfxAbiVersion = u32;
 pub type FfxVersion = ffi::TuxFfxVersion;
 
 pub struct FidelityFxLibrary {
     _library: Library,
+    abi_version: FfxAbiVersion,
     version: FfxVersion,
     create_fn: ffi::TuxFfxCreateFn,
     dispatch_fn: ffi::TuxFfxDispatchFn,
@@ -56,8 +59,22 @@ impl FidelityFxLibrary {
         self.version
     }
 
+    pub fn abi_version(&self) -> FfxAbiVersion {
+        self.abi_version
+    }
+
+    pub const fn is_abi_compatible(version: FfxAbiVersion) -> bool {
+        version == EXPECTED_ABI_VERSION
+    }
+
     fn load_path(path: &Path) -> Result<Arc<Self>, BackendError> {
         let library = unsafe { Library::new(path) }.map_err(|_| BackendError::Unavailable)?;
+        let abi_version_fn =
+            load_symbol::<ffi::TuxFfxAbiVersionFn>(&library, b"tux_ffx_abi_version\0")?;
+        let abi_version = unsafe { abi_version_fn() };
+        if !Self::is_abi_compatible(abi_version) {
+            return Err(BackendError::Unavailable);
+        }
         let version_fn = load_symbol::<ffi::TuxFfxVersionFn>(&library, b"tux_ffx_version\0")?;
         let create_fn = load_symbol::<ffi::TuxFfxCreateFn>(&library, b"tux_ffx_create\0")?;
         let dispatch_fn = load_symbol::<ffi::TuxFfxDispatchFn>(&library, b"tux_ffx_dispatch\0")?;
@@ -70,6 +87,7 @@ impl FidelityFxLibrary {
 
         Ok(Arc::new(Self {
             _library: library,
+            abi_version,
             version,
             create_fn,
             dispatch_fn,
@@ -183,5 +201,16 @@ fn mapped_library_path(line: &str) -> Option<PathBuf> {
         Some(PathBuf::from(path))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FidelityFxLibrary;
+
+    #[test]
+    fn stale_abi_is_rejected_before_any_dispatch_symbol_can_be_used() {
+        assert!(!FidelityFxLibrary::is_abi_compatible(1));
+        assert!(FidelityFxLibrary::is_abi_compatible(2));
     }
 }

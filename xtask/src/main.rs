@@ -375,11 +375,13 @@ fn parse_backend_args(args: &[&str]) -> Result<BackendSelection, String> {
     Ok(backend)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct VkcubeOptions {
     seconds: u64,
     release: bool,
     backend: BackendSelection,
+    sharpening_enabled: bool,
+    sharpness: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -410,8 +412,11 @@ fn parse_vkcube_args(args: &[&str]) -> Result<VkcubeOptions, String> {
         seconds: 10,
         release: false,
         backend: BackendSelection::Reference,
+        sharpening_enabled: true,
+        sharpness: 0.2,
     };
     let mut backend_seen = false;
+    let mut sharpening_seen = false;
     let mut index = 0;
     while index < args.len() {
         match args[index] {
@@ -438,6 +443,30 @@ fn parse_vkcube_args(args: &[&str]) -> Result<VkcubeOptions, String> {
                     .get(index)
                     .ok_or_else(|| "--backend requires reference or fsr_3_1_4".to_owned())?;
                 options.backend = parse_backend(value)?;
+            }
+            "--disable-sharpening" if !sharpening_seen => {
+                sharpening_seen = true;
+                options.sharpening_enabled = false;
+            }
+            "--disable-sharpening" => {
+                return Err("sharpening options may only be specified once".into());
+            }
+            "--sharpness" if !sharpening_seen => {
+                sharpening_seen = true;
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    "--sharpness requires a finite value in [0.0, 1.0]".to_owned()
+                })?;
+                options.sharpness = value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|sharpness| sharpness.is_finite() && (0.0..=1.0).contains(sharpness))
+                    .ok_or_else(|| {
+                        "--sharpness requires a finite value in [0.0, 1.0]".to_owned()
+                    })?;
+            }
+            "--sharpness" => {
+                return Err("sharpening options may only be specified once".into());
             }
             value => return Err(format!("unknown vkcube argument: {value}")),
         }
@@ -595,7 +624,14 @@ fn run_vkcube(root: &Path, options: VkcubeOptions) -> VkcubeExit {
     let launch = vkcube_launch(root, options);
     if std::fs::write(
         &launch.config_path,
-        generated_config_with_backend("swapchain", 1.0, None, options.backend),
+        generated_config_with_backend_and_sharpening(
+            "swapchain",
+            1.0,
+            None,
+            options.backend,
+            options.sharpening_enabled,
+            options.sharpness,
+        ),
     )
     .is_err()
     {
@@ -865,12 +901,30 @@ fn generated_config_with_backend(
     quality: Option<&str>,
     backend: BackendSelection,
 ) -> String {
+    generated_config_with_backend_and_sharpening(
+        output_resolution,
+        guidance_scale,
+        quality,
+        backend,
+        true,
+        0.2,
+    )
+}
+
+fn generated_config_with_backend_and_sharpening(
+    output_resolution: &str,
+    guidance_scale: f32,
+    quality: Option<&str>,
+    backend: BackendSelection,
+    sharpening_enabled: bool,
+    sharpness: f32,
+) -> String {
     let quality = quality.map_or_else(String::new, |quality| {
         format!("motion_quality = \"{quality}\"\n")
     });
     format!(
-        "output_resolution = \"{output_resolution}\"\nguidance_scale = {guidance_scale}\n{quality}upscaler = \"{}\"\n",
-        backend.config_value()
+        "output_resolution = \"{output_resolution}\"\nguidance_scale = {guidance_scale}\n{quality}sharpening_enabled = {sharpening_enabled}\nsharpness = {sharpness}\nupscaler = \"{}\"\n",
+        backend.config_value(),
     )
 }
 
@@ -1000,9 +1054,11 @@ fn fidelityfx_check(root: &Path) -> bool {
         return false;
     };
     let file_text = String::from_utf8_lossy(&file.stdout);
-    if !file.status.success() || !file_text.contains("ELF") {
+    if !file.status.success()
+        || !fidelityfx_elf_architecture_is_valid(&file_text, std::env::consts::ARCH)
+    {
         eprintln!(
-            "cargo xtask fidelityfx-check: companion is not an ELF shared library: {}",
+            "cargo xtask fidelityfx-check: companion has an unsupported ELF architecture: {}",
             library.display()
         );
         return false;
@@ -1011,18 +1067,12 @@ fn fidelityfx_check(root: &Path) -> bool {
         return false;
     };
     let symbol_text = String::from_utf8_lossy(&symbols.stdout);
-    let symbols_ok = symbols.status.success()
-        && [
-            "tux_ffx_version",
-            "tux_ffx_create",
-            "tux_ffx_dispatch",
-            "tux_ffx_reset",
-            "tux_ffx_destroy",
-        ]
-        .iter()
-        .all(|symbol| symbol_text.lines().any(|line| line.ends_with(symbol)));
-    if !symbols_ok {
+    if !symbols.status.success() || !fidelityfx_symbols_are_complete(&symbol_text) {
         eprintln!("cargo xtask fidelityfx-check: companion symbols are incomplete");
+        return false;
+    }
+    if !fidelityfx_generated_hashes_match(root) {
+        eprintln!("cargo xtask fidelityfx-check: generated FidelityFX hashes do not match");
         return false;
     }
     report(
@@ -1039,6 +1089,60 @@ fn fidelityfx_check(root: &Path) -> bool {
         ]))
         .output(),
     )
+}
+
+fn fidelityfx_elf_architecture_is_valid(file_text: &str, architecture: &str) -> bool {
+    if !file_text.contains("ELF 64-bit") {
+        return false;
+    }
+    match architecture {
+        "x86_64" => file_text.contains("x86-64"),
+        "aarch64" => file_text.contains("ARM aarch64"),
+        "riscv64" => file_text.contains("UCB RISC-V"),
+        _ => true,
+    }
+}
+
+fn fidelityfx_symbols_are_complete(symbol_text: &str) -> bool {
+    [
+        "tux_ffx_abi_version",
+        "tux_ffx_version",
+        "tux_ffx_create",
+        "tux_ffx_dispatch",
+        "tux_ffx_reset",
+        "tux_ffx_destroy",
+    ]
+    .iter()
+    .all(|symbol| {
+        symbol_text.lines().any(|line| {
+            line.split_whitespace()
+                .last()
+                .is_some_and(|last| last == *symbol)
+        })
+    })
+}
+
+fn fidelityfx_generated_hashes_match(root: &Path) -> bool {
+    let generated = root.join("crates/upscaler/native/fidelityfx/generated");
+    let manifest = generated.join("SHA256SUMS");
+    let Ok(result) = Command::new("sha256sum")
+        .args(["--check", "SHA256SUMS"])
+        .current_dir(&generated)
+        .output()
+    else {
+        return false;
+    };
+    if result.status.success() {
+        true
+    } else {
+        eprintln!(
+            "cargo xtask fidelityfx-check: unable to verify {}:\n{}{}",
+            manifest.display(),
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        false
+    }
 }
 
 fn main() -> ExitCode {
@@ -1302,7 +1406,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "Usage: cargo xtask <benchmark|check|fidelityfx-check|gpu-check|smoke|vkcube|wsi-compatibility>"
+                "Usage: cargo xtask <benchmark|check|fidelityfx-check|gpu-check|smoke|vkcube|wsi-compatibility> [--sharpness 0.0..=1.0|--disable-sharpening]"
             );
             return ExitCode::from(2);
         }
@@ -1319,9 +1423,10 @@ mod tests {
     use super::{
         BENCHMARK_SAMPLE_COUNT, BackendSelection, VkcubeExit, benchmark_cases,
         benchmark_output_is_operationally_valid, classify_vkcube_exit, classify_vkcube_output,
-        generated_config, maintenance_evidence_complete, maintenance_output_is_valid,
-        parse_backend_args, parse_maintenance_evidence, parse_vkcube_args, quality_fixture_passes,
-        vkcube_launch, wsi_compatibility_output_is_valid,
+        fidelityfx_elf_architecture_is_valid, fidelityfx_symbols_are_complete, generated_config,
+        maintenance_evidence_complete, maintenance_output_is_valid, parse_backend_args,
+        parse_maintenance_evidence, parse_vkcube_args, quality_fixture_passes, vkcube_launch,
+        wsi_compatibility_output_is_valid,
     };
     use std::path::Path;
 
@@ -1426,10 +1531,68 @@ mod tests {
     }
 
     #[test]
+    fn vkcube_accepts_output_sharpening_ablation_values() {
+        let disabled = parse_vkcube_args(&["--disable-sharpening"]).unwrap();
+        assert!(!disabled.sharpening_enabled);
+
+        let maximum = parse_vkcube_args(&["--sharpness", "1.0"]).unwrap();
+        assert!(maximum.sharpening_enabled);
+        assert_eq!(maximum.sharpness, 1.0);
+    }
+
+    #[test]
+    fn vkcube_rejects_invalid_or_conflicting_sharpening_options() {
+        for args in [
+            vec!["--sharpness"],
+            vec!["--sharpness", "-0.1"],
+            vec!["--sharpness", "1.1"],
+            vec!["--sharpness", "NaN"],
+            vec!["--sharpness", "0.2", "--disable-sharpening"],
+            vec!["--disable-sharpening", "--sharpness", "0.2"],
+        ] {
+            assert!(parse_vkcube_args(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
     fn vkcube_accepts_the_fidelityfx_backend() {
         let options = parse_vkcube_args(&["--backend", "fsr_3_1_4"]).unwrap();
 
         assert_eq!(options.backend, BackendSelection::Fsr314);
+    }
+
+    #[test]
+    fn fidelityfx_check_requires_the_native_host_architecture() {
+        assert!(fidelityfx_elf_architecture_is_valid(
+            "ELF 64-bit LSB shared object, x86-64, version 1 (SYSV)",
+            "x86_64"
+        ));
+        assert!(!fidelityfx_elf_architecture_is_valid(
+            "ELF 32-bit LSB shared object, Intel 80386",
+            "x86_64"
+        ));
+        assert!(!fidelityfx_elf_architecture_is_valid(
+            "ELF 64-bit LSB shared object, ARM aarch64",
+            "x86_64"
+        ));
+    }
+
+    #[test]
+    fn fidelityfx_check_requires_all_versioned_abi_symbols() {
+        let symbols = concat!(
+            "00000000 T tux_ffx_abi_version\n",
+            "00000000 T tux_ffx_version\n",
+            "00000000 T tux_ffx_create\n",
+            "00000000 T tux_ffx_dispatch\n",
+            "00000000 T tux_ffx_reset\n",
+            "00000000 T tux_ffx_destroy\n",
+        );
+        assert!(fidelityfx_symbols_are_complete(symbols));
+        assert!(!fidelityfx_symbols_are_complete(
+            symbols
+                .replace("tux_ffx_abi_version", "tux_ffx_old_abi")
+                .as_str()
+        ));
     }
 
     #[test]
@@ -1515,6 +1678,8 @@ mod tests {
         let source = generated_config("native", 1.0, Some("ultra"));
 
         assert!(source.contains("guidance_scale = 1"));
+        assert!(source.contains("sharpening_enabled = true"));
+        assert!(source.contains("sharpness = 0.2"));
         assert!(!source.contains("processing_scale"));
         assert!(!source.contains("render_scale"));
     }

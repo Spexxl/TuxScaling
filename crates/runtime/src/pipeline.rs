@@ -941,6 +941,7 @@ mod tests {
             },
             guidance,
             viewport: content_viewport(extent, extent),
+            output_sharpening: tuxscaling_upscaler::OutputSharpening::default(),
             frame_id: 1,
             reset_history: false,
             debug_view: 0,

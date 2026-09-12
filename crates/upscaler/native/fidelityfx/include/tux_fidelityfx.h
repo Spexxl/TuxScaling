@@ -9,6 +9,10 @@
 #define TUX_FFX_API __attribute__((visibility("default")))
 #endif
 
+#ifndef TUX_FFX_ABI_VERSION
+#define TUX_FFX_ABI_VERSION 2u
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -72,6 +76,8 @@ typedef struct TuxFfxDispatchInfo {
     uint32_t output_width;
     uint32_t output_height;
     uint32_t reset;
+    uint32_t enable_sharpening;
+    float sharpness;
 } TuxFfxDispatchInfo;
 
 enum {
@@ -95,6 +101,7 @@ enum {
 };
 
 TUX_FFX_API TuxFfxVersion tux_ffx_version(void);
+TUX_FFX_API uint32_t tux_ffx_abi_version(void);
 TUX_FFX_API int32_t tux_ffx_create(const TuxFfxCreateInfo* info, TuxFfxContext** context);
 TUX_FFX_API int32_t tux_ffx_dispatch(TuxFfxContext* context, const TuxFfxDispatchInfo* info);
 TUX_FFX_API int32_t tux_ffx_reset(TuxFfxContext* context);
