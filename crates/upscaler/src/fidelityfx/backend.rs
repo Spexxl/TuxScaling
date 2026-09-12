@@ -520,8 +520,8 @@ impl UpscalerBackend for Fsr314Upscaler {
                     TUX_FFX_IMAGE_STATE_UNORDERED_ACCESS
                 },
             ),
-            jitter_x: 0.0,
-            jitter_y: 0.0,
+            jitter_x: frame.guidance.jitter.current[0],
+            jitter_y: frame.guidance.jitter.current[1],
             motion_scale_x: 1.0,
             motion_scale_y: 1.0,
             frame_time_ms: frame.guidance.timing.validated.as_secs_f32() * 1_000.0,
