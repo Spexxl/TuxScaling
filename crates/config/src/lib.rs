@@ -25,6 +25,9 @@ pub struct Config {
     pub toggle_key: String,
     pub debug_view: DebugView,
     pub jitter_mode: JitterMode,
+    pub guidance_mode: GuidanceMode,
+    pub sharpening_enabled: bool,
+    pub sharpness: f32,
     pub motion_quality: MotionQuality,
     pub output_resolution: OutputResolution,
     #[serde(alias = "processing_scale", alias = "render_scale")]
@@ -38,9 +41,17 @@ pub struct Config {
 pub enum MotionQuality {
     High,
     #[default]
-    Ultra,
     Balanced,
+    Ultra,
     Performance,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GuidanceMode {
+    #[default]
+    Estimated,
+    Zero,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -116,7 +127,10 @@ impl Default for Config {
             toggle_key: "Insert".into(),
             debug_view: DebugView::Original,
             jitter_mode: JitterMode::Off,
-            motion_quality: MotionQuality::Ultra,
+            guidance_mode: GuidanceMode::Estimated,
+            sharpening_enabled: true,
+            sharpness: 0.2,
+            motion_quality: MotionQuality::Balanced,
             output_resolution: OutputResolution::Native,
             guidance_scale: 1.0,
             scene_distance_threshold: 0.5,
@@ -135,7 +149,8 @@ pub enum ConfigError {
 
 impl Config {
     pub fn parse(source: &str) -> Result<Self, ConfigError> {
-        let config: Self = toml::from_str(source)?;
+        let mut config: Self = toml::from_str(source)?;
+        config.sharpness = clamp_sharpness(config.sharpness);
         if !config.guidance_scale.is_finite()
             || !(0.5..=1.0).contains(&config.guidance_scale)
             || !config.scene_distance_threshold.is_finite()
@@ -150,10 +165,19 @@ impl Config {
     }
 }
 
+fn clamp_sharpness(value: f32) -> f32 {
+    if value.is_nan() {
+        0.0
+    } else {
+        value.clamp(0.0, 1.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ConfigError, DebugView, JitterMode, MotionQuality, OutputResolution, Upscaler,
+        Config, ConfigError, DebugView, GuidanceMode, JitterMode, MotionQuality, OutputResolution,
+        Upscaler,
     };
 
     #[test]
@@ -205,7 +229,7 @@ mod tests {
                 .motion_quality,
             MotionQuality::Performance
         );
-        assert_eq!(Config::default().motion_quality, MotionQuality::Ultra);
+        assert_eq!(Config::default().motion_quality, MotionQuality::Balanced);
     }
 
     #[test]
@@ -271,11 +295,41 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_full_resolution_guidance_and_ultra_motion() {
+    fn defaults_to_full_resolution_guidance_and_balanced_motion() {
         let config = Config::parse("").unwrap();
 
         assert_eq!(config.guidance_scale, 1.0);
-        assert_eq!(config.motion_quality, MotionQuality::Ultra);
+        assert_eq!(config.motion_quality, MotionQuality::Balanced);
+        assert_eq!(config.guidance_mode, GuidanceMode::Estimated);
+        assert!(config.sharpening_enabled);
+        assert_eq!(config.sharpness, 0.2);
+    }
+
+    #[test]
+    fn preset_selection_and_guidance_scale_are_independent_manual_settings() {
+        let config =
+            Config::parse("motion_quality = 'performance'\nguidance_scale = 0.75").unwrap();
+
+        assert_eq!(config.motion_quality, MotionQuality::Performance);
+        assert_eq!(config.guidance_scale, 0.75);
+    }
+
+    #[test]
+    fn clamps_deserialized_sharpness_at_the_configuration_boundary() {
+        assert_eq!(Config::parse("sharpness = -1.0").unwrap().sharpness, 0.0);
+        assert_eq!(Config::parse("sharpness = 2.0").unwrap().sharpness, 1.0);
+    }
+
+    #[test]
+    fn parses_zero_guidance_mode_without_changing_other_manual_settings() {
+        let config = Config::parse(
+            "guidance_mode = 'zero'\nmotion_quality = 'balanced'\nguidance_scale = 0.75",
+        )
+        .unwrap();
+
+        assert_eq!(config.guidance_mode, GuidanceMode::Zero);
+        assert_eq!(config.motion_quality, MotionQuality::Balanced);
+        assert_eq!(config.guidance_scale, 0.75);
     }
 
     #[test]

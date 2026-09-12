@@ -19,6 +19,8 @@ pub struct MotionProfile {
     pub patch_radius: i32,
     pub coarse_radius: i32,
     pub fine_radius: i32,
+    pub sample_step: u32,
+    pub subpixel_refinement: bool,
 }
 
 impl MotionQuality {
@@ -42,24 +44,32 @@ impl MotionQuality {
                 patch_radius: 3,
                 coarse_radius: 4,
                 fine_radius: 2,
+                sample_step: patch_sample_step(Self::Ultra),
+                subpixel_refinement: true,
             },
             Self::High => MotionProfile {
                 levels: 4,
                 patch_radius: 2,
                 coarse_radius: 4,
                 fine_radius: 2,
+                sample_step: patch_sample_step(Self::High),
+                subpixel_refinement: true,
             },
             Self::Balanced => MotionProfile {
                 levels: 3,
                 patch_radius: 2,
                 coarse_radius: 3,
                 fine_radius: 1,
+                sample_step: patch_sample_step(Self::Balanced),
+                subpixel_refinement: true,
             },
             Self::Performance => MotionProfile {
-                levels: 3,
+                levels: 2,
                 patch_radius: 2,
-                coarse_radius: 3,
+                coarse_radius: 2,
                 fine_radius: 1,
+                sample_step: patch_sample_step(Self::Performance),
+                subpixel_refinement: false,
             },
         };
         MotionProfile {
@@ -69,7 +79,7 @@ impl MotionQuality {
     }
 }
 
-fn patch_sample_step(quality: MotionQuality) -> u32 {
+const fn patch_sample_step(quality: MotionQuality) -> u32 {
     match quality {
         MotionQuality::Ultra | MotionQuality::High => 1,
         MotionQuality::Balanced | MotionQuality::Performance => 2,
@@ -201,7 +211,7 @@ impl MotionEstimator {
             initialized: false,
             decode_srgb,
             cut_thresholds: [0.5, 0.2],
-            quality: MotionQuality::Ultra,
+            quality: MotionQuality::Balanced,
             stats_grid,
         };
         result.sampler = unsafe {
@@ -561,7 +571,7 @@ impl MotionEstimator {
                         | ((profile.patch_radius as u32) << 16)
                         | ((profile.coarse_radius as u32) << 20)
                         | ((profile.fine_radius as u32) << 24)
-                        | (patch_sample_step(self.quality) << 28);
+                        | (profile.sample_step << 28);
                     self.dispatch(command, 2, p, l.width.div_ceil(2), l.height.div_ceil(2));
                 }
                 if let Some((query_pool, query_base)) = timestamps {
@@ -688,9 +698,16 @@ mod tests {
         assert_eq!(ultra.levels, 4);
         assert!(balanced.levels < ultra.levels);
         assert_eq!(performance.patch_radius, balanced.patch_radius);
-        assert_eq!(performance.coarse_radius, balanced.coarse_radius);
+        assert_eq!(performance.levels, 2);
+        assert_eq!(performance.coarse_radius, 2);
+        assert!(performance.levels < balanced.levels);
+        assert!(performance.coarse_radius < balanced.coarse_radius);
         assert_eq!(balanced.fine_radius, 1);
         assert_eq!(performance.fine_radius, 1);
+        assert_eq!(balanced.sample_step, 2);
+        assert!(balanced.subpixel_refinement);
+        assert_eq!(performance.sample_step, 2);
+        assert!(!performance.subpixel_refinement);
     }
 
     #[test]
