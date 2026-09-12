@@ -172,6 +172,44 @@ pub enum GuidanceSignal {
     TransparencyComposition = 6,
 }
 
+/// Runtime-only diagnostic switches for removing one guidance signal at a
+/// time. The post-capture jitter switch is experimental: it is not engine
+/// projection jitter and is outside the stable estimated-guidance contract.
+/// These controls intentionally do not change serialized runtime
+/// configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GuidanceAblations {
+    pub motion: bool,
+    pub relative_depth: bool,
+    pub reactive: bool,
+    pub composition: bool,
+    pub exposure: bool,
+    pub confidence_disocclusion: bool,
+    pub post_capture_jitter: bool,
+}
+
+impl GuidanceAblations {
+    pub const NONE: Self = Self {
+        motion: false,
+        relative_depth: false,
+        reactive: false,
+        composition: false,
+        exposure: false,
+        confidence_disocclusion: false,
+        post_capture_jitter: false,
+    };
+
+    pub const fn any(self) -> bool {
+        self.motion
+            || self.relative_depth
+            || self.reactive
+            || self.composition
+            || self.exposure
+            || self.confidence_disocclusion
+            || self.post_capture_jitter
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuidanceCapabilities {
     pub estimated: [bool; 7],
@@ -348,12 +386,61 @@ impl GuidanceView {
             && self.jitter.is_finite()
             && self.resolution.is_valid_for(extent)
     }
+
+    /// Returns whether a zero/fallback view has a complete set of usable
+    /// resources.  Constant fallback values are valid inputs for a temporal
+    /// backend; unavailable resources are not.
+    pub fn has_coherent_fallbacks(self) -> bool {
+        if !self.motion.metadata.is_zero {
+            return false;
+        }
+        let resources = [
+            self.motion,
+            self.confidence,
+            self.disocclusion,
+            self.reactive,
+            self.exposure,
+            self.depth,
+            self.transparency_composition,
+        ];
+        let metadata = self.motion.metadata;
+        resources.iter().all(|resource| {
+            resource.state == SignalState::ConstantFallback
+                && resource.metadata == metadata
+                && resource.metadata.valid
+        }) && matches!(self.depth_semantics, DepthSemantics::FlatFallback)
+            && self.pre_exposure.is_valid()
+            && self.jitter.signal_state() == SignalState::Unavailable
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ash::vk::Handle;
+
+    #[test]
+    fn guidance_ablations_are_independent_and_disabled_by_default() {
+        let mut ablations = GuidanceAblations::default();
+        assert!(!ablations.any());
+        assert!(!ablations.motion);
+        assert!(!ablations.relative_depth);
+        assert!(!ablations.reactive);
+        assert!(!ablations.composition);
+        assert!(!ablations.exposure);
+        assert!(!ablations.confidence_disocclusion);
+        assert!(!ablations.post_capture_jitter);
+
+        ablations.motion = true;
+        assert!(ablations.any());
+        assert!(ablations.motion);
+        assert!(!ablations.relative_depth);
+        assert!(!ablations.reactive);
+        assert!(!ablations.composition);
+        assert!(!ablations.exposure);
+        assert!(!ablations.confidence_disocclusion);
+        assert!(!ablations.post_capture_jitter);
+    }
 
     fn resource(metadata: GuidanceMetadata, format: vk::Format) -> GuidanceResource {
         GuidanceResource {

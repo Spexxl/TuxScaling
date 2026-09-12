@@ -5,7 +5,8 @@ use tuxscaling_capture::{GuidanceCapture, JitterState};
 use tuxscaling_config::{Config, GuidanceMode, Upscaler};
 use tuxscaling_motion::{MotionEstimator, MotionQuality};
 use tuxscaling_temporal::{
-    FrameTiming, GuidanceEstimator, GuidanceReset, GuidanceResolver, GuidanceView, History,
+    FrameTiming, GuidanceAblations, GuidanceEstimator, GuidanceReset, GuidanceResolver,
+    GuidanceView, History,
 };
 use tuxscaling_upscaler::{
     BackendColorEncoding, BackendConfig, BackendEnvironment, BackendError, BackendFrame,
@@ -193,6 +194,8 @@ pub struct TemporalPipeline {
     pub(crate) pending_quality: Option<MotionQuality>,
     pub(crate) pending_guidance_scale: Option<f32>,
     pub(crate) pending_guidance_mode: Option<GuidanceMode>,
+    pub(crate) guidance_ablations: GuidanceAblations,
+    pub(crate) pending_guidance_ablations: Option<GuidanceAblations>,
     pub(crate) pending_sharpening_enabled: Option<bool>,
     pub(crate) pending_sharpness: Option<f32>,
     pub(crate) pending_comparison_enabled: Option<bool>,
@@ -427,6 +430,8 @@ impl TemporalPipeline {
             pending_quality: None,
             pending_guidance_scale: None,
             pending_guidance_mode: None,
+            guidance_ablations: GuidanceAblations::NONE,
+            pending_guidance_ablations: None,
             pending_sharpening_enabled: None,
             pending_sharpness: None,
             pending_comparison_enabled: None,
@@ -612,6 +617,11 @@ impl TemporalPipeline {
         self.pending_guidance_mode = (mode != self.config.guidance_mode).then_some(mode);
     }
 
+    pub(crate) fn request_guidance_ablations(&mut self, ablations: GuidanceAblations) {
+        self.pending_guidance_ablations =
+            (ablations != self.guidance_ablations).then_some(ablations);
+    }
+
     pub(crate) fn request_sharpening_enabled(&mut self, enabled: bool) {
         self.pending_sharpening_enabled =
             (enabled != self.config.sharpening_enabled).then_some(enabled);
@@ -642,6 +652,12 @@ impl TemporalPipeline {
             && mode != self.config.guidance_mode
         {
             self.config.guidance_mode = mode;
+            reset_history = true;
+        }
+        if let Some(ablations) = self.pending_guidance_ablations.take()
+            && ablations != self.guidance_ablations
+        {
+            self.guidance_ablations = ablations;
             reset_history = true;
         }
         if let Some(enabled) = self.pending_sharpening_enabled.take() {
@@ -756,6 +772,8 @@ impl TemporalPipeline {
             pending_quality: None,
             pending_guidance_scale: None,
             pending_guidance_mode: None,
+            guidance_ablations: GuidanceAblations::NONE,
+            pending_guidance_ablations: None,
             pending_sharpening_enabled: None,
             pending_sharpness: None,
             pending_comparison_enabled: None,
@@ -1151,5 +1169,38 @@ mod tests {
         assert_eq!(pipeline.config.comparison_split, 0.25);
         assert_eq!(pipeline.reset_reason, GuidanceReset::PresetChanged);
         assert_eq!(pipeline.history_age, 0);
+    }
+
+    #[test]
+    fn guidance_ablation_changes_apply_at_the_next_frame_boundary() {
+        let mut pipeline = TemporalPipeline::for_test(tuxscaling_upscaler::ResolutionPlan::new(
+            vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            },
+            1.0,
+        ));
+        let requested = tuxscaling_temporal::GuidanceAblations {
+            motion: true,
+            relative_depth: false,
+            reactive: true,
+            composition: false,
+            exposure: false,
+            confidence_disocclusion: false,
+            post_capture_jitter: false,
+        };
+
+        pipeline.request_guidance_ablations(requested);
+        assert_eq!(
+            pipeline.guidance_ablations,
+            tuxscaling_temporal::GuidanceAblations::default()
+        );
+        assert!(pipeline.apply_pending_manual_controls());
+        assert_eq!(pipeline.guidance_ablations, requested);
+        assert_eq!(pipeline.reset_reason, GuidanceReset::PresetChanged);
     }
 }

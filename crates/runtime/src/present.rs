@@ -2,11 +2,13 @@
 use ash::vk;
 use std::{collections::VecDeque, mem, time::Instant};
 use tuxscaling_capture::Capture;
-use tuxscaling_config::{DebugView, Upscaler};
+use tuxscaling_config::{DebugView, GuidanceMode, Upscaler};
 use tuxscaling_motion::MotionQuality;
 use tuxscaling_overlay::{FrameDiagnostics, OverlayFrame};
 use tuxscaling_overlay_vulkan::{InputRouteConfig, OverlayRenderer, SwapchainInfo};
-use tuxscaling_temporal::{DepthSemantics, FrameExtent, GuidanceReset, SignalState};
+use tuxscaling_temporal::{
+    DepthSemantics, FrameExtent, GuidanceAblations, GuidanceReset, JitterSample, SignalState,
+};
 use tuxscaling_upscaler::{
     BackendError, BackendFrame, BackendImage, OutputSharpening, ResolutionPlan, content_viewport,
 };
@@ -314,6 +316,53 @@ fn reset_name(reset: GuidanceReset) -> &'static str {
     }
 }
 
+fn update_ablation_diagnostics(diagnostics: &mut FrameDiagnostics, ablations: GuidanceAblations) {
+    diagnostics.active_ablation_motion = ablations.motion;
+    diagnostics.active_ablation_relative_depth = ablations.relative_depth;
+    diagnostics.active_ablation_reactive = ablations.reactive;
+    diagnostics.active_ablation_composition = ablations.composition;
+    diagnostics.active_ablation_exposure = ablations.exposure;
+    diagnostics.active_ablation_confidence_disocclusion = ablations.confidence_disocclusion;
+    diagnostics.active_ablation_post_capture_jitter = ablations.post_capture_jitter;
+}
+
+fn request_ablation_controls(
+    temporal: &mut TemporalPipeline,
+    diagnostics: &mut FrameDiagnostics,
+    frame: &OverlayFrame,
+) {
+    let mut ablations = temporal.guidance_ablations;
+    if let Some(value) = frame.requested_ablation_motion {
+        ablations.motion = value;
+        diagnostics.requested_ablation_motion = Some(value);
+    }
+    if let Some(value) = frame.requested_ablation_relative_depth {
+        ablations.relative_depth = value;
+        diagnostics.requested_ablation_relative_depth = Some(value);
+    }
+    if let Some(value) = frame.requested_ablation_reactive {
+        ablations.reactive = value;
+        diagnostics.requested_ablation_reactive = Some(value);
+    }
+    if let Some(value) = frame.requested_ablation_composition {
+        ablations.composition = value;
+        diagnostics.requested_ablation_composition = Some(value);
+    }
+    if let Some(value) = frame.requested_ablation_exposure {
+        ablations.exposure = value;
+        diagnostics.requested_ablation_exposure = Some(value);
+    }
+    if let Some(value) = frame.requested_ablation_confidence_disocclusion {
+        ablations.confidence_disocclusion = value;
+        diagnostics.requested_ablation_confidence_disocclusion = Some(value);
+    }
+    if let Some(value) = frame.requested_ablation_post_capture_jitter {
+        ablations.post_capture_jitter = value;
+        diagnostics.requested_ablation_post_capture_jitter = Some(value);
+    }
+    temporal.request_guidance_ablations(ablations);
+}
+
 fn motion_quality(quality: tuxscaling_config::MotionQuality) -> MotionQuality {
     match quality {
         tuxscaling_config::MotionQuality::Ultra => MotionQuality::Ultra,
@@ -387,6 +436,40 @@ unsafe fn record_spatial_fallback(
             output,
             output_layout,
             output_extent,
+        );
+    }
+}
+
+unsafe fn clear_guidance_image(
+    device: &ash::Device,
+    command: vk::CommandBuffer,
+    image: vk::Image,
+    value: [f32; 4],
+) {
+    unsafe {
+        image_barrier(
+            device,
+            command,
+            image,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        device.cmd_clear_color_image(
+            command,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &vk::ClearColorValue { float32: value },
+            &[vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1)],
+        );
+        image_barrier(
+            device,
+            command,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::GENERAL,
         );
     }
 }
@@ -857,6 +940,7 @@ impl SwapchainRuntime {
         self.diagnostics.active_sharpness = self.requested_config.sharpness;
         self.diagnostics.active_comparison_enabled = self.requested_config.comparison_enabled;
         self.diagnostics.active_comparison_split = self.requested_config.comparison_split;
+        update_ablation_diagnostics(&mut self.diagnostics, self.temporal.guidance_ablations);
         self.diagnostics.game_extent = [
             self.temporal.resolution.game_extent.width,
             self.temporal.resolution.game_extent.height,
@@ -1087,6 +1171,7 @@ impl SwapchainRuntime {
         self.diagnostics.active_sharpness = self.temporal.config.sharpness;
         self.diagnostics.active_comparison_enabled = self.temporal.config.comparison_enabled;
         self.diagnostics.active_comparison_split = self.temporal.config.comparison_split;
+        update_ablation_diagnostics(&mut self.diagnostics, self.temporal.guidance_ablations);
         self.diagnostics.history_valid = self.temporal.history.valid(self.temporal.pending_time);
         self.diagnostics.history_age = self.temporal.history_age;
         if let Some(quality) = self.temporal.pending_quality.take() {
@@ -1195,6 +1280,7 @@ impl SwapchainRuntime {
             self.requested_config.guidance_mode = mode;
             self.diagnostics.requested_guidance_mode = Some(mode);
         }
+        request_ablation_controls(&mut self.temporal, &mut self.diagnostics, &frame);
         if let Some(enabled) = frame.requested_sharpening_enabled {
             self.temporal.request_sharpening_enabled(enabled);
             self.requested_config.sharpening_enabled = enabled;
@@ -1227,7 +1313,14 @@ impl SwapchainRuntime {
             self.diagnostics.debug_view = view;
             self.diagnostics.mode = mode_name(self.mode).into();
         }
-        let jitter = self.temporal.jitter.sample();
+        let requested_jitter = self.temporal.jitter.sample();
+        let zero_guidance = self.temporal.config.guidance_mode == GuidanceMode::Zero;
+        let ablations = self.temporal.guidance_ablations;
+        let jitter = if zero_guidance || ablations.post_capture_jitter {
+            JitterSample::default()
+        } else {
+            requested_jitter
+        };
         if self.temporal.jitter.take_phase_restart() {
             self.temporal
                 .reset_history_preserving_jitter(GuidanceReset::PresetChanged);
@@ -1301,7 +1394,7 @@ impl SwapchainRuntime {
         }
         let raw_guidance_view = match (&self.temporal.guidance, &self.temporal.motion) {
             (Some(guidance), Some(motion)) => {
-                let mut view = guidance.view(
+                let mut view = guidance.view_with_controls(
                     motion,
                     self.temporal.history.frame_id + 1,
                     self.temporal.resolution.guidance_extent,
@@ -1312,6 +1405,8 @@ impl SwapchainRuntime {
                     } else {
                         self.temporal.reset_reason
                     },
+                    zero_guidance,
+                    ablations,
                 );
                 view.jitter = jitter;
                 self.diagnostics.motion_state = signal_name(view.motion.state).into();
@@ -1432,6 +1527,30 @@ impl SwapchainRuntime {
                     );
                 }
             }
+            let zero_motion = zero_guidance || ablations.motion;
+            let zero_confidence = zero_guidance || ablations.confidence_disocclusion;
+            if (zero_motion || zero_confidence)
+                && let Some(motion) = self.temporal.motion.as_ref()
+            {
+                compute_memory_barrier(&self.device, slot.command);
+                if zero_motion {
+                    clear_guidance_image(
+                        &self.device,
+                        slot.command,
+                        motion.vectors.handle,
+                        [0.0, 0.0, 0.0, 0.0],
+                    );
+                }
+                if zero_confidence {
+                    clear_guidance_image(
+                        &self.device,
+                        slot.command,
+                        motion.confidence.handle,
+                        [0.0, 0.0, 0.0, 0.0],
+                    );
+                }
+                compute_memory_barrier(&self.device, slot.command);
+            }
             if let Some(guidance) = &mut self.temporal.guidance {
                 let cpu_start = Instant::now();
                 if self.temporal.queries != vk::QueryPool::null() {
@@ -1441,20 +1560,24 @@ impl SwapchainRuntime {
                         index as u32 * GPU_TIMESTAMPS as u32 + 11,
                         4,
                     );
-                    guidance.record_timed_with_timing_for_slot(
+                    guidance.record_timed_with_ablation_for_slot(
                         slot.command,
                         valid,
                         self.temporal.pending_timing,
                         self.temporal.queries,
                         index as u32 * GPU_TIMESTAMPS as u32 + 11,
                         index,
+                        zero_guidance,
+                        ablations,
                     );
                 } else {
-                    guidance.record_with_timing_for_slot(
+                    guidance.record_with_ablation_for_slot(
                         slot.command,
                         valid,
                         self.temporal.pending_timing,
                         index,
+                        zero_guidance,
+                        ablations,
                     );
                 }
                 compute_memory_barrier(&self.device, slot.command);
@@ -1964,6 +2087,7 @@ impl SwapchainRuntime {
             self.requested_config.guidance_mode = mode;
             self.diagnostics.requested_guidance_mode = Some(mode);
         }
+        request_ablation_controls(&mut self.temporal, &mut self.diagnostics, &frame);
         if let Some(enabled) = frame.requested_sharpening_enabled {
             self.temporal.request_sharpening_enabled(enabled);
             self.requested_config.sharpening_enabled = enabled;
@@ -1992,7 +2116,13 @@ impl SwapchainRuntime {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
-            let jitter = self.temporal.jitter.sample();
+            let jitter = if self.temporal.config.guidance_mode == GuidanceMode::Zero
+                || self.temporal.guidance_ablations.post_capture_jitter
+            {
+                JitterSample::default()
+            } else {
+                self.temporal.jitter.sample()
+            };
             if let Some(capture) = &mut self.temporal.capture {
                 capture.record_scaled_from_with_jitter(
                     &self.device,

@@ -6,9 +6,9 @@ use tuxscaling_vulkan::{
 };
 
 use crate::{
-    DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResolution,
-    GuidanceResource, GuidanceScalar, GuidanceView, JitterSample, MotionDirection, MotionUnits,
-    SignalState, ValidRegion,
+    DepthSemantics, FrameExtent, FrameTiming, GuidanceAblations, GuidanceMetadata, GuidanceReset,
+    GuidanceResolution, GuidanceResource, GuidanceScalar, GuidanceView, JitterSample,
+    MotionDirection, MotionUnits, SignalState, ValidRegion,
 };
 
 const DEPTH_RECORD_WORDS: u64 = 80;
@@ -422,6 +422,23 @@ impl GuidanceEstimator {
         unsafe { self.record_inner(command, valid, timing, None, slot) };
     }
 
+    /// Record the normal guidance producers and then apply diagnostic signal
+    /// ablations in-place.  The existing images are reused as the canonical
+    /// resources, so toggling a control never allocates a new image.
+    pub unsafe fn record_with_ablation_for_slot(
+        &mut self,
+        command: vk::CommandBuffer,
+        valid: bool,
+        timing: FrameTiming,
+        slot: usize,
+        zero_guidance: bool,
+        ablations: GuidanceAblations,
+    ) {
+        self.provider_failure = false;
+        unsafe { self.record_inner(command, valid, timing, None, slot) };
+        unsafe { self.apply_ablation_clears(command, zero_guidance, ablations) };
+    }
+
     pub unsafe fn record_timed(
         &mut self,
         command: vk::CommandBuffer,
@@ -466,6 +483,23 @@ impl GuidanceEstimator {
     ) {
         self.provider_failure = false;
         unsafe { self.record_inner(command, valid, timing, Some((query_pool, query_base)), slot) };
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn record_timed_with_ablation_for_slot(
+        &mut self,
+        command: vk::CommandBuffer,
+        valid: bool,
+        timing: FrameTiming,
+        query_pool: vk::QueryPool,
+        query_base: u32,
+        slot: usize,
+        zero_guidance: bool,
+        ablations: GuidanceAblations,
+    ) {
+        self.provider_failure = false;
+        unsafe { self.record_inner(command, valid, timing, Some((query_pool, query_base)), slot) };
+        unsafe { self.apply_ablation_clears(command, zero_guidance, ablations) };
     }
 
     unsafe fn record_inner(
@@ -727,6 +761,130 @@ impl GuidanceEstimator {
         self.history_initialized = valid && !self.provider_failure;
     }
 
+    unsafe fn apply_ablation_clears(
+        &self,
+        command: vk::CommandBuffer,
+        zero_guidance: bool,
+        ablations: GuidanceAblations,
+    ) {
+        let clear = |device: &ash::Device,
+                     command: vk::CommandBuffer,
+                     image: vk::Image,
+                     value: [f32; 4]| {
+            unsafe {
+                image_barrier(
+                    device,
+                    command,
+                    image,
+                    vk::ImageLayout::GENERAL,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                );
+                device.cmd_clear_color_image(
+                    command,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearColorValue { float32: value },
+                    &[vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1)],
+                );
+                image_barrier(
+                    device,
+                    command,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::GENERAL,
+                );
+            }
+        };
+        let zero_reactive = zero_guidance || ablations.reactive;
+        let zero_composition = zero_guidance || ablations.composition;
+        let one_disocclusion = zero_guidance || ablations.confidence_disocclusion;
+        let one_exposure = zero_guidance || ablations.exposure;
+        let flat_depth = zero_guidance || ablations.relative_depth;
+        if zero_reactive || zero_composition || one_disocclusion || one_exposure || flat_depth {
+            unsafe { compute_memory_barrier(&self.device, command) };
+        }
+        if zero_reactive {
+            clear(
+                &self.device,
+                command,
+                self.reactive.handle,
+                [0.0, 0.0, 0.0, 0.0],
+            );
+        }
+        if zero_composition {
+            clear(
+                &self.device,
+                command,
+                self.transparency.handle,
+                [0.0, 0.0, 0.0, 0.0],
+            );
+        }
+        if one_disocclusion {
+            clear(
+                &self.device,
+                command,
+                self.disocclusion.handle,
+                [1.0, 0.0, 0.0, 0.0],
+            );
+        }
+        if one_exposure {
+            clear(
+                &self.device,
+                command,
+                self.exposure.handle,
+                [1.0, 0.0, 0.0, 0.0],
+            );
+        }
+        if flat_depth {
+            clear(
+                &self.device,
+                command,
+                self.depth.handle,
+                [1.0, 0.0, 0.0, 0.0],
+            );
+        }
+        if zero_composition {
+            unsafe {
+                image_barrier(
+                    &self.device,
+                    command,
+                    self.transparency_history.handle,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                );
+            }
+            unsafe {
+                self.device.cmd_clear_color_image(
+                    command,
+                    self.transparency_history.handle,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 0.0],
+                    },
+                    &[vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1)],
+                );
+            }
+            unsafe {
+                image_barrier(
+                    &self.device,
+                    command,
+                    self.transparency_history.handle,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                );
+            }
+        }
+        if zero_reactive || zero_composition || one_disocclusion || one_exposure || flat_depth {
+            unsafe { compute_memory_barrier(&self.device, command) };
+        }
+    }
+
     /// Record coherent fallback values after a provider failure.
     pub unsafe fn record_provider_failure(&mut self, command: vk::CommandBuffer) {
         unsafe { self.record_provider_failure_for_slot(command, 0) };
@@ -764,6 +922,30 @@ impl GuidanceEstimator {
         timing: FrameTiming,
         reset: GuidanceReset,
     ) -> GuidanceView {
+        self.view_with_controls(
+            motion,
+            frame_id,
+            extent,
+            valid,
+            timing,
+            reset,
+            false,
+            GuidanceAblations::NONE,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn view_with_controls(
+        &self,
+        motion: &MotionEstimator,
+        frame_id: u64,
+        extent: vk::Extent2D,
+        valid: bool,
+        timing: FrameTiming,
+        reset: GuidanceReset,
+        zero_guidance: bool,
+        ablations: GuidanceAblations,
+    ) -> GuidanceView {
         let extent = FrameExtent {
             width: extent.width,
             height: extent.height,
@@ -779,7 +961,7 @@ impl GuidanceEstimator {
             valid: true,
             valid_region: ValidRegion::full(extent),
             reset,
-            is_zero: !valid || self.provider_failure,
+            is_zero: zero_guidance || !valid || self.provider_failure,
             requires_history_reset: !valid
                 || self.provider_failure
                 || !self.history_initialized
@@ -789,7 +971,8 @@ impl GuidanceEstimator {
         // a valid depth dispatch was recorded; the shader may still produce a
         // conservative exact flat-one image when its inlier thresholds are
         // not met.
-        let depth_estimated = valid && !self.provider_failure;
+        let estimated = valid && !self.provider_failure && !zero_guidance;
+        let depth_estimated = estimated && !ablations.relative_depth;
         let resource =
             |image: vk::Image, view: vk::ImageView, format: vk::Format, state: SignalState| {
                 GuidanceResource {
@@ -805,7 +988,7 @@ impl GuidanceEstimator {
                 motion.vectors.handle,
                 motion.vectors.view,
                 vk::Format::R16G16_SFLOAT,
-                if valid && !self.provider_failure {
+                if estimated && !ablations.motion {
                     SignalState::Estimated
                 } else {
                     SignalState::ConstantFallback
@@ -815,7 +998,7 @@ impl GuidanceEstimator {
                 motion.confidence.handle,
                 motion.confidence.view,
                 vk::Format::R8_UNORM,
-                if valid && !self.provider_failure {
+                if estimated && !ablations.confidence_disocclusion {
                     SignalState::Estimated
                 } else {
                     SignalState::ConstantFallback
@@ -825,7 +1008,7 @@ impl GuidanceEstimator {
                 self.disocclusion.handle,
                 self.disocclusion.view,
                 vk::Format::R8_UNORM,
-                if !valid || self.provider_failure {
+                if !estimated || ablations.confidence_disocclusion {
                     SignalState::ConstantFallback
                 } else {
                     SignalState::Estimated
@@ -835,7 +1018,7 @@ impl GuidanceEstimator {
                 self.reactive.handle,
                 self.reactive.view,
                 vk::Format::R8_UNORM,
-                if !valid || self.provider_failure {
+                if !estimated || ablations.reactive {
                     SignalState::ConstantFallback
                 } else {
                     SignalState::Estimated
@@ -845,7 +1028,7 @@ impl GuidanceEstimator {
                 self.exposure.handle,
                 self.exposure.view,
                 vk::Format::R32_SFLOAT,
-                if !valid || self.provider_failure {
+                if !estimated || ablations.exposure {
                     SignalState::ConstantFallback
                 } else {
                     SignalState::Estimated
@@ -865,7 +1048,7 @@ impl GuidanceEstimator {
                 self.transparency.handle,
                 self.transparency.view,
                 vk::Format::R8_UNORM,
-                if !valid || self.provider_failure {
+                if !estimated || ablations.composition {
                     SignalState::ConstantFallback
                 } else {
                     SignalState::Estimated

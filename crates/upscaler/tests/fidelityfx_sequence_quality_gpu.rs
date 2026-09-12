@@ -6,9 +6,9 @@ use ash::vk;
 use std::time::Duration;
 use tuxscaling_temporal::quality::SequenceFixture;
 use tuxscaling_temporal::{
-    DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResolution,
-    GuidanceResource, GuidanceScalar, GuidanceView, JitterSample, MotionDirection, MotionUnits,
-    SignalState,
+    DepthSemantics, FrameExtent, FrameTiming, GuidanceAblations, GuidanceMetadata, GuidanceReset,
+    GuidanceResolution, GuidanceResource, GuidanceScalar, GuidanceView, JitterSample,
+    MotionDirection, MotionUnits, SignalState,
 };
 use tuxscaling_upscaler::fidelityfx::Fsr314Upscaler;
 use tuxscaling_upscaler::{
@@ -29,6 +29,23 @@ const OUTPUT: vk::Extent2D = vk::Extent2D {
     width: 64,
     height: 64,
 };
+
+#[derive(Debug, Clone, Copy)]
+struct GuidanceSummary {
+    metadata_is_zero: bool,
+    states: [SignalState; 7],
+    depth_semantics: DepthSemantics,
+    jitter: JitterSample,
+    requires_history_reset: bool,
+    coherent_fallbacks: bool,
+}
+
+struct FsrVariantResult {
+    first: Vec<[f32; 4]>,
+    second: Vec<[f32; 4]>,
+    first_guidance: GuidanceSummary,
+    second_guidance: GuidanceSummary,
+}
 
 type FixtureFactory = fn(u32, u32) -> SequenceFixture;
 
@@ -52,6 +69,60 @@ fn captured_sequence_catalog() -> [(&'static str, FixtureFactory); 12] {
         ("noise", tuxscaling_temporal::quality::noise),
         ("scene_cut", tuxscaling_temporal::quality::scene_cut),
         ("pause_resume", tuxscaling_temporal::quality::pause),
+    ]
+}
+
+fn single_guidance_ablations() -> [(&'static str, GuidanceAblations); 7] {
+    [
+        (
+            "motion",
+            GuidanceAblations {
+                motion: true,
+                ..GuidanceAblations::NONE
+            },
+        ),
+        (
+            "relative_depth",
+            GuidanceAblations {
+                relative_depth: true,
+                ..GuidanceAblations::NONE
+            },
+        ),
+        (
+            "reactive",
+            GuidanceAblations {
+                reactive: true,
+                ..GuidanceAblations::NONE
+            },
+        ),
+        (
+            "composition",
+            GuidanceAblations {
+                composition: true,
+                ..GuidanceAblations::NONE
+            },
+        ),
+        (
+            "exposure",
+            GuidanceAblations {
+                exposure: true,
+                ..GuidanceAblations::NONE
+            },
+        ),
+        (
+            "confidence_disocclusion",
+            GuidanceAblations {
+                confidence_disocclusion: true,
+                ..GuidanceAblations::NONE
+            },
+        ),
+        (
+            "post_capture_jitter",
+            GuidanceAblations {
+                post_capture_jitter: true,
+                ..GuidanceAblations::NONE
+            },
+        ),
     ]
 }
 
@@ -80,6 +151,139 @@ fn captured_sequence_catalog_is_complete_and_deterministic() {
         let left = factory(32, 32);
         let right = second_factory(32, 32);
         assert_eq!(left, right, "fixture {name} is not deterministic");
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU with the FidelityFX storage-image formats"]
+fn fsr_guidance_modes_and_single_signal_ablations_are_distinct_and_coherent() {
+    let gpu = unsafe { Gpu::new() };
+    let physical = unsafe { gpu.instance.enumerate_physical_devices() }.unwrap()[0];
+    let environment = BackendEnvironment::new(&gpu.instance, physical, &gpu.device);
+    let fixture = tuxscaling_temporal::quality::translation(INPUT.width, INPUT.height);
+    let source = scene_bytes(0, INPUT);
+    let second_source = fixture_scene_bytes(0, &fixture, INPUT);
+
+    let estimated = unsafe {
+        run_fsr_variant(
+            &gpu,
+            &environment,
+            &fixture,
+            &source,
+            &second_source,
+            false,
+            GuidanceAblations::NONE,
+        )
+    };
+    let zero = unsafe {
+        run_fsr_variant(
+            &gpu,
+            &environment,
+            &fixture,
+            &source,
+            &second_source,
+            true,
+            GuidanceAblations::NONE,
+        )
+    };
+    let off = bilinear(&source, INPUT, OUTPUT);
+
+    let finite = |pixels: &[[f32; 4]]| {
+        pixels
+            .iter()
+            .all(|pixel| pixel.iter().all(|value| value.is_finite()))
+    };
+    for (name, pixels) in [
+        ("estimated first", &estimated.first),
+        ("estimated second", &estimated.second),
+        ("zero first", &zero.first),
+        ("zero second", &zero.second),
+    ] {
+        assert!(finite(pixels), "{name} contains a non-finite output");
+    }
+    assert!(
+        zero.first
+            .iter()
+            .any(|pixel| { pixel[..3].iter().any(|value| *value > f32::EPSILON) })
+    );
+    assert!(zero.first_guidance.metadata_is_zero);
+    assert_eq!(
+        zero.first_guidance.states,
+        [SignalState::ConstantFallback; 7]
+    );
+    assert_eq!(
+        zero.first_guidance.depth_semantics,
+        DepthSemantics::FlatFallback
+    );
+    assert_eq!(zero.first_guidance.jitter, JitterSample::default());
+    assert!(zero.first_guidance.coherent_fallbacks);
+    assert!(zero.first_guidance.requires_history_reset);
+    assert!(!zero.second_guidance.requires_history_reset);
+    assert!(image_mse(&zero.first, &zero.second) > 1.0e-8);
+    eprintln!(
+        "FSR guidance modes: zero_vs_off_mse={:.9}",
+        image_mse(&zero.first, &off)
+    );
+    assert!(image_mse(&zero.first, &off) > 1.0e-8);
+
+    for (name, ablations) in single_guidance_ablations() {
+        let result = unsafe {
+            run_fsr_variant(
+                &gpu,
+                &environment,
+                &fixture,
+                &source,
+                &second_source,
+                false,
+                ablations,
+            )
+        };
+        assert!(finite(&result.first), "{name} first output is not finite");
+        assert!(finite(&result.second), "{name} second output is not finite");
+        assert!(result.first_guidance.requires_history_reset);
+        assert!(!result.second_guidance.requires_history_reset);
+        let expected_states = [
+            if ablations.motion {
+                SignalState::ConstantFallback
+            } else {
+                SignalState::Estimated
+            },
+            if ablations.confidence_disocclusion {
+                SignalState::ConstantFallback
+            } else {
+                SignalState::Estimated
+            },
+            if ablations.confidence_disocclusion {
+                SignalState::ConstantFallback
+            } else {
+                SignalState::Estimated
+            },
+            if ablations.reactive {
+                SignalState::ConstantFallback
+            } else {
+                SignalState::Estimated
+            },
+            if ablations.exposure {
+                SignalState::ConstantFallback
+            } else {
+                SignalState::Estimated
+            },
+            if ablations.relative_depth {
+                SignalState::ConstantFallback
+            } else {
+                SignalState::Estimated
+            },
+            if ablations.composition {
+                SignalState::ConstantFallback
+            } else {
+                SignalState::Estimated
+            },
+        ];
+        assert_eq!(result.first_guidance.states, expected_states, "{name}");
+        assert_eq!(result.second_guidance.states, expected_states, "{name}");
+        if ablations.post_capture_jitter {
+            assert_eq!(result.first_guidance.jitter, JitterSample::default());
+        }
     }
 }
 
@@ -228,6 +432,17 @@ impl Images {
     }
 
     fn guidance(&self, fixture: &SequenceFixture, frame_id: u64, first: bool) -> GuidanceView {
+        self.guidance_with_controls(fixture, frame_id, first, false, GuidanceAblations::NONE)
+    }
+
+    fn guidance_with_controls(
+        &self,
+        fixture: &SequenceFixture,
+        frame_id: u64,
+        first: bool,
+        zero_guidance: bool,
+        ablations: GuidanceAblations,
+    ) -> GuidanceView {
         let extent = FrameExtent {
             width: INPUT.width,
             height: INPUT.height,
@@ -244,22 +459,79 @@ impl Images {
             GuidanceReset::None
         };
         let mut metadata = GuidanceMetadata::zero(frame_id, extent, reset);
-        metadata.is_zero = false;
-        let resource = |image: &Image, format| GuidanceResource {
+        metadata.is_zero = zero_guidance;
+        let estimated = !zero_guidance;
+        let resource = |image: &Image, format, state| GuidanceResource {
             image: image.handle,
             view: image.view,
             format,
             metadata,
-            state: SignalState::Estimated,
+            state,
         };
         GuidanceView {
-            motion: resource(&self.motion, vk::Format::R16G16_SFLOAT),
-            confidence: resource(&self.confidence, vk::Format::R8_UNORM),
-            disocclusion: resource(&self.disocclusion, vk::Format::R8_UNORM),
-            reactive: resource(&self.reactive, vk::Format::R8_UNORM),
-            exposure: resource(&self.exposure, vk::Format::R32_SFLOAT),
-            depth: resource(&self.depth, vk::Format::R32_SFLOAT),
-            transparency_composition: resource(&self.transparency, vk::Format::R8_UNORM),
+            motion: resource(
+                &self.motion,
+                vk::Format::R16G16_SFLOAT,
+                if estimated && !ablations.motion {
+                    SignalState::Estimated
+                } else {
+                    SignalState::ConstantFallback
+                },
+            ),
+            confidence: resource(
+                &self.confidence,
+                vk::Format::R8_UNORM,
+                if estimated && !ablations.confidence_disocclusion {
+                    SignalState::Estimated
+                } else {
+                    SignalState::ConstantFallback
+                },
+            ),
+            disocclusion: resource(
+                &self.disocclusion,
+                vk::Format::R8_UNORM,
+                if estimated && !ablations.confidence_disocclusion {
+                    SignalState::Estimated
+                } else {
+                    SignalState::ConstantFallback
+                },
+            ),
+            reactive: resource(
+                &self.reactive,
+                vk::Format::R8_UNORM,
+                if estimated && !ablations.reactive {
+                    SignalState::Estimated
+                } else {
+                    SignalState::ConstantFallback
+                },
+            ),
+            exposure: resource(
+                &self.exposure,
+                vk::Format::R32_SFLOAT,
+                if estimated && !ablations.exposure {
+                    SignalState::Estimated
+                } else {
+                    SignalState::ConstantFallback
+                },
+            ),
+            depth: resource(
+                &self.depth,
+                vk::Format::R32_SFLOAT,
+                if estimated && !ablations.relative_depth {
+                    SignalState::Estimated
+                } else {
+                    SignalState::ConstantFallback
+                },
+            ),
+            transparency_composition: resource(
+                &self.transparency,
+                vk::Format::R8_UNORM,
+                if estimated && !ablations.composition {
+                    SignalState::Estimated
+                } else {
+                    SignalState::ConstantFallback
+                },
+            ),
             pre_exposure: GuidanceScalar::constant_fallback(1.0),
             timing: FrameTiming {
                 raw: Duration::from_micros(16_667),
@@ -267,12 +539,35 @@ impl Images {
                 smoothed: Duration::from_micros(16_667),
             },
             jitter: JitterSample::default(),
-            depth_semantics: DepthSemantics::RelativeNearIsOne,
+            depth_semantics: if estimated && !ablations.relative_depth {
+                DepthSemantics::RelativeNearIsOne
+            } else {
+                DepthSemantics::FlatFallback
+            },
             direction: MotionDirection::CurrentToPrevious,
             units: MotionUnits::SourcePixels,
             resolution: GuidanceResolution::new(extent, extent),
             requires_history_reset: metadata.requires_history_reset,
         }
+    }
+}
+
+fn summarize_guidance(guidance: GuidanceView) -> GuidanceSummary {
+    GuidanceSummary {
+        metadata_is_zero: guidance.motion.metadata.is_zero,
+        states: [
+            guidance.motion.state,
+            guidance.confidence.state,
+            guidance.disocclusion.state,
+            guidance.reactive.state,
+            guidance.exposure.state,
+            guidance.depth.state,
+            guidance.transparency_composition.state,
+        ],
+        depth_semantics: guidance.depth_semantics,
+        jitter: guidance.jitter,
+        requires_history_reset: guidance.requires_history_reset,
+        coherent_fallbacks: guidance.has_coherent_fallbacks(),
     }
 }
 
@@ -351,40 +646,73 @@ unsafe fn upload_frame(
     fixture: &SequenceFixture,
     source_bytes: &[u8],
     first: bool,
+    zero_guidance: bool,
+    ablations: GuidanceAblations,
 ) {
+    let pixel_count = (INPUT.width * INPUT.height) as usize;
+    let zero_motion = zero_guidance || ablations.motion;
+    let zero_confidence = zero_guidance || ablations.confidence_disocclusion;
+    let flat_depth = zero_guidance || ablations.relative_depth;
     let motion = fixture
         .motion
         .iter()
-        .flat_map(|value| [f32_to_f16(value[0]), f32_to_f16(value[1])])
+        .flat_map(|value| {
+            if zero_motion {
+                [f32_to_f16(0.0), f32_to_f16(0.0)]
+            } else {
+                [f32_to_f16(value[0]), f32_to_f16(value[1])]
+            }
+        })
         .flat_map(u16::to_ne_bytes)
         .collect::<Vec<_>>();
-    let confidence = fixture
-        .valid
-        .iter()
-        .map(|valid| u8::from(*valid) * 255)
-        .collect::<Vec<_>>();
-    let disocclusion = fixture
-        .occlusion
-        .iter()
-        .map(|value| u8::from(*value) * 255)
-        .collect::<Vec<_>>();
-    let reactive = fixture
-        .transparency
-        .iter()
-        .map(|value| u8::from(*value) * 255)
-        .collect::<Vec<_>>();
-    let transparency = fixture
-        .transparency
-        .iter()
-        .zip(fixture.hud.iter())
-        .map(|(composition, hud)| u8::from(*composition || *hud) * 255)
-        .collect::<Vec<_>>();
+    let confidence = if zero_confidence {
+        vec![0; pixel_count]
+    } else {
+        fixture
+            .valid
+            .iter()
+            .map(|valid| u8::from(*valid) * 255)
+            .collect::<Vec<_>>()
+    };
+    let disocclusion = if zero_confidence {
+        vec![255; pixel_count]
+    } else {
+        fixture
+            .occlusion
+            .iter()
+            .map(|value| u8::from(*value) * 255)
+            .collect::<Vec<_>>()
+    };
+    let reactive = if zero_guidance || ablations.reactive {
+        vec![0; pixel_count]
+    } else {
+        fixture
+            .transparency
+            .iter()
+            .map(|value| u8::from(*value) * 255)
+            .collect::<Vec<_>>()
+    };
+    let transparency = if zero_guidance || ablations.composition {
+        vec![0; pixel_count]
+    } else {
+        fixture
+            .transparency
+            .iter()
+            .zip(fixture.hud.iter())
+            .map(|(composition, hud)| u8::from(*composition || *hud) * 255)
+            .collect::<Vec<_>>()
+    };
     let depth = fixture
         .depth
         .iter()
+        .map(|value| if flat_depth { 1.0 } else { *value })
         .flat_map(|value| value.to_ne_bytes())
         .collect::<Vec<_>>();
-    let exposure = fixture.exposure_ev.exp2().to_ne_bytes();
+    let exposure = if zero_guidance || ablations.exposure {
+        1.0_f32.to_ne_bytes()
+    } else {
+        fixture.exposure_ev.exp2().to_ne_bytes()
+    };
     unsafe {
         uploads.source.write(source_bytes).unwrap();
         uploads.motion.write(&motion).unwrap();
@@ -539,9 +867,40 @@ unsafe fn run_fsr_case(
     source_bytes: &[u8],
     second_source_bytes: &[u8],
 ) -> (Vec<[f32; 4]>, Vec<[f32; 4]>) {
+    let result = unsafe {
+        run_fsr_variant(
+            gpu,
+            environment,
+            fixture,
+            source_bytes,
+            second_source_bytes,
+            false,
+            GuidanceAblations::NONE,
+        )
+    };
+    (result.first, result.second)
+}
+
+unsafe fn run_fsr_variant(
+    gpu: &Gpu,
+    environment: &BackendEnvironment,
+    fixture: &SequenceFixture,
+    source_bytes: &[u8],
+    second_source_bytes: &[u8],
+    zero_guidance: bool,
+    ablations: GuidanceAblations,
+) -> FsrVariantResult {
     let images = unsafe { Images::new(gpu) };
     let uploads = unsafe { Uploads::new(gpu) };
-    let guidance = images.guidance(fixture, 1, true);
+    let guidance = images.guidance_with_controls(fixture, 1, true, zero_guidance, ablations);
+    assert!(guidance.is_valid_for(
+        1,
+        FrameExtent {
+            width: INPUT.width,
+            height: INPUT.height,
+        }
+    ));
+    let first_guidance = summarize_guidance(guidance);
     let config = BackendConfig {
         game_extent: INPUT,
         output_extent: OUTPUT,
@@ -552,7 +911,18 @@ unsafe fn run_fsr_case(
         guidance: guidance.capabilities(),
     };
     let mut backend = unsafe { Fsr314Upscaler::new(environment, config, guidance, 1) }.unwrap();
-    unsafe { upload_frame(gpu, &images, &uploads, fixture, source_bytes, true) };
+    unsafe {
+        upload_frame(
+            gpu,
+            &images,
+            &uploads,
+            fixture,
+            source_bytes,
+            true,
+            zero_guidance,
+            ablations,
+        )
+    };
     let first = unsafe {
         run_backend_frame(
             gpu,
@@ -565,8 +935,28 @@ unsafe fn run_fsr_case(
             true,
         )
     };
-    let second_guidance = images.guidance(fixture, 2, false);
-    unsafe { upload_frame(gpu, &images, &uploads, fixture, second_source_bytes, false) };
+    let second_guidance =
+        images.guidance_with_controls(fixture, 2, false, zero_guidance, ablations);
+    assert!(second_guidance.is_valid_for(
+        2,
+        FrameExtent {
+            width: INPUT.width,
+            height: INPUT.height,
+        }
+    ));
+    let second_guidance_summary = summarize_guidance(second_guidance);
+    unsafe {
+        upload_frame(
+            gpu,
+            &images,
+            &uploads,
+            fixture,
+            second_source_bytes,
+            false,
+            zero_guidance,
+            ablations,
+        )
+    };
     let second = unsafe {
         run_backend_frame(
             gpu,
@@ -575,11 +965,16 @@ unsafe fn run_fsr_case(
             &mut backend,
             second_guidance,
             2,
-            false,
+            second_guidance.requires_history_reset,
             false,
         )
     };
-    (first, second)
+    FsrVariantResult {
+        first,
+        second,
+        first_guidance,
+        second_guidance: second_guidance_summary,
+    }
 }
 
 unsafe fn run_reference_case(
@@ -604,7 +999,18 @@ unsafe fn run_reference_case(
         )
     }
     .unwrap();
-    unsafe { upload_frame(gpu, &images, &uploads, fixture, source_bytes, true) };
+    unsafe {
+        upload_frame(
+            gpu,
+            &images,
+            &uploads,
+            fixture,
+            source_bytes,
+            true,
+            false,
+            GuidanceAblations::NONE,
+        )
+    };
     unsafe {
         run_backend_frame(
             gpu,

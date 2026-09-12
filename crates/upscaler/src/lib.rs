@@ -307,6 +307,20 @@ impl BackendFrame {
         if !self.guidance.is_valid_for(self.frame_id, extent) {
             return Err(BackendError::InvalidMetadata("guidance view"));
         }
+        let has_estimated_signal = self
+            .guidance
+            .capabilities()
+            .estimated
+            .into_iter()
+            .any(|value| value);
+        if self.guidance.motion.metadata.is_zero
+            && !has_estimated_signal
+            && !self.guidance.has_coherent_fallbacks()
+        {
+            return Err(BackendError::InvalidMetadata(
+                "incoherent zero guidance fallback",
+            ));
+        }
         for signal in all_guidance_signals() {
             if capabilities.required_guidance[signal as usize]
                 && self.guidance.resource(signal).state == SignalState::Unavailable
@@ -846,6 +860,26 @@ mod tests {
             })
             .unwrap();
         backend.reset().unwrap();
+    }
+
+    #[test]
+    fn zero_guidance_requires_coherent_fallback_resources() {
+        let mut guidance = guidance();
+        for resource in [
+            &mut guidance.motion,
+            &mut guidance.confidence,
+            &mut guidance.disocclusion,
+            &mut guidance.reactive,
+            &mut guidance.exposure,
+            &mut guidance.depth,
+            &mut guidance.transparency_composition,
+        ] {
+            resource.state = SignalState::ConstantFallback;
+            resource.metadata.is_zero = true;
+        }
+        assert!(guidance.has_coherent_fallbacks());
+        guidance.reactive.state = SignalState::Unavailable;
+        assert!(!guidance.has_coherent_fallbacks());
     }
 
     const GAME: vk::Extent2D = vk::Extent2D {

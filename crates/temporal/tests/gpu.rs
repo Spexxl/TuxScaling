@@ -3,9 +3,9 @@
 use ash::vk;
 use tuxscaling_motion::MotionEstimator;
 use tuxscaling_temporal::{
-    DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResolution,
-    GuidanceResolver, GuidanceResource, GuidanceScalar, GuidanceView, JitterSample,
-    MotionDirection, MotionUnits, SignalState, ValidRegion,
+    DepthSemantics, FrameExtent, FrameTiming, GuidanceAblations, GuidanceMetadata, GuidanceReset,
+    GuidanceResolution, GuidanceResolver, GuidanceResource, GuidanceScalar, GuidanceView,
+    JitterSample, MotionDirection, MotionUnits, SignalState, ValidRegion,
 };
 use tuxscaling_vulkan::{Buffer, Image, image_barrier, memory_barrier};
 
@@ -26,6 +26,15 @@ type GuidanceOutputs = (
     DepthSemantics,
     bool,
 );
+
+struct GuidanceControlOutputs {
+    outputs: GuidanceOutputs,
+    motion: Vec<u8>,
+    confidence: Vec<u8>,
+    view_states: [SignalState; 7],
+    jitter: JitterSample,
+    coherent_fallbacks: bool,
+}
 
 #[test]
 fn guidance_shader_contains_reprojected_mask_and_exposure_producers() {
@@ -387,7 +396,7 @@ fn guidance_shader_contains_relative_depth_and_gradient_rejection_producers() {
     assert!(reconstruct.contains("depth_discontinuity"));
     assert!(!reconstruct.contains("* clamp(depth, 0.0, 1.0)"));
     let runtime = include_str!("../../../crates/runtime/src/present.rs");
-    assert!(runtime.contains("guidance.view("));
+    assert!(runtime.contains("guidance.view_with_controls("));
 }
 
 #[test]
@@ -406,7 +415,7 @@ fn production_depth_status_is_slot_scoped() {
     let runtime = include_str!("../../runtime/src/present.rs");
     assert!(gpu.contains("depth_models: Vec<Buffer>"));
     assert!(gpu.contains("depth_descriptor_sets: Vec<vk::DescriptorSet>"));
-    assert!(runtime.contains("record_with_timing_for_slot"));
+    assert!(runtime.contains("record_with_ablation_for_slot"));
     assert!(runtime.contains("record_provider_failure_for_slot"));
 }
 
@@ -701,6 +710,38 @@ unsafe fn clear_motion(gpu: &Gpu, motion: &Image, value: [f32; 4]) {
                 device,
                 command,
                 motion.handle,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::GENERAL,
+            );
+        });
+    }
+}
+
+unsafe fn clear_image(gpu: &Gpu, image: &Image, value: [f32; 4]) {
+    let device = &gpu.device;
+    unsafe {
+        gpu.submit(|command| {
+            image_barrier(
+                device,
+                command,
+                image.handle,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            );
+            device.cmd_clear_color_image(
+                command,
+                image.handle,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearColorValue { float32: value },
+                &[vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1)],
+            );
+            image_barrier(
+                device,
+                command,
+                image.handle,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::ImageLayout::GENERAL,
             );
@@ -1100,14 +1141,17 @@ unsafe fn guidance_masks_with_options(
     provider_failure: bool,
 ) -> GuidanceOutputs {
     unsafe {
-        guidance_masks_with_field_options(
+        guidance_masks_with_field_controls(
             extent,
             previous_pixels,
             current_pixels,
             forced_motion,
             None,
             provider_failure,
+            false,
+            GuidanceAblations::NONE,
         )
+        .outputs
     }
 }
 
@@ -1119,6 +1163,32 @@ unsafe fn guidance_masks_with_field_options(
     forced_motion_field: Option<&[[f32; 2]]>,
     provider_failure: bool,
 ) -> GuidanceOutputs {
+    unsafe {
+        guidance_masks_with_field_controls(
+            extent,
+            previous_pixels,
+            current_pixels,
+            forced_motion,
+            forced_motion_field,
+            provider_failure,
+            false,
+            GuidanceAblations::NONE,
+        )
+        .outputs
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn guidance_masks_with_field_controls(
+    extent: vk::Extent2D,
+    previous_pixels: &[u8],
+    current_pixels: &[u8],
+    forced_motion: Option<[f32; 4]>,
+    forced_motion_field: Option<&[[f32; 2]]>,
+    provider_failure: bool,
+    zero_guidance: bool,
+    ablations: GuidanceAblations,
+) -> GuidanceControlOutputs {
     unsafe {
         let gpu = Gpu::new();
         let device = &gpu.device;
@@ -1161,6 +1231,12 @@ unsafe fn guidance_masks_with_field_options(
         if let Some(forced_motion_field) = forced_motion_field {
             clear_motion_field(&gpu, &motion.vectors, forced_motion_field, extent);
         }
+        if zero_guidance || ablations.motion {
+            clear_motion(&gpu, &motion.vectors, [0.0, 0.0, 0.0, 0.0]);
+        }
+        if zero_guidance || ablations.confidence_disocclusion {
+            clear_image(&gpu, &motion.confidence, [0.0, 0.0, 0.0, 0.0]);
+        }
         upload.write(previous_pixels).unwrap();
         copy_upload(&gpu, &previous, &upload, extent);
         let mut guidance = tuxscaling_temporal::GuidanceEstimator::new(
@@ -1181,10 +1257,12 @@ unsafe fn guidance_masks_with_field_options(
         let transparency_offset = count * 2;
         let exposure_offset = count * 3;
         let depth_offset = exposure_offset + 4;
+        let motion_offset = depth_offset + count * 4;
+        let confidence_offset = motion_offset + count * 4;
         let readback = Buffer::new(
             device,
             &gpu.memory,
-            depth_offset + count * 4,
+            confidence_offset + count,
             vk::BufferUsageFlags::TRANSFER_DST,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )
@@ -1192,8 +1270,17 @@ unsafe fn guidance_masks_with_field_options(
         gpu.submit(|command| {
             if provider_failure {
                 guidance.record_provider_failure(command);
-            } else {
+            } else if !zero_guidance && !ablations.any() {
                 guidance.record(command, true);
+            } else {
+                guidance.record_with_ablation_for_slot(
+                    command,
+                    true,
+                    FrameTiming::default(),
+                    0,
+                    zero_guidance,
+                    ablations,
+                );
             }
             for (image, offset) in [
                 (&guidance.reactive, reactive_offset),
@@ -1276,6 +1363,38 @@ unsafe fn guidance_masks_with_field_options(
                         depth: 1,
                     })],
             );
+            if zero_guidance || ablations.any() {
+                for (image, offset, extent) in [
+                    (&motion.vectors, motion_offset, extent),
+                    (&motion.confidence, confidence_offset, extent),
+                ] {
+                    image_barrier(
+                        device,
+                        command,
+                        image.handle,
+                        vk::ImageLayout::GENERAL,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    );
+                    device.cmd_copy_image_to_buffer(
+                        command,
+                        image.handle,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        readback.handle,
+                        &[vk::BufferImageCopy::default()
+                            .buffer_offset(offset)
+                            .image_subresource(
+                                vk::ImageSubresourceLayers::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .layer_count(1),
+                            )
+                            .image_extent(vk::Extent3D {
+                                width: extent.width,
+                                height: extent.height,
+                                depth: 1,
+                            })],
+                    );
+                }
+            }
             memory_barrier(device, command);
         });
         let mut bytes = vec![0u8; readback.size as usize];
@@ -1291,19 +1410,35 @@ unsafe fn guidance_masks_with_field_options(
                 f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
             })
             .collect::<Vec<_>>();
-        let view = guidance.view(
-            &motion,
-            1,
-            extent,
-            !provider_failure,
-            tuxscaling_temporal::FrameTiming::default(),
-            if provider_failure {
-                GuidanceReset::ProviderFailure
-            } else {
-                GuidanceReset::None
-            },
-        );
-        (
+        let reset = if provider_failure {
+            GuidanceReset::ProviderFailure
+        } else if zero_guidance {
+            GuidanceReset::PresetChanged
+        } else {
+            GuidanceReset::None
+        };
+        let view = if !zero_guidance && !ablations.any() {
+            guidance.view(
+                &motion,
+                1,
+                extent,
+                !provider_failure,
+                tuxscaling_temporal::FrameTiming::default(),
+                reset,
+            )
+        } else {
+            guidance.view_with_controls(
+                &motion,
+                1,
+                extent,
+                !provider_failure,
+                tuxscaling_temporal::FrameTiming::default(),
+                reset,
+                zero_guidance,
+                ablations,
+            )
+        };
+        let outputs = (
             bytes[reactive_offset as usize..disocclusion_offset as usize].to_vec(),
             bytes[disocclusion_offset as usize..transparency_offset as usize].to_vec(),
             bytes[transparency_offset as usize..exposure_offset as usize].to_vec(),
@@ -1318,7 +1453,25 @@ unsafe fn guidance_masks_with_field_options(
             view.depth.state,
             view.depth_semantics,
             view.requires_history_reset,
-        )
+        );
+        GuidanceControlOutputs {
+            outputs,
+            motion: bytes[motion_offset as usize..confidence_offset as usize].to_vec(),
+            confidence: bytes
+                [confidence_offset as usize..confidence_offset as usize + count as usize]
+                .to_vec(),
+            view_states: [
+                view.motion.state,
+                view.confidence.state,
+                view.disocclusion.state,
+                view.reactive.state,
+                view.exposure.state,
+                view.depth.state,
+                view.transparency_composition.state,
+            ],
+            jitter: view.jitter,
+            coherent_fallbacks: view.has_coherent_fallbacks(),
+        }
     }
 }
 
@@ -1649,6 +1802,66 @@ fn provider_failure_writes_fallback_guidance_and_labels_the_view() {
     assert!((exposure - 1.0).abs() <= f32::EPSILON);
     assert_eq!(states, [SignalState::ConstantFallback; 4]);
     assert!(reset);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn zero_guidance_dispatches_coherent_fallback_resources() {
+    let extent = vk::Extent2D {
+        width: 32,
+        height: 24,
+    };
+    let (previous, current, _) = translated_flow_fixture(extent, 4, 0);
+    let result = unsafe {
+        guidance_masks_with_field_controls(
+            extent,
+            &previous,
+            &current,
+            None,
+            None,
+            false,
+            true,
+            GuidanceAblations::NONE,
+        )
+    };
+    let (
+        reactive,
+        disocclusion,
+        transparency,
+        depth,
+        exposure,
+        states,
+        depth_state,
+        semantics,
+        reset,
+    ) = result.outputs;
+
+    assert!(
+        result
+            .motion
+            .as_slice()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|value| value == &[0; 4])
+    );
+    assert!(result.confidence.iter().all(|value| *value == 0));
+    assert!(reactive.iter().all(|value| *value == 0));
+    assert!(transparency.iter().all(|value| *value == 0));
+    assert!(disocclusion.iter().all(|value| *value == 255));
+    assert!((exposure - 1.0).abs() <= f32::EPSILON);
+    assert!(
+        depth
+            .iter()
+            .all(|value| (*value - 1.0).abs() <= f32::EPSILON)
+    );
+    assert_eq!(states, [SignalState::ConstantFallback; 4]);
+    assert_eq!(result.view_states, [SignalState::ConstantFallback; 7]);
+    assert_eq!(result.jitter, JitterSample::default());
+    assert_eq!(depth_state, SignalState::ConstantFallback);
+    assert_eq!(semantics, DepthSemantics::FlatFallback);
+    assert!(reset);
+    assert!(result.coherent_fallbacks);
 }
 
 #[test]

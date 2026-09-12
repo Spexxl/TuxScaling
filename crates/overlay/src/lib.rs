@@ -20,6 +20,20 @@ pub struct FrameDiagnostics {
     pub requested_guidance_scale: Option<f32>,
     pub active_guidance_mode: GuidanceMode,
     pub requested_guidance_mode: Option<GuidanceMode>,
+    pub active_ablation_motion: bool,
+    pub requested_ablation_motion: Option<bool>,
+    pub active_ablation_relative_depth: bool,
+    pub requested_ablation_relative_depth: Option<bool>,
+    pub active_ablation_reactive: bool,
+    pub requested_ablation_reactive: Option<bool>,
+    pub active_ablation_composition: bool,
+    pub requested_ablation_composition: Option<bool>,
+    pub active_ablation_exposure: bool,
+    pub requested_ablation_exposure: Option<bool>,
+    pub active_ablation_confidence_disocclusion: bool,
+    pub requested_ablation_confidence_disocclusion: Option<bool>,
+    pub active_ablation_post_capture_jitter: bool,
+    pub requested_ablation_post_capture_jitter: Option<bool>,
     pub active_sharpening_enabled: bool,
     pub requested_sharpening_enabled: Option<bool>,
     pub active_sharpness: f32,
@@ -178,6 +192,13 @@ pub fn render_diagnostics(
     diagnostics.requested_upscaler = None;
     diagnostics.requested_guidance_scale = None;
     diagnostics.requested_guidance_mode = None;
+    diagnostics.requested_ablation_motion = None;
+    diagnostics.requested_ablation_relative_depth = None;
+    diagnostics.requested_ablation_reactive = None;
+    diagnostics.requested_ablation_composition = None;
+    diagnostics.requested_ablation_exposure = None;
+    diagnostics.requested_ablation_confidence_disocclusion = None;
+    diagnostics.requested_ablation_post_capture_jitter = None;
     diagnostics.requested_sharpening_enabled = None;
     diagnostics.requested_sharpness = None;
     diagnostics.requested_comparison_enabled = None;
@@ -281,6 +302,50 @@ pub fn render_diagnostics(
                                 }
                             }
                         });
+                    ui.label("Diagnostic signal ablations");
+                    ablation_checkbox(
+                        ui,
+                        "Motion",
+                        diagnostics.active_ablation_motion,
+                        &mut diagnostics.requested_ablation_motion,
+                    );
+                    ablation_checkbox(
+                        ui,
+                        "Relative depth",
+                        diagnostics.active_ablation_relative_depth,
+                        &mut diagnostics.requested_ablation_relative_depth,
+                    );
+                    ablation_checkbox(
+                        ui,
+                        "Reactive mask",
+                        diagnostics.active_ablation_reactive,
+                        &mut diagnostics.requested_ablation_reactive,
+                    );
+                    ablation_checkbox(
+                        ui,
+                        "Composition mask",
+                        diagnostics.active_ablation_composition,
+                        &mut diagnostics.requested_ablation_composition,
+                    );
+                    ablation_checkbox(
+                        ui,
+                        "Exposure",
+                        diagnostics.active_ablation_exposure,
+                        &mut diagnostics.requested_ablation_exposure,
+                    );
+                    ablation_checkbox(
+                        ui,
+                        "Confidence/disocclusion",
+                        diagnostics.active_ablation_confidence_disocclusion,
+                        &mut diagnostics.requested_ablation_confidence_disocclusion,
+                    );
+                    ablation_checkbox(
+                        ui,
+                        "Experimental post-capture jitter",
+                        diagnostics.active_ablation_post_capture_jitter,
+                        &mut diagnostics.requested_ablation_post_capture_jitter,
+                    );
+                    ui.small("Ablations are diagnostic only and reset temporal history.");
                     ui.label(format!(
                         "Guidance scale: {:.0}%",
                         diagnostics.guidance_scale * 100.0
@@ -509,6 +574,14 @@ pub fn render_diagnostics(
         requested_quality: diagnostics.requested_quality,
         requested_guidance_scale: diagnostics.requested_guidance_scale,
         requested_guidance_mode: diagnostics.requested_guidance_mode,
+        requested_ablation_motion: diagnostics.requested_ablation_motion,
+        requested_ablation_relative_depth: diagnostics.requested_ablation_relative_depth,
+        requested_ablation_reactive: diagnostics.requested_ablation_reactive,
+        requested_ablation_composition: diagnostics.requested_ablation_composition,
+        requested_ablation_exposure: diagnostics.requested_ablation_exposure,
+        requested_ablation_confidence_disocclusion: diagnostics
+            .requested_ablation_confidence_disocclusion,
+        requested_ablation_post_capture_jitter: diagnostics.requested_ablation_post_capture_jitter,
         requested_sharpening_enabled: diagnostics.requested_sharpening_enabled,
         requested_sharpness: diagnostics.requested_sharpness,
         requested_comparison_enabled: diagnostics.requested_comparison_enabled,
@@ -516,6 +589,13 @@ pub fn render_diagnostics(
         requested_jitter_mode: diagnostics.requested_jitter_mode,
         requested_debug_view: diagnostics.requested_debug_view,
         software_cursor_visible,
+    }
+}
+
+fn ablation_checkbox(ui: &mut egui::Ui, label: &str, active: bool, requested: &mut Option<bool>) {
+    let mut selected = active;
+    if ui.checkbox(&mut selected, label).changed() {
+        *requested = Some(selected);
     }
 }
 
@@ -570,6 +650,13 @@ pub struct OverlayFrame {
     pub requested_quality: Option<MotionQuality>,
     pub requested_guidance_scale: Option<f32>,
     pub requested_guidance_mode: Option<GuidanceMode>,
+    pub requested_ablation_motion: Option<bool>,
+    pub requested_ablation_relative_depth: Option<bool>,
+    pub requested_ablation_reactive: Option<bool>,
+    pub requested_ablation_composition: Option<bool>,
+    pub requested_ablation_exposure: Option<bool>,
+    pub requested_ablation_confidence_disocclusion: Option<bool>,
+    pub requested_ablation_post_capture_jitter: Option<bool>,
     pub requested_sharpening_enabled: Option<bool>,
     pub requested_sharpness: Option<f32>,
     pub requested_comparison_enabled: Option<bool>,
@@ -613,6 +700,13 @@ pub fn render_smoke_frame(
         requested_quality: None,
         requested_guidance_scale: None,
         requested_guidance_mode: None,
+        requested_ablation_motion: None,
+        requested_ablation_relative_depth: None,
+        requested_ablation_reactive: None,
+        requested_ablation_composition: None,
+        requested_ablation_exposure: None,
+        requested_ablation_confidence_disocclusion: None,
+        requested_ablation_post_capture_jitter: None,
         requested_sharpening_enabled: None,
         requested_sharpness: None,
         requested_comparison_enabled: None,
@@ -708,6 +802,8 @@ mod tests {
         diagnostics.requested_upscaler = Some(Upscaler::Off);
         diagnostics.requested_quality = Some(MotionQuality::Performance);
         diagnostics.requested_guidance_mode = Some(GuidanceMode::Zero);
+        diagnostics.active_ablation_motion = true;
+        diagnostics.requested_ablation_motion = Some(false);
         diagnostics.requested_sharpening_enabled = Some(false);
         diagnostics.requested_sharpness = Some(1.0);
         diagnostics.requested_comparison_enabled = Some(true);
@@ -730,6 +826,8 @@ mod tests {
             diagnostics.requested_guidance_mode,
             Some(GuidanceMode::Zero)
         );
+        assert!(diagnostics.active_ablation_motion);
+        assert_eq!(diagnostics.requested_ablation_motion, Some(false));
         assert!(diagnostics.active_sharpening_enabled);
         assert_eq!(diagnostics.requested_sharpening_enabled, Some(false));
         assert_eq!(diagnostics.active_sharpness, 0.2);
