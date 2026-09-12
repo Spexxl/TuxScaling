@@ -245,6 +245,8 @@ impl OverlayRenderer {
             diagnostics,
             &input.events,
             self.visible,
+            input.pointer_position,
+            input.pointer_present,
         );
         for slot in &mut self.slots {
             slot.pending_textures

@@ -182,6 +182,10 @@ impl PresenterWindow {
         }
     }
 
+    pub const fn cursor_hidden(&self) -> bool {
+        self.cursor_hidden
+    }
+
     pub fn hide_cursor(&mut self) -> Result<(), DisplayError> {
         if self.destroyed || self.cursor_hidden {
             return Ok(());

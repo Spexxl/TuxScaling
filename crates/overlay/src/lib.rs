@@ -1,4 +1,7 @@
-use egui::{ClippedPrimitive, Context, RawInput, Rect, TexturesDelta, vec2};
+use egui::{
+    ClippedPrimitive, Color32, Context, Id, LayerId, Order, Pos2, RawInput, Rect, Shape, Stroke,
+    TexturesDelta, vec2,
+};
 use tuxscaling_config::{DebugView, JitterMode, MotionQuality, Upscaler};
 
 pub const CRATE_NAME: &str = "tuxscaling-overlay";
@@ -96,18 +99,51 @@ pub fn guidance_scale_request(value: f32) -> Option<f32> {
         .filter(|value| (0.5..=1.0).contains(value))
 }
 
+pub fn software_cursor_is_visible(
+    overlay_owns_input: bool,
+    pointer_present: bool,
+    pointer_position: Option<[f32; 2]>,
+) -> bool {
+    overlay_owns_input
+        && pointer_present
+        && pointer_position.is_some_and(|position| position.iter().all(|value| value.is_finite()))
+}
+
+fn paint_software_cursor(context: &Context, position: [f32; 2]) {
+    let painter = context.layer_painter(LayerId::new(
+        Order::Foreground,
+        Id::new("tuxscaling-software-cursor"),
+    ));
+    let tip = Pos2::new(position[0], position[1]);
+    let points = vec![
+        tip,
+        Pos2::new(position[0] + 8.0, position[1] + 23.0),
+        Pos2::new(position[0] + 14.0, position[1] + 16.0),
+        Pos2::new(position[0] + 23.0, position[1] + 20.0),
+    ];
+    painter.add(Shape::convex_polygon(
+        points,
+        Color32::WHITE,
+        Stroke::new(1.0_f32, Color32::BLACK),
+    ));
+}
+
 pub fn render_diagnostics(
     context: &Context,
     size: [u32; 2],
     diagnostics: &mut FrameDiagnostics,
     events: &[egui::Event],
     visible: bool,
+    pointer_position: Option<[f32; 2]>,
+    pointer_present: bool,
 ) -> OverlayFrame {
     diagnostics.requested_quality = None;
     diagnostics.requested_upscaler = None;
     diagnostics.requested_guidance_scale = None;
     diagnostics.requested_jitter_mode = None;
     diagnostics.requested_debug_view = None;
+    let software_cursor_visible =
+        software_cursor_is_visible(visible, pointer_present, pointer_position);
     let output = context.run(
         RawInput {
             screen_rect: Some(Rect::from_min_size(
@@ -320,6 +356,12 @@ pub fn render_diagnostics(
                     }
                 });
             }
+            if software_cursor_visible {
+                paint_software_cursor(
+                    context,
+                    pointer_position.expect("visible cursor has a position"),
+                );
+            }
         },
     );
     OverlayFrame {
@@ -331,6 +373,7 @@ pub fn render_diagnostics(
         requested_guidance_scale: diagnostics.requested_guidance_scale,
         requested_jitter_mode: diagnostics.requested_jitter_mode,
         requested_debug_view: diagnostics.requested_debug_view,
+        software_cursor_visible,
     }
 }
 
@@ -372,6 +415,7 @@ pub struct OverlayFrame {
     pub requested_guidance_scale: Option<f32>,
     pub requested_jitter_mode: Option<JitterMode>,
     pub requested_debug_view: Option<DebugView>,
+    pub software_cursor_visible: bool,
 }
 
 pub fn render_smoke_frame(
@@ -409,6 +453,7 @@ pub fn render_smoke_frame(
         requested_guidance_scale: None,
         requested_jitter_mode: None,
         requested_debug_view: None,
+        software_cursor_visible: false,
     }
 }
 
@@ -436,7 +481,8 @@ impl Default for OverlayState {
 #[cfg(test)]
 mod tests {
     use super::{
-        OverlayState, debug_view_label, guidance_scale_request, render_smoke_frame, resolution_mode,
+        FrameDiagnostics, OverlayState, debug_view_label, guidance_scale_request,
+        render_diagnostics, render_smoke_frame, resolution_mode, software_cursor_is_visible,
     };
     use tuxscaling_config::{DebugView, Upscaler};
 
@@ -474,6 +520,44 @@ mod tests {
         assert_eq!(guidance_scale_request(0.49), None);
         assert_eq!(guidance_scale_request(1.01), None);
         assert_eq!(guidance_scale_request(f32::NAN), None);
+    }
+
+    #[test]
+    fn foreground_cursor_is_emitted_only_while_overlay_owns_a_present_pointer() {
+        let context = egui::Context::default();
+        let mut diagnostics = FrameDiagnostics::default();
+        let visible = render_diagnostics(
+            &context,
+            [640, 480],
+            &mut diagnostics,
+            &[],
+            true,
+            Some([120.0, 80.0]),
+            true,
+        );
+        assert!(visible.software_cursor_visible);
+        assert!(!visible.primitives.is_empty());
+
+        let hidden = render_diagnostics(
+            &context,
+            [640, 480],
+            &mut diagnostics,
+            &[],
+            false,
+            Some([120.0, 80.0]),
+            true,
+        );
+        assert!(!hidden.software_cursor_visible);
+        assert!(!software_cursor_is_visible(
+            false,
+            true,
+            Some([120.0, 80.0])
+        ));
+        assert!(!software_cursor_is_visible(
+            true,
+            false,
+            Some([120.0, 80.0])
+        ));
     }
 
     #[test]

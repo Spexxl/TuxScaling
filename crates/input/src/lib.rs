@@ -164,6 +164,8 @@ type WarpPointer = unsafe extern "C" fn(
 ) -> c_int;
 type FakeButtonEvent = unsafe extern "C" fn(*mut Display, c_uint, c_int, c_ulong) -> c_int;
 type FakeRelativeMotionEvent = unsafe extern "C" fn(*mut Display, c_int, c_int, c_ulong) -> c_int;
+type HideCursor = unsafe extern "C" fn(*mut Display, c_ulong) -> c_int;
+type ShowCursor = unsafe extern "C" fn(*mut Display, c_ulong) -> c_int;
 
 #[derive(Debug, Error)]
 pub enum InputError {
@@ -177,6 +179,37 @@ pub enum InputError {
 pub struct InputFrame {
     pub events: Vec<Event>,
     pub toggle_overlay: bool,
+    pub pointer_position: Option<[f32; 2]>,
+    pub pointer_present: bool,
+    pub cursor_owner: CursorOwner,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CursorOwner {
+    #[default]
+    Native,
+    Overlay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorCleanupReason {
+    OverlayClosed,
+    FocusLost,
+    PresenterDestroyed,
+    RendererError,
+    Panic,
+    ProcessExit,
+}
+
+pub const fn cursor_owner_after(_owner: CursorOwner, reason: CursorCleanupReason) -> CursorOwner {
+    match reason {
+        CursorCleanupReason::OverlayClosed
+        | CursorCleanupReason::FocusLost
+        | CursorCleanupReason::PresenterDestroyed
+        | CursorCleanupReason::RendererError
+        | CursorCleanupReason::Panic
+        | CursorCleanupReason::ProcessExit => CursorOwner::Native,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -286,6 +319,7 @@ pub fn should_forward_to_game(route: &InputRoute, overlay_open: bool) -> bool {
 pub struct X11Input {
     _library: Library,
     _xtest_library: Option<Library>,
+    _xfixes_library: Option<Library>,
     display: *mut Display,
     route: InputRoute,
     event_window: c_ulong,
@@ -293,6 +327,8 @@ pub struct X11Input {
     overlay_open: bool,
     pointer_mode: PointerMode,
     last_root: Option<[i32; 2]>,
+    last_position: Option<[f32; 2]>,
+    pointer_present: bool,
     pending: Pending,
     next_event: NextEvent,
     grab_keyboard: GrabKeyboard,
@@ -304,6 +340,8 @@ pub struct X11Input {
     warp_pointer: WarpPointer,
     fake_button: Option<FakeButtonEvent>,
     fake_relative_motion: Option<FakeRelativeMotionEvent>,
+    hide_cursor: Option<HideCursor>,
+    show_cursor: Option<ShowCursor>,
 }
 
 unsafe impl Send for X11Input {}
@@ -350,9 +388,17 @@ impl X11Input {
         let fake_relative_motion = xtest_library.as_ref().and_then(|library| {
             load::<FakeRelativeMotionEvent>(library, b"XTestFakeRelativeMotionEvent\0").ok()
         });
+        let xfixes_library = unsafe { Library::new("libXfixes.so.3") }.ok();
+        let hide_cursor = xfixes_library
+            .as_ref()
+            .and_then(|library| load::<HideCursor>(library, b"XFixesHideCursor\0").ok());
+        let show_cursor = xfixes_library
+            .as_ref()
+            .and_then(|library| load::<ShowCursor>(library, b"XFixesShowCursor\0").ok());
         let input = Self {
             _library: library,
             _xtest_library: xtest_library,
+            _xfixes_library: xfixes_library,
             display,
             route,
             event_window: if route.event_window == 0 {
@@ -364,6 +410,8 @@ impl X11Input {
             overlay_open: false,
             pointer_mode: PointerMode::Absolute,
             last_root: None,
+            last_position: None,
+            pointer_present: false,
             pending,
             next_event,
             grab_keyboard,
@@ -375,6 +423,8 @@ impl X11Input {
             warp_pointer,
             fake_button,
             fake_relative_motion,
+            hide_cursor,
+            show_cursor,
         };
         input.update_grab();
         let sync = load::<Sync>(&input._library, b"XSync\0")?;
@@ -385,6 +435,14 @@ impl X11Input {
     pub fn set_pointer_mode(&mut self, mode: PointerMode) {
         self.pointer_mode = mode;
         self.last_root = None;
+    }
+
+    pub fn cursor_owner(&self) -> CursorOwner {
+        if self.overlay_open {
+            CursorOwner::Overlay
+        } else {
+            CursorOwner::Native
+        }
     }
 
     pub fn poll(&mut self) -> InputFrame {
@@ -403,6 +461,7 @@ impl X11Input {
                         frame.toggle_overlay = true;
                         self.overlay_open = !self.overlay_open;
                         self.update_grab();
+                        self.update_cursor_visibility();
                         frame.events.push(key_event(true));
                     }
                 }
@@ -421,13 +480,15 @@ impl X11Input {
                         continue;
                     }
                     let root = [event.x_root, event.y_root];
+                    let position = [event.x as f32, event.y as f32];
                     let delta = self.last_root.map_or([0.0, 0.0], |last| {
                         [(root[0] - last[0]) as f32, (root[1] - last[1]) as f32]
                     });
                     self.last_root = Some(root);
+                    self.last_position = Some(position);
+                    self.pointer_present = true;
                     match self.pointer_mode {
                         PointerMode::Absolute => {
-                            let position = [event.x as f32, event.y as f32];
                             if self.overlay_open {
                                 frame
                                     .events
@@ -527,8 +588,14 @@ impl X11Input {
                     if !should_accept_event(&self.route, event.window) || event.send_event != 0 {
                         continue;
                     }
-                    if self.overlay_open && kind == LEAVE_NOTIFY {
-                        frame.events.push(Event::PointerGone);
+                    if kind == ENTER_NOTIFY {
+                        self.last_position = Some([event.x as f32, event.y as f32]);
+                        self.pointer_present = true;
+                    } else {
+                        self.pointer_present = false;
+                        if self.overlay_open {
+                            frame.events.push(Event::PointerGone);
+                        }
                     }
                 }
                 FOCUS_IN | FOCUS_OUT => {
@@ -539,10 +606,22 @@ impl X11Input {
                     if self.overlay_open {
                         frame.events.push(Event::WindowFocused(kind == FOCUS_IN));
                     }
+                    if kind == FOCUS_OUT {
+                        self.pointer_present = false;
+                        if self.overlay_open {
+                            self.overlay_open = false;
+                            self.update_grab();
+                            self.update_cursor_visibility();
+                            frame.toggle_overlay = true;
+                        }
+                    }
                 }
                 _ => {}
             }
         }
+        frame.pointer_position = self.last_position;
+        frame.pointer_present = self.pointer_present;
+        frame.cursor_owner = self.cursor_owner();
         frame
     }
 
@@ -570,6 +649,36 @@ impl X11Input {
         }
         unsafe {
             (self.flush)(self.display);
+        }
+    }
+
+    fn update_cursor_visibility(&self) {
+        if self.overlay_open {
+            self.hide_native_cursor();
+        } else {
+            self.show_native_cursor();
+        }
+    }
+
+    fn hide_native_cursor(&self) {
+        if let Some(hide_cursor) = self.hide_cursor
+            && self.event_window != 0
+        {
+            unsafe {
+                hide_cursor(self.display, self.event_window);
+                (self.flush)(self.display);
+            }
+        }
+    }
+
+    fn show_native_cursor(&self) {
+        if let Some(show_cursor) = self.show_cursor
+            && self.event_window != 0
+        {
+            unsafe {
+                show_cursor(self.display, self.event_window);
+                (self.flush)(self.display);
+            }
         }
     }
 
@@ -627,6 +736,7 @@ impl Drop for X11Input {
     fn drop(&mut self) {
         if !self.display.is_null() {
             unsafe {
+                self.show_native_cursor();
                 (self.ungrab_keyboard)(self.display, 0);
                 (self.ungrab_pointer)(self.display, 0);
                 (self.close_display)(self.display);
@@ -671,8 +781,8 @@ fn modifiers(state: c_uint) -> Modifiers {
 #[cfg(test)]
 mod tests {
     use super::{
-        InputRoute, PointerMode, PointerViewport, pointer_button, route_pointer,
-        should_accept_event, should_forward_to_game,
+        CursorOwner, InputFrame, InputRoute, PointerMode, PointerViewport, pointer_button,
+        route_pointer, should_accept_event, should_forward_to_game,
     };
     use egui::PointerButton;
 
@@ -780,5 +890,31 @@ mod tests {
             ),
             false,
         ));
+    }
+
+    #[test]
+    fn input_frame_defaults_to_native_cursor_ownership_without_pointer_presence() {
+        let frame = InputFrame::default();
+
+        assert_eq!(frame.cursor_owner, CursorOwner::Native);
+        assert!(!frame.pointer_present);
+        assert_eq!(frame.pointer_position, None);
+    }
+
+    #[test]
+    fn every_overlay_cleanup_path_restores_native_cursor_ownership() {
+        for reason in [
+            super::CursorCleanupReason::OverlayClosed,
+            super::CursorCleanupReason::FocusLost,
+            super::CursorCleanupReason::PresenterDestroyed,
+            super::CursorCleanupReason::RendererError,
+            super::CursorCleanupReason::Panic,
+            super::CursorCleanupReason::ProcessExit,
+        ] {
+            assert_eq!(
+                super::cursor_owner_after(CursorOwner::Overlay, reason),
+                CursorOwner::Native
+            );
+        }
     }
 }
