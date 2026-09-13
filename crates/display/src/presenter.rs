@@ -105,8 +105,7 @@ impl PresenterWindow {
         let attributes = CreateWindowAux::new()
             .background_pixel(screen.black_pixel)
             .border_pixel(screen.black_pixel)
-            .override_redirect(1)
-            .event_mask(presenter_event_mask());
+            .override_redirect(1);
         connection
             .create_window(
                 COPY_DEPTH_FROM_PARENT,
