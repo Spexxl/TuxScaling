@@ -2256,11 +2256,55 @@ fn run_visual_quality(root: &Path, options: &VisualQualityOptions) -> bool {
 struct ProtonAcceptanceOptions {
     evidence_dir: PathBuf,
     game_command: Vec<String>,
+    preflight_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProtonLauncherProbe {
+    proton: bool,
+    wine: bool,
+    wine64: bool,
+}
+
+impl ProtonLauncherProbe {
+    const fn ready(self) -> bool {
+        self.proton || self.wine || self.wine64
+    }
+}
+
+fn proton_launchers_on_path(path: &std::ffi::OsStr) -> ProtonLauncherProbe {
+    let directories = std::env::split_paths(path).collect::<Vec<_>>();
+    let present = |name: &str| {
+        directories.iter().any(|directory| {
+            let candidate = directory.join(name);
+            candidate.is_file() && executable_file(&candidate)
+        })
+    };
+    ProtonLauncherProbe {
+        proton: present("proton"),
+        wine: present("wine"),
+        wine64: present("wine64"),
+    }
+}
+
+fn executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn parse_proton_acceptance_args(args: &[String]) -> Result<ProtonAcceptanceOptions, String> {
     let mut evidence_dir = None;
     let mut game_command = None;
+    let mut preflight_only = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -2272,6 +2316,10 @@ fn parse_proton_acceptance_args(args: &[String]) -> Result<ProtonAcceptanceOptio
                 if evidence_dir.replace(PathBuf::from(path)).is_some() {
                     return Err("--evidence-dir may only be specified once".into());
                 }
+            }
+            "--preflight-only" if !preflight_only => preflight_only = true,
+            "--preflight-only" => {
+                return Err("--preflight-only may only be specified once".into());
             }
             "--game-command" => {
                 if game_command.is_some() {
@@ -2291,9 +2339,17 @@ fn parse_proton_acceptance_args(args: &[String]) -> Result<ProtonAcceptanceOptio
         }
         index += 1;
     }
+    if preflight_only && game_command.is_some() {
+        return Err("--preflight-only cannot be combined with --game-command".into());
+    }
     Ok(ProtonAcceptanceOptions {
         evidence_dir: evidence_dir.ok_or_else(|| "--evidence-dir is required".to_owned())?,
-        game_command: game_command.ok_or_else(|| "--game-command is required".to_owned())?,
+        game_command: if preflight_only {
+            Vec::new()
+        } else {
+            game_command.ok_or_else(|| "--game-command is required".to_owned())?
+        },
+        preflight_only,
     })
 }
 
@@ -2332,14 +2388,29 @@ fn validation_layer_is_available() -> bool {
 }
 
 fn x11_display_is_available() -> bool {
-    let Some(display) = std::env::var_os("DISPLAY") else {
-        return false;
-    };
-    !display.is_empty()
-        && Command::new("xdpyinfo")
+    x11_display_is_available_with(std::env::var_os("DISPLAY"), |program, args, display| {
+        Command::new(program)
+            .args(args)
             .env("DISPLAY", display)
             .output()
             .is_ok_and(|output| output.status.success())
+    })
+}
+
+fn x11_display_is_available_with(
+    display: Option<std::ffi::OsString>,
+    probe: impl Fn(&str, &[&str], &std::ffi::OsStr) -> bool,
+) -> bool {
+    let Some(display) = display.filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    [
+        ("xdpyinfo", &[][..]),
+        ("xprop", &["-root"][..]),
+        ("xwininfo", &["-root"][..]),
+    ]
+    .into_iter()
+    .any(|(program, args)| probe(program, args, &display))
 }
 
 fn fidelityfx_abi_symbols_are_available(root: &Path) -> bool {
@@ -2423,9 +2494,25 @@ fn run_proton_acceptance(root: &Path, options: &ProtonAcceptanceOptions) -> bool
             eprintln!("cargo xtask proton-acceptance: {reason}");
         }
     }
+    let launchers = proton_launchers_on_path(&std::env::var_os("PATH").unwrap_or_default());
+    preflight.push_str(&format!(
+        "proton_on_path={}\nwine_on_path={}\nwine64_on_path={}\nlauncher_ready={}\n",
+        launchers.proton,
+        launchers.wine,
+        launchers.wine64,
+        launchers.ready()
+    ));
+    if !launchers.ready() {
+        eprintln!(
+            "cargo xtask proton-acceptance: no proton, wine, or wine64 executable on PATH; game launch remains blocked"
+        );
+    }
     let _ = fs::write(options.evidence_dir.join("preflight.txt"), preflight);
     if !preflight_ok {
         return false;
+    }
+    if options.preflight_only {
+        return true;
     }
 
     let gates = [
@@ -3763,16 +3850,17 @@ fn main() -> ExitCode {
 mod tests {
     use super::{
         BENCHMARK_SAMPLE_COUNT, BackendSelection, CollectedQualityEvidence,
-        ProtonAcceptanceOptions, QualityEvidenceSuiteReport, VkcubeExit, benchmark_cases,
-        benchmark_output_is_operationally_valid, classify_vkcube_exit, classify_vkcube_output,
-        fidelityfx_elf_architecture_is_valid, fidelityfx_symbols_are_complete, generated_config,
-        maintenance_evidence_complete, maintenance_output_is_valid, parse_backend_args,
-        parse_maintenance_evidence, parse_preset_medians, parse_proton_acceptance_args,
-        parse_public_x11_display, parse_visual_quality_args, parse_vkcube_args,
-        parse_vkcube_evidence, parse_wsi_compatibility_args, quality_ablation_rows,
+        ProtonAcceptanceOptions, ProtonLauncherProbe, QualityEvidenceSuiteReport, VkcubeExit,
+        benchmark_cases, benchmark_output_is_operationally_valid, classify_vkcube_exit,
+        classify_vkcube_output, fidelityfx_elf_architecture_is_valid,
+        fidelityfx_symbols_are_complete, generated_config, maintenance_evidence_complete,
+        maintenance_output_is_valid, parse_backend_args, parse_maintenance_evidence,
+        parse_preset_medians, parse_proton_acceptance_args, parse_public_x11_display,
+        parse_visual_quality_args, parse_vkcube_args, parse_vkcube_evidence,
+        parse_wsi_compatibility_args, proton_launchers_on_path, quality_ablation_rows,
         quality_fixture_passes, quality_metric_lines, quality_preset_rows,
         visual_quality_metrics_for_test, vkcube_control_sequence_is_valid, vkcube_launch_in,
-        vkcube_output_is_valid, wsi_compatibility_output_is_valid,
+        vkcube_output_is_valid, wsi_compatibility_output_is_valid, x11_display_is_available_with,
     };
     use std::path::Path;
 
@@ -3784,6 +3872,91 @@ mod tests {
                 .is_err()
         );
         assert!(parse_proton_acceptance_args(&["--game-command".into(), "true".into(),]).is_err());
+    }
+
+    #[test]
+    fn proton_preflight_only_does_not_require_a_game_command() {
+        let options = parse_proton_acceptance_args(&[
+            "--evidence-dir".into(),
+            "target/proton".into(),
+            "--preflight-only".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            options,
+            ProtonAcceptanceOptions {
+                evidence_dir: Path::new("target/proton").to_path_buf(),
+                game_command: Vec::new(),
+                preflight_only: true,
+            }
+        );
+    }
+
+    #[test]
+    fn proton_preflight_only_rejects_a_game_command() {
+        assert!(
+            parse_proton_acceptance_args(&[
+                "--evidence-dir".into(),
+                "target/proton".into(),
+                "--preflight-only".into(),
+                "--game-command".into(),
+                "true".into(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn x11_display_probe_accepts_xprop_when_xdpyinfo_is_missing() {
+        assert!(x11_display_is_available_with(
+            Some(":0".into()),
+            |program, _, _| program == "xprop",
+        ));
+        assert!(!x11_display_is_available_with(
+            Some(":0".into()),
+            |_, _, _| false,
+        ));
+        assert!(!x11_display_is_available_with(None, |_, _, _| true));
+        assert!(!x11_display_is_available_with(
+            Some(std::ffi::OsString::new()),
+            |_, _, _| true,
+        ));
+    }
+
+    #[test]
+    fn proton_launcher_probe_reads_path_without_inventing_a_game() {
+        let root = std::env::temp_dir().join(format!(
+            "tuxscaling-proton-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |value| value.as_nanos())
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["proton", "wine"] {
+            std::fs::write(root.join(name), []).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(root.join(name)).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(root.join(name), permissions).unwrap();
+            }
+        }
+
+        let probe = proton_launchers_on_path(root.as_os_str());
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(
+            probe,
+            ProtonLauncherProbe {
+                proton: true,
+                wine: true,
+                wine64: false,
+            }
+        );
+        assert!(!proton_launchers_on_path(std::ffi::OsStr::new("")).ready());
     }
 
     #[test]
@@ -3804,6 +3977,7 @@ mod tests {
             ProtonAcceptanceOptions {
                 evidence_dir: Path::new("target/proton").to_path_buf(),
                 game_command: vec!["steam".into(), "-applaunch".into(), "123".into()],
+                preflight_only: false,
             }
         );
     }
