@@ -1230,6 +1230,10 @@ unsafe fn guidance_masks_with_field_controls(
         }
         if let Some(forced_motion_field) = forced_motion_field {
             clear_motion_field(&gpu, &motion.vectors, forced_motion_field, extent);
+            // A synthetic field replaces the estimator output; its confidence
+            // must be supplied by the same fixture instead of retaining the
+            // confidence computed for the discarded field.
+            clear_image(&gpu, &motion.confidence, [1.0, 0.0, 0.0, 0.0]);
         }
         if zero_guidance || ablations.motion {
             clear_motion(&gpu, &motion.vectors, [0.0, 0.0, 0.0, 0.0]);
