@@ -1347,14 +1347,14 @@ fn amplified_difference(
 
 struct NestedMutter {
     mutter: Child,
-    xwayland: Child,
     runtime_dir: PathBuf,
     wayland_display: String,
     display: String,
+    xauthority: PathBuf,
 }
 
 impl NestedMutter {
-    fn environment(&self) -> [(&str, &str); 3] {
+    fn environment(&self) -> [(&str, &str); 4] {
         [
             (
                 "XDG_RUNTIME_DIR",
@@ -1362,17 +1362,19 @@ impl NestedMutter {
             ),
             ("WAYLAND_DISPLAY", &self.wayland_display),
             ("DISPLAY", &self.display),
+            (
+                "XAUTHORITY",
+                self.xauthority.to_str().unwrap_or("/dev/null"),
+            ),
         ]
     }
 }
 
 impl Drop for NestedMutter {
     fn drop(&mut self) {
-        for child in [&mut self.xwayland, &mut self.mutter] {
-            if child.try_wait().ok().flatten().is_none() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+        if self.mutter.try_wait().ok().flatten().is_none() {
+            let _ = self.mutter.kill();
+            let _ = self.mutter.wait();
         }
     }
 }
@@ -1394,6 +1396,58 @@ fn wait_for_path(path: &Path, child: &mut Child, timeout: Duration) -> Result<()
     Err(format!("timed out waiting for {}", path.display()))
 }
 
+fn parse_public_x11_display(log: &str) -> Option<String> {
+    log.lines().find_map(|line| {
+        let (_, remainder) = line.split_once("Using public X11 display ")?;
+        let display = remainder.split(',').next()?.trim();
+        (!display.is_empty()).then(|| display.to_owned())
+    })
+}
+
+fn private_xauthority(runtime_dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(runtime_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".mutter-Xwaylandauth."))
+        })
+}
+
+fn wait_for_nested_x11(
+    log_path: &Path,
+    runtime_dir: &Path,
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<(String, PathBuf), String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let log = fs::read_to_string(log_path).unwrap_or_default();
+        if let (Some(display), Some(xauthority)) = (
+            parse_public_x11_display(&log),
+            private_xauthority(runtime_dir),
+        ) {
+            return Ok((display, xauthority));
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("poll nested Mutter: {error}"))?
+        {
+            return Err(format!(
+                "nested Mutter exited with {status}; see {}",
+                log_path.display()
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!(
+        "timed out waiting for a public X11 display; see {}",
+        log_path.display()
+    ))
+}
+
 fn start_nested_mutter(width: u32, height: u32) -> Result<NestedMutter, String> {
     let runtime_dir =
         std::env::temp_dir().join(format!("tuxscaling-wayland-{}", std::process::id()));
@@ -1404,10 +1458,15 @@ fn start_nested_mutter(width: u32, height: u32) -> Result<NestedMutter, String> 
         .map_err(|error| format!("secure private Wayland runtime directory: {error}"))?;
     let wayland_display = format!("tuxscaling-visual-{}", std::process::id());
     let wayland_socket = runtime_dir.join(&wayland_display);
+    let log_path = runtime_dir.join("mutter.log");
+    let log = fs::File::create(&log_path)
+        .map_err(|error| format!("create nested Mutter log: {error}"))?;
+    let log_stdout = log
+        .try_clone()
+        .map_err(|error| format!("clone nested Mutter log: {error}"))?;
     let mut mutter = Command::new("mutter")
         .args([
             "--wayland",
-            "--no-x11",
             "--headless",
             "--virtual-monitor",
             &format!("{width}x{height}"),
@@ -1417,8 +1476,11 @@ fn start_nested_mutter(width: u32, height: u32) -> Result<NestedMutter, String> 
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env("XDG_CONFIG_HOME", &runtime_dir)
         .env("GSETTINGS_BACKEND", "memory")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("XAUTHORITY")
+        .stdout(Stdio::from(log_stdout))
+        .stderr(Stdio::from(log))
         .spawn()
         .map_err(|error| format!("start nested Mutter: {error}"))?;
     if let Err(error) = wait_for_path(&wayland_socket, &mut mutter, Duration::from_secs(5)) {
@@ -1426,45 +1488,22 @@ fn start_nested_mutter(width: u32, height: u32) -> Result<NestedMutter, String> 
         let _ = mutter.wait();
         return Err(error);
     }
-
-    for number in 80..200 {
-        let display = format!(":{number}");
-        let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
-        if socket.exists() {
-            continue;
-        }
-        let mut xwayland = match Command::new("Xwayland")
-            .args([display.as_str(), "-rootless", "-terminate"])
-            .env("XDG_RUNTIME_DIR", &runtime_dir)
-            .env("WAYLAND_DISPLAY", &wayland_display)
-            .env("XDG_CONFIG_HOME", &runtime_dir)
-            .env("GSETTINGS_BACKEND", "memory")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(child) => child,
+    let (display, xauthority) =
+        match wait_for_nested_x11(&log_path, &runtime_dir, &mut mutter, Duration::from_secs(5)) {
+            Ok(value) => value,
             Err(error) => {
                 let _ = mutter.kill();
                 let _ = mutter.wait();
-                return Err(format!("start nested Xwayland: {error}"));
+                return Err(error);
             }
         };
-        if wait_for_path(&socket, &mut xwayland, Duration::from_secs(5)).is_ok() {
-            return Ok(NestedMutter {
-                mutter,
-                xwayland,
-                runtime_dir,
-                wayland_display,
-                display,
-            });
-        }
-        let _ = xwayland.kill();
-        let _ = xwayland.wait();
-    }
-    let _ = mutter.kill();
-    let _ = mutter.wait();
-    Err("could not allocate a private Xwayland display".into())
+    Ok(NestedMutter {
+        mutter,
+        runtime_dir,
+        wayland_display,
+        display,
+        xauthority,
+    })
 }
 
 fn capture_command(
@@ -3111,9 +3150,10 @@ mod tests {
         classify_vkcube_output, fidelityfx_elf_architecture_is_valid,
         fidelityfx_symbols_are_complete, generated_config, maintenance_evidence_complete,
         maintenance_output_is_valid, parse_backend_args, parse_maintenance_evidence,
-        parse_proton_acceptance_args, parse_visual_quality_args, parse_vkcube_args,
-        parse_vkcube_evidence, quality_fixture_passes, visual_quality_metrics_for_test,
-        vkcube_launch, vkcube_output_is_valid, wsi_compatibility_output_is_valid,
+        parse_proton_acceptance_args, parse_public_x11_display, parse_visual_quality_args,
+        parse_vkcube_args, parse_vkcube_evidence, quality_fixture_passes,
+        visual_quality_metrics_for_test, vkcube_launch, vkcube_output_is_valid,
+        wsi_compatibility_output_is_valid,
     };
     use std::path::Path;
 
@@ -3557,6 +3597,20 @@ mod tests {
         ] {
             assert!(parse_visual_quality_args(&args).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn nested_mutter_parser_extracts_public_x11_display() {
+        assert_eq!(
+            parse_public_x11_display(
+                "libmutter-Message: Using public X11 display :42, (using unix:/tmp/.X11-unix/X43 for managed services)"
+            ),
+            Some(":42".to_owned())
+        );
+        assert_eq!(
+            parse_public_x11_display("Using Wayland display name 'nested'"),
+            None
+        );
     }
 
     #[test]
