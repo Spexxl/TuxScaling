@@ -187,6 +187,7 @@ pub struct TemporalPipeline {
     pub(crate) upscaler: Option<Box<dyn UpscalerBackend>>,
     pub(crate) history: History,
     pub(crate) start: Instant,
+    pub(crate) excluded_capture_time: Duration,
     pub(crate) pending_time: Duration,
     pub(crate) timing: FrameTimingState,
     pub(crate) pending_timing: FrameTiming,
@@ -423,6 +424,7 @@ impl TemporalPipeline {
             upscaler,
             history: History::default(),
             start: Instant::now(),
+            excluded_capture_time: Duration::ZERO,
             pending_time: Duration::ZERO,
             timing: FrameTimingState::default(),
             pending_timing: FrameTiming::default(),
@@ -449,6 +451,16 @@ impl TemporalPipeline {
             comparison,
             history_age: 0,
         })
+    }
+
+    pub(crate) fn exclude_capture_time(&mut self, duration: Duration) {
+        self.excluded_capture_time = self.excluded_capture_time.saturating_add(duration);
+    }
+
+    pub(crate) fn frame_elapsed(&self) -> Duration {
+        self.start
+            .elapsed()
+            .saturating_sub(self.excluded_capture_time)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -765,6 +777,7 @@ impl TemporalPipeline {
             upscaler: None,
             history: History::default(),
             start: Instant::now(),
+            excluded_capture_time: Duration::ZERO,
             pending_time: Duration::ZERO,
             timing: FrameTimingState::default(),
             pending_timing: FrameTiming::default(),

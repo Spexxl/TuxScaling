@@ -1416,7 +1416,10 @@ impl SwapchainRuntime {
             vk::ImageLayout::UNDEFINED
         };
         unsafe { self.device.wait_for_fences(&[slot.fence], true, u64::MAX) }?;
+        let capture_service_start = Instant::now();
         unsafe { self.service_diagnostic_capture() };
+        self.temporal
+            .exclude_capture_time(capture_service_start.elapsed());
         self.temporal.apply_pending_manual_controls();
         self.diagnostics.active_guidance_mode = self.temporal.config.guidance_mode;
         self.diagnostics.active_sharpening_enabled = self.temporal.config.sharpening_enabled;
@@ -1494,7 +1497,7 @@ impl SwapchainRuntime {
                 }
             }
         }
-        self.temporal.pending_time = self.temporal.start.elapsed();
+        self.temporal.pending_time = self.temporal.frame_elapsed();
         let (timing, timing_reset) = self.temporal.timing.sample(self.temporal.pending_time);
         self.temporal.pending_timing = timing;
         self.diagnostics.frame_delta_ms = timing.raw.as_secs_f32() * 1_000.0;
@@ -2519,14 +2522,15 @@ impl SwapchainRuntime {
         if self.temporal.active_upscaler == Upscaler::Off {
             self.diagnostics.history_valid = false;
             self.diagnostics.history_age = 0;
+            self.diagnostics.frame_id = self.diagnostics.frame_id.saturating_add(1);
         } else {
             self.temporal.history.commit(self.temporal.pending_time);
             self.temporal.history_age = self.temporal.history_age.saturating_add(1);
+            self.diagnostics.frame_id = self.temporal.history.frame_id;
         }
         if let Some(index) = self.pending_output.take() {
             self.output_presented[index] = true;
         }
-        self.diagnostics.frame_id = self.temporal.history.frame_id;
         if self.temporal.active_upscaler != Upscaler::Off {
             self.diagnostics.history_valid = true;
             self.diagnostics.history_age = self.temporal.history_age;
