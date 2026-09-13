@@ -411,6 +411,15 @@ unsafe fn create_direct_fallback(
         "TuxScaling evidence event=presenter_fallback_to_direct surface=0x{:x} result={result:?}",
         original.surface.as_raw(),
     );
+    if result == vk::Result::SUCCESS {
+        eprintln!(
+            "TuxScaling evidence event=direct_swapchain_created surface=0x{:x} extent={}x{} reason={}",
+            original.surface.as_raw(),
+            original.image_extent.width,
+            original.image_extent.height,
+            reason.as_str(),
+        );
+    }
     result
 }
 
@@ -619,6 +628,17 @@ fn native_output_target(
         );
         return None;
     }
+    eprintln!(
+        "TuxScaling evidence event=borderless_target surface=0x{:x} window={} extent={}x{} rect={}x{}+{}+{}",
+        surface.as_raw(),
+        window,
+        target_extent.width,
+        target_extent.height,
+        monitor.rect.width,
+        monitor.rect.height,
+        monitor.rect.x,
+        monitor.rect.y,
+    );
     Some(InitialOutputTarget { window, monitor })
 }
 
@@ -2825,6 +2845,16 @@ unsafe fn create_swapchain_inner(
                 info.extent.height,
                 u8::from(present_surface.is_some()),
             );
+            if let Some(presenter_surface) = present_surface {
+                eprintln!(
+                    "TuxScaling evidence event=presenter_generation_published logical={}x{} physical={}x{} presenter_surface=0x{:x}",
+                    original.image_extent.width,
+                    original.image_extent.height,
+                    info.extent.width,
+                    info.extent.height,
+                    presenter_surface.as_raw(),
+                );
+            }
         }
         result
     }));

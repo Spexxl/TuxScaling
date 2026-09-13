@@ -154,6 +154,7 @@ struct WsiCompatibilityEvidence {
     mutable_format: bool,
     view_formats: u32,
     native_published: bool,
+    presenter_published: bool,
     fsr_dispatch: bool,
     reconstructed_present: bool,
     overlay_submitted: bool,
@@ -239,6 +240,17 @@ fn parse_wsi_compatibility_evidence(stdout: &str, stderr: &str) -> WsiCompatibil
                     wsi_field(&lowercase, "physical").and_then(parse_wsi_extent);
                 evidence.native_published = true;
             }
+            "presenter_generation_published" => {
+                evidence.published_logical =
+                    wsi_field(&lowercase, "logical").and_then(parse_wsi_extent);
+                evidence.published_physical =
+                    wsi_field(&lowercase, "physical").and_then(parse_wsi_extent);
+                evidence.presenter_published = true;
+            }
+            "direct_swapchain_created" => {
+                evidence.virtual_created = Some(false);
+                evidence.virtual_zero = true;
+            }
             "fsr_dispatch" => {
                 evidence.fsr_dispatch = wsi_field(&lowercase, "backend") == Some("fsr_3_1_4");
             }
@@ -260,21 +272,21 @@ fn parse_wsi_compatibility_evidence(stdout: &str, stderr: &str) -> WsiCompatibil
                 }
             }
             "wsi_scenario" => {
-                evidence.scenario_verified = wsi_field(&lowercase, "result") == Some("verified");
-                evidence.alternate_views = wsi_positive_field(&lowercase, "alternate_views");
-                evidence.present_wait_current =
+                evidence.scenario_verified |= wsi_field(&lowercase, "result") == Some("verified");
+                evidence.alternate_views |= wsi_positive_field(&lowercase, "alternate_views");
+                evidence.present_wait_current |=
                     wsi_positive_field(&lowercase, "present_wait_current");
-                evidence.present_wait_old = wsi_positive_field(&lowercase, "present_wait_old");
-                evidence.hdr_before = wsi_positive_field(&lowercase, "hdr_before");
-                evidence.hdr_after = wsi_positive_field(&lowercase, "hdr_after");
+                evidence.present_wait_old |= wsi_positive_field(&lowercase, "present_wait_old");
+                evidence.hdr_before |= wsi_positive_field(&lowercase, "hdr_before");
+                evidence.hdr_after |= wsi_positive_field(&lowercase, "hdr_after");
                 let queries = wsi_field(&lowercase, "queries").unwrap_or_default();
-                evidence.status_query = queries.split(',').any(|query| query == "status");
-                evidence.counter_query = queries.split(',').any(|query| query == "counter");
-                evidence.refresh_query = queries.split(',').any(|query| query == "refresh");
+                evidence.status_query |= queries.split(',').any(|query| query == "status");
+                evidence.counter_query |= queries.split(',').any(|query| query == "counter");
+                evidence.refresh_query |= queries.split(',').any(|query| query == "refresh");
                 let timing = wsi_field(&lowercase, "timing").unwrap_or_default();
-                evidence.timing_count = timing.split(',').any(|value| value == "count");
-                evidence.timing_data = timing.split(',').any(|value| value == "data");
-                evidence.post_publish_recreation =
+                evidence.timing_count |= timing.split(',').any(|value| value == "count");
+                evidence.timing_data |= timing.split(',').any(|value| value == "data");
+                evidence.post_publish_recreation |=
                     wsi_positive_field(&lowercase, "recreations_after_publish");
             }
             _ => {}
@@ -314,7 +326,7 @@ fn wsi_compatibility_output_is_valid(
         || evidence.logical_created != evidence.requested
         || evidence.published_logical != evidence.requested
         || evidence.native_target != evidence.published_physical
-        || !evidence.native_published
+        || !(evidence.native_published || evidence.presenter_published)
         || !evidence.reconstructed_present
         || !evidence.overlay_submitted
         || evidence.post_publish_recreation
@@ -441,6 +453,11 @@ fn parse_vkcube_evidence(stdout: &str, stderr: &str) -> VkcubeEvidence {
         };
         match event {
             "native_generation_published" => {
+                evidence.native_published = true;
+                evidence.logical = wsi_field(&lowercase, "logical").and_then(parse_wsi_extent);
+                evidence.physical = wsi_field(&lowercase, "physical").and_then(parse_wsi_extent);
+            }
+            "presenter_generation_published" => {
                 evidence.native_published = true;
                 evidence.logical = wsi_field(&lowercase, "logical").and_then(parse_wsi_extent);
                 evidence.physical = wsi_field(&lowercase, "physical").and_then(parse_wsi_extent);
@@ -3199,7 +3216,7 @@ mod tests {
                 "TuxScaling evidence event=borderless_target extent=3440x1440\n",
                 "TuxScaling evidence event=logical_swapchain_created logical_handle=0x1 physical_handle=0x2 logical=1280x720 physical=1280x720 virtual=1 mutable_format=1 view_formats=2 negotiation=negotiating\n",
                 "TuxScaling evidence event=virtual_swapchain_active logical_handle=0x1 logical=1280x720 physical=3440x1440 generation=1\n",
-                "TuxScaling evidence event=native_generation_published logical=1280x720 physical=3440x1440 backend=FSR_3_1_4 images=3\n",
+                "TuxScaling evidence event=presenter_generation_published logical=1280x720 physical=3440x1440 presenter_surface=0x4\n",
                 "TuxScaling evidence event=fsr_dispatch backend=fsr_3_1_4 logical=1280x720 physical=3440x1440\n",
                 "TuxScaling evidence event=present_wait translated=1 generation=0\n",
                 "TuxScaling evidence event=present_wait translated=1 generation=1\n",
@@ -3719,6 +3736,33 @@ mod tests {
         ));
 
         let output = output.replace("incompatible_wsi_extension", "unexpected");
+        assert!(!wsi_compatibility_output_is_valid(
+            &output,
+            "",
+            "incompatible_direct",
+            BackendSelection::Fsr314,
+        ));
+    }
+
+    #[test]
+    fn wsi_compatibility_requires_direct_creation_evidence_without_a_logical_event() {
+        let output = concat!(
+            "TuxScaling evidence event=wsi_scenario_request scenario=incompatible_direct requested=1280x720\n",
+            "TuxScaling evidence event=virtualization_preflight result=direct reason=unsupported_pnext stype=DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR\n",
+            "TuxScaling evidence event=direct_swapchain_created surface=0x1 extent=1280x720 reason=unsupported_pnext\n",
+            "TuxScaling evidence event=wsi_scenario scenario=incompatible_direct result=verified direct=1\n",
+        );
+        assert!(wsi_compatibility_output_is_valid(
+            output,
+            "",
+            "incompatible_direct",
+            BackendSelection::Fsr314,
+        ));
+
+        let output = output.replace(
+            "TuxScaling evidence event=direct_swapchain_created surface=0x1 extent=1280x720 reason=unsupported_pnext\n",
+            "",
+        );
         assert!(!wsi_compatibility_output_is_valid(
             &output,
             "",

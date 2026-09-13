@@ -1470,7 +1470,16 @@ unsafe fn run() -> WsiOutcome {
         let scenario_active = scenario.is_some();
         let scenario_name = scenario.as_deref().unwrap_or("default");
         let maintenance_scenario = scenario.as_deref() == Some("maintenance1");
-        let presenter_scenario = scenario.as_deref() == Some("upscale");
+        let presenter_scenario = matches!(
+            scenario.as_deref(),
+            Some(
+                "upscale"
+                    | "mutable_format"
+                    | "present_wait_generation"
+                    | "hdr_replacement"
+                    | "display_timing"
+            )
+        );
         let mutable_scenario = scenario.as_deref() == Some("mutable_format");
         let present_wait_scenario = scenario.as_deref() == Some("present_wait_generation");
         let hdr_scenario = scenario.as_deref() == Some("hdr_replacement");
@@ -2592,7 +2601,7 @@ unsafe fn run() -> WsiOutcome {
         }
         if let Some((_, _, width, height)) = presenter_native {
             eprintln!(
-                "TuxScaling evidence event=wsi_scenario scenario=upscale result=verified logical=1280x720 physical={}x{} presenter_windows={} original_window=logical recreations_after_publish=0",
+                "TuxScaling evidence event=wsi_scenario scenario={scenario_name} result=verified logical=1280x720 physical={}x{} presenter_windows={} original_window=logical recreations_after_publish=0",
                 width,
                 height,
                 windows.len(),
