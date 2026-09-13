@@ -164,8 +164,10 @@ type WarpPointer = unsafe extern "C" fn(
 ) -> c_int;
 type FakeButtonEvent = unsafe extern "C" fn(*mut Display, c_uint, c_int, c_ulong) -> c_int;
 type FakeRelativeMotionEvent = unsafe extern "C" fn(*mut Display, c_int, c_int, c_ulong) -> c_int;
-type HideCursor = unsafe extern "C" fn(*mut Display, c_ulong) -> c_int;
-type ShowCursor = unsafe extern "C" fn(*mut Display, c_ulong) -> c_int;
+type QueryXFixesExtension = unsafe extern "C" fn(*mut Display, *mut c_int, *mut c_int) -> c_int;
+type QueryXFixesVersion = unsafe extern "C" fn(*mut Display, *mut c_int, *mut c_int) -> c_int;
+type HideCursor = unsafe extern "C" fn(*mut Display, c_ulong);
+type ShowCursor = unsafe extern "C" fn(*mut Display, c_ulong);
 
 #[derive(Debug, Error)]
 pub enum InputError {
@@ -293,6 +295,21 @@ pub enum PointerMode {
     Relative,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorVisibilityAction {
+    Hide,
+    Show,
+    None,
+}
+
+fn cursor_visibility_action(cursor_hidden: bool, overlay_open: bool) -> CursorVisibilityAction {
+    match (cursor_hidden, overlay_open) {
+        (false, true) => CursorVisibilityAction::Hide,
+        (true, false) => CursorVisibilityAction::Show,
+        _ => CursorVisibilityAction::None,
+    }
+}
+
 pub fn route_pointer(
     route: &InputRoute,
     mode: PointerMode,
@@ -326,6 +343,7 @@ pub struct X11Input {
     insert_keycode: u8,
     overlay_open: bool,
     pointer_mode: PointerMode,
+    cursor_hidden: bool,
     last_root: Option<[i32; 2]>,
     last_position: Option<[f32; 2]>,
     pointer_present: bool,
@@ -389,12 +407,29 @@ impl X11Input {
             load::<FakeRelativeMotionEvent>(library, b"XTestFakeRelativeMotionEvent\0").ok()
         });
         let xfixes_library = unsafe { Library::new("libXfixes.so.3") }.ok();
-        let hide_cursor = xfixes_library
-            .as_ref()
-            .and_then(|library| load::<HideCursor>(library, b"XFixesHideCursor\0").ok());
-        let show_cursor = xfixes_library
-            .as_ref()
-            .and_then(|library| load::<ShowCursor>(library, b"XFixesShowCursor\0").ok());
+        let xfixes_cursor = xfixes_library.as_ref().and_then(|library| {
+            let query_extension =
+                load::<QueryXFixesExtension>(library, b"XFixesQueryExtension\0").ok()?;
+            let query_version =
+                load::<QueryXFixesVersion>(library, b"XFixesQueryVersion\0").ok()?;
+            let hide_cursor = load::<HideCursor>(library, b"XFixesHideCursor\0").ok()?;
+            let show_cursor = load::<ShowCursor>(library, b"XFixesShowCursor\0").ok()?;
+            let mut event_base = 0;
+            let mut error_base = 0;
+            let mut major = 0;
+            let mut minor = 0;
+            let available = unsafe {
+                query_extension(display, &mut event_base, &mut error_base) != 0
+                    && query_version(display, &mut major, &mut minor) != 0
+                    && (major > 4 || major == 4 && minor >= 0)
+            };
+            available.then_some((hide_cursor, show_cursor))
+        });
+        if xfixes_cursor.is_none() {
+            eprintln!("TuxScaling input: XFixes cursor extension is unavailable");
+        }
+        let (hide_cursor, show_cursor) =
+            xfixes_cursor.map_or((None, None), |(hide, show)| (Some(hide), Some(show)));
         let input = Self {
             _library: library,
             _xtest_library: xtest_library,
@@ -409,6 +444,7 @@ impl X11Input {
             insert_keycode,
             overlay_open: false,
             pointer_mode: PointerMode::Absolute,
+            cursor_hidden: false,
             last_root: None,
             last_position: None,
             pointer_present: false,
@@ -652,15 +688,18 @@ impl X11Input {
         }
     }
 
-    fn update_cursor_visibility(&self) {
-        if self.overlay_open {
-            self.hide_native_cursor();
-        } else {
-            self.show_native_cursor();
+    fn update_cursor_visibility(&mut self) {
+        match cursor_visibility_action(self.cursor_hidden, self.overlay_open) {
+            CursorVisibilityAction::Hide => self.hide_native_cursor(),
+            CursorVisibilityAction::Show => self.show_native_cursor(),
+            CursorVisibilityAction::None => {}
         }
     }
 
-    fn hide_native_cursor(&self) {
+    fn hide_native_cursor(&mut self) {
+        if self.cursor_hidden {
+            return;
+        }
         if let Some(hide_cursor) = self.hide_cursor
             && self.event_window != 0
         {
@@ -668,10 +707,14 @@ impl X11Input {
                 hide_cursor(self.display, self.event_window);
                 (self.flush)(self.display);
             }
+            self.cursor_hidden = true;
         }
     }
 
-    fn show_native_cursor(&self) {
+    fn show_native_cursor(&mut self) {
+        if !self.cursor_hidden {
+            return;
+        }
         if let Some(show_cursor) = self.show_cursor
             && self.event_window != 0
         {
@@ -679,6 +722,7 @@ impl X11Input {
                 show_cursor(self.display, self.event_window);
                 (self.flush)(self.display);
             }
+            self.cursor_hidden = false;
         }
     }
 
@@ -781,10 +825,31 @@ fn modifiers(state: c_uint) -> Modifiers {
 #[cfg(test)]
 mod tests {
     use super::{
-        CursorOwner, InputFrame, InputRoute, PointerMode, PointerViewport, pointer_button,
-        route_pointer, should_accept_event, should_forward_to_game,
+        CursorOwner, CursorVisibilityAction, InputFrame, InputRoute, PointerMode, PointerViewport,
+        cursor_visibility_action, pointer_button, route_pointer, should_accept_event,
+        should_forward_to_game,
     };
     use egui::PointerButton;
+
+    #[test]
+    fn cursor_visibility_does_not_show_an_unhidden_cursor() {
+        assert_eq!(
+            cursor_visibility_action(false, false),
+            CursorVisibilityAction::None
+        );
+        assert_eq!(
+            cursor_visibility_action(false, true),
+            CursorVisibilityAction::Hide
+        );
+        assert_eq!(
+            cursor_visibility_action(true, false),
+            CursorVisibilityAction::Show
+        );
+        assert_eq!(
+            cursor_visibility_action(true, true),
+            CursorVisibilityAction::None
+        );
+    }
 
     #[test]
     fn maps_x11_buttons_to_egui() {
