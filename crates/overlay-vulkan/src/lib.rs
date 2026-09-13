@@ -146,6 +146,10 @@ pub struct OverlayRenderer {
     context: egui::Context,
 }
 
+pub fn overlay_visibility(cursor_owner: tuxscaling_input::CursorOwner) -> bool {
+    cursor_owner == tuxscaling_input::CursorOwner::Overlay
+}
+
 pub fn is_srgb_framebuffer(format: vk::Format) -> bool {
     matches!(
         format,
@@ -266,8 +270,13 @@ impl OverlayRenderer {
                 .unwrap_or_else(|error| error.into_inner())
                 .poll()
         });
+        self.visible = overlay_visibility(input.cursor_owner);
         if input.toggle_overlay {
-            self.visible = !self.visible;
+            eprintln!(
+                "TuxScaling evidence event=overlay_toggled visible={} owner={:?}",
+                u8::from(self.visible),
+                input.cursor_owner
+            );
         }
         let frame = tuxscaling_overlay::render_diagnostics(
             &self.context,
@@ -366,5 +375,11 @@ mod tests {
         assert_eq!(route.viewport.offset, [0.0, 60.0]);
         assert_eq!(route.viewport.extent, [1920.0, 1080.0]);
         assert_eq!(route.with_output_extent([0, 1200]), None);
+    }
+
+    #[test]
+    fn overlay_visibility_follows_cursor_ownership_not_an_edge_toggle() {
+        assert!(!overlay_visibility(tuxscaling_input::CursorOwner::Native));
+        assert!(overlay_visibility(tuxscaling_input::CursorOwner::Overlay));
     }
 }

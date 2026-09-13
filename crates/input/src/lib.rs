@@ -14,9 +14,9 @@ const ENTER_NOTIFY: c_int = 7;
 const LEAVE_NOTIFY: c_int = 8;
 const FOCUS_IN: c_int = 9;
 const FOCUS_OUT: c_int = 10;
-const NOTIFY_GRAB: c_int = 1;
-const NOTIFY_UNGRAB: c_int = 2;
 const INSERT_KEYSYM: c_ulong = 0xff63;
+const ANY_MODIFIER: c_uint = 1 << 15;
+const GRAB_MODE_ASYNC: c_int = 1;
 const POINTER_GRAB_MASK: c_ulong = (1 << 2) | (1 << 3) | (1 << 6);
 const PASSIVE_EVENT_MASK: c_long = 1 | 2 | 4 | 8 | 16 | 32 | (1 << 6) | (1 << 21);
 
@@ -149,6 +149,9 @@ type GrabPointer = unsafe extern "C" fn(
     c_ulong,
 ) -> c_int;
 type UngrabPointer = unsafe extern "C" fn(*mut Display, c_ulong) -> c_int;
+type GrabKey =
+    unsafe extern "C" fn(*mut Display, c_int, c_uint, c_ulong, c_int, c_int, c_int) -> c_int;
+type UngrabKey = unsafe extern "C" fn(*mut Display, c_int, c_uint, c_ulong) -> c_int;
 type Flush = unsafe extern "C" fn(*mut Display) -> c_int;
 type CloseDisplay = unsafe extern "C" fn(*mut Display) -> c_int;
 type Sync = unsafe extern "C" fn(*mut Display, c_int) -> c_int;
@@ -328,6 +331,16 @@ pub fn should_accept_event(route: &InputRoute, event_window: u64) -> bool {
     route.event_window != 0 && event_window == route.event_window
 }
 
+pub fn should_accept_toggle_key(route: &InputRoute, event_window: u64) -> bool {
+    route.event_window != 0
+        && (event_window == route.event_window
+            || (route.game_window != 0 && event_window == route.game_window))
+}
+
+pub const fn overlay_hotkey_uses_passive_grab(overlay_open: bool) -> bool {
+    !overlay_open
+}
+
 pub fn should_forward_to_game(route: &InputRoute, overlay_open: bool) -> bool {
     !overlay_open
         && route.event_window != 0
@@ -335,8 +348,8 @@ pub fn should_forward_to_game(route: &InputRoute, overlay_open: bool) -> bool {
         && route.event_window != route.game_window
 }
 
-const fn focus_out_closes_overlay(mode: c_int) -> bool {
-    !matches!(mode, NOTIFY_GRAB | NOTIFY_UNGRAB)
+const fn focus_out_closes_overlay(_mode: c_int) -> bool {
+    false
 }
 
 pub struct X11Input {
@@ -359,6 +372,8 @@ pub struct X11Input {
     ungrab_keyboard: UngrabKeyboard,
     grab_pointer: GrabPointer,
     ungrab_pointer: UngrabPointer,
+    grab_key: GrabKey,
+    ungrab_key: UngrabKey,
     flush: Flush,
     close_display: CloseDisplay,
     warp_pointer: WarpPointer,
@@ -383,6 +398,8 @@ impl X11Input {
         let ungrab_keyboard = load::<UngrabKeyboard>(&library, b"XUngrabKeyboard\0")?;
         let grab_pointer = load::<GrabPointer>(&library, b"XGrabPointer\0")?;
         let ungrab_pointer = load::<UngrabPointer>(&library, b"XUngrabPointer\0")?;
+        let grab_key = load::<GrabKey>(&library, b"XGrabKey\0")?;
+        let ungrab_key = load::<UngrabKey>(&library, b"XUngrabKey\0")?;
         let flush = load::<Flush>(&library, b"XFlush\0")?;
         let close_display = load::<CloseDisplay>(&library, b"XCloseDisplay\0")?;
         let warp_pointer = load::<WarpPointer>(&library, b"XWarpPointer\0")?;
@@ -394,16 +411,16 @@ impl X11Input {
         let root = unsafe { root_window(display, screen) };
         let insert_keycode = unsafe { keysym_to_keycode(display, INSERT_KEYSYM) };
         let select_input = load::<SelectInput>(&library, b"XSelectInput\0")?;
+        let event_window = if route.event_window == 0 {
+            root
+        } else {
+            route.event_window as c_ulong
+        };
         unsafe {
-            select_input(
-                display,
-                if route.event_window == 0 {
-                    root
-                } else {
-                    route.event_window as c_ulong
-                },
-                PASSIVE_EVENT_MASK,
-            );
+            select_input(display, event_window, PASSIVE_EVENT_MASK);
+            if route.game_window != 0 && route.game_window as c_ulong != event_window {
+                select_input(display, route.game_window as c_ulong, 1 | 2);
+            }
         }
         let xtest_library = unsafe { Library::new("libXtst.so.6") }.ok();
         let fake_button = xtest_library
@@ -460,6 +477,8 @@ impl X11Input {
             ungrab_keyboard,
             grab_pointer,
             ungrab_pointer,
+            grab_key,
+            ungrab_key,
             flush,
             close_display,
             warp_pointer,
@@ -509,10 +528,17 @@ impl X11Input {
             match kind {
                 KEY_PRESS => {
                     let event = unsafe { event.key };
-                    if !should_accept_event(&self.route, event.window) || event.send_event != 0 {
+                    let is_insert = event.keycode as u8 == self.insert_keycode;
+                    if event.send_event != 0
+                        || if is_insert {
+                            !should_accept_toggle_key(&self.route, event.window)
+                        } else {
+                            !should_accept_event(&self.route, event.window)
+                        }
+                    {
                         continue;
                     }
-                    if event.keycode as u8 == self.insert_keycode {
+                    if is_insert {
                         frame.toggle_overlay = true;
                         self.overlay_open = !self.overlay_open;
                         self.update_grab();
@@ -522,10 +548,17 @@ impl X11Input {
                 }
                 KEY_RELEASE => {
                     let event = unsafe { event.key };
-                    if !should_accept_event(&self.route, event.window) || event.send_event != 0 {
+                    let is_insert = event.keycode as u8 == self.insert_keycode;
+                    if event.send_event != 0
+                        || if is_insert {
+                            !should_accept_toggle_key(&self.route, event.window)
+                        } else {
+                            !should_accept_event(&self.route, event.window)
+                        }
+                    {
                         continue;
                     }
-                    if event.keycode as u8 == self.insert_keycode {
+                    if is_insert {
                         frame.events.push(key_event(false));
                     }
                 }
@@ -685,6 +718,7 @@ impl X11Input {
 
     fn update_grab(&self) {
         if self.overlay_open {
+            self.release_insert_hotkey();
             unsafe {
                 (self.grab_keyboard)(self.display, self.event_window, 0, 1, 1, 0);
                 (self.grab_pointer)(
@@ -704,10 +738,56 @@ impl X11Input {
                 (self.ungrab_keyboard)(self.display, 0);
                 (self.ungrab_pointer)(self.display, 0);
             }
+            self.grab_insert_hotkey();
         }
         unsafe {
             (self.flush)(self.display);
         }
+    }
+
+    fn grab_insert_hotkey(&self) {
+        if !overlay_hotkey_uses_passive_grab(self.overlay_open) || self.insert_keycode == 0 {
+            return;
+        }
+        for window in self.hotkey_windows() {
+            unsafe {
+                (self.grab_key)(
+                    self.display,
+                    c_int::from(self.insert_keycode),
+                    ANY_MODIFIER,
+                    window,
+                    0,
+                    GRAB_MODE_ASYNC,
+                    GRAB_MODE_ASYNC,
+                );
+            }
+        }
+    }
+
+    fn release_insert_hotkey(&self) {
+        if self.insert_keycode == 0 {
+            return;
+        }
+        for window in self.hotkey_windows() {
+            unsafe {
+                (self.ungrab_key)(
+                    self.display,
+                    c_int::from(self.insert_keycode),
+                    ANY_MODIFIER,
+                    window,
+                );
+            }
+        }
+    }
+
+    fn hotkey_windows(&self) -> impl Iterator<Item = c_ulong> {
+        let event = self.event_window;
+        let game = self.route.game_window as c_ulong;
+        [event, game]
+            .into_iter()
+            .filter(move |window| *window != 0)
+            .enumerate()
+            .filter_map(move |(index, window)| (index == 0 || window != event).then_some(window))
     }
 
     fn update_cursor_visibility(&mut self) {
@@ -803,6 +883,7 @@ impl Drop for X11Input {
         if !self.display.is_null() {
             unsafe {
                 self.show_native_cursor();
+                self.release_insert_hotkey();
                 (self.ungrab_keyboard)(self.display, 0);
                 (self.ungrab_pointer)(self.display, 0);
                 (self.close_display)(self.display);
@@ -849,7 +930,7 @@ mod tests {
     use super::{
         CursorOwner, CursorVisibilityAction, InputFrame, InputRoute, PointerMode, PointerViewport,
         cursor_visibility_action, pointer_button, route_pointer, should_accept_event,
-        should_forward_to_game,
+        should_accept_toggle_key, should_forward_to_game,
     };
     use egui::PointerButton;
 
@@ -965,6 +1046,9 @@ mod tests {
 
         assert!(should_accept_event(&route, route.event_window));
         assert!(!should_accept_event(&route, route.game_window));
+        assert!(should_accept_toggle_key(&route, route.event_window));
+        assert!(should_accept_toggle_key(&route, route.game_window));
+        assert!(!should_accept_toggle_key(&route, 0x1));
         assert!(should_forward_to_game(&route, false));
         assert!(!should_forward_to_game(&route, true));
         assert!(!should_forward_to_game(
@@ -977,6 +1061,12 @@ mod tests {
             ),
             false,
         ));
+    }
+
+    #[test]
+    fn closed_overlay_uses_a_passive_insert_grab() {
+        assert!(super::overlay_hotkey_uses_passive_grab(false));
+        assert!(!super::overlay_hotkey_uses_passive_grab(true));
     }
 
     #[test]
@@ -1006,10 +1096,10 @@ mod tests {
     }
 
     #[test]
-    fn focus_grab_transitions_do_not_close_the_overlay() {
-        assert!(!super::focus_out_closes_overlay(super::NOTIFY_GRAB));
-        assert!(!super::focus_out_closes_overlay(super::NOTIFY_UNGRAB));
-        assert!(super::focus_out_closes_overlay(0));
-        assert!(super::focus_out_closes_overlay(3));
+    fn focus_changes_do_not_close_the_overlay() {
+        assert!(!super::focus_out_closes_overlay(1));
+        assert!(!super::focus_out_closes_overlay(2));
+        assert!(!super::focus_out_closes_overlay(0));
+        assert!(!super::focus_out_closes_overlay(3));
     }
 }
