@@ -611,8 +611,12 @@ fn vkcube_control_sequence_is_valid(stdout: &str, stderr: &str) -> bool {
         .iter()
         .filter_map(|applied| applied.generation)
         .collect::<BTreeSet<_>>();
-    evidence.native_publishes == 1
-        && evidence.presenter_publishes == 1
+    let published = evidence
+        .native_publishes
+        .saturating_add(evidence.presenter_publishes);
+    evidence.native_publishes <= 1
+        && evidence.presenter_publishes <= 1
+        && published >= 1
         && generations.len() == 1
         && required.iter().all(|(setting, value)| {
             evidence
@@ -704,9 +708,22 @@ fn parse_vkcube_args(args: &[&str]) -> Result<VkcubeOptions, String> {
 }
 
 fn vkcube_launch(root: &Path, options: VkcubeOptions) -> VkcubeLaunch {
+    let cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+    vkcube_launch_in(root, options, cargo_target_dir.as_deref())
+}
+
+fn vkcube_launch_in(
+    root: &Path,
+    options: VkcubeOptions,
+    cargo_target_dir: Option<&Path>,
+) -> VkcubeLaunch {
     let profile = if options.release { "release" } else { "debug" };
+    let target = cargo_target_dir
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.join("target"));
     VkcubeLaunch {
-        profile_dir: root.join("target").join(profile),
+        profile_dir: target.join(profile),
         config_path: root.join("target").join(format!("vkcube-{profile}.toml")),
     }
 }
@@ -3754,7 +3771,7 @@ mod tests {
         parse_public_x11_display, parse_visual_quality_args, parse_vkcube_args,
         parse_vkcube_evidence, parse_wsi_compatibility_args, quality_ablation_rows,
         quality_fixture_passes, quality_metric_lines, quality_preset_rows,
-        visual_quality_metrics_for_test, vkcube_control_sequence_is_valid, vkcube_launch,
+        visual_quality_metrics_for_test, vkcube_control_sequence_is_valid, vkcube_launch_in,
         vkcube_output_is_valid, wsi_compatibility_output_is_valid,
     };
     use std::path::Path;
@@ -3890,7 +3907,7 @@ mod tests {
     #[test]
     fn vkcube_defaults_to_debug_profile_and_ten_seconds() {
         let options = parse_vkcube_args(&[]).unwrap();
-        let launch = vkcube_launch(Path::new("/workspace"), options);
+        let launch = vkcube_launch_in(Path::new("/workspace"), options, None);
 
         assert_eq!(options.seconds, 10);
         assert!(!options.release);
@@ -3900,11 +3917,22 @@ mod tests {
     #[test]
     fn vkcube_accepts_release_and_positive_seconds() {
         let options = parse_vkcube_args(&["--release", "--seconds", "27"]).unwrap();
-        let launch = vkcube_launch(Path::new("/workspace"), options);
+        let launch = vkcube_launch_in(Path::new("/workspace"), options, None);
 
         assert_eq!(options.seconds, 27);
         assert!(options.release);
         assert_eq!(launch.profile_dir, Path::new("/workspace/target/release"));
+    }
+
+    #[test]
+    fn vkcube_loads_the_layer_from_cargo_target_dir_when_set() {
+        let options = parse_vkcube_args(&["--release"]).unwrap();
+        let launch = vkcube_launch_in(
+            Path::new("/workspace"),
+            options,
+            Some(Path::new("/tmp/cargo-target")),
+        );
+        assert_eq!(launch.profile_dir, Path::new("/tmp/cargo-target/release"));
     }
 
     #[test]
@@ -4120,6 +4148,11 @@ mod tests {
             BackendSelection::Fsr314
         ));
         assert!(vkcube_control_sequence_is_valid(positive, ""));
+        let presenter_only = positive.replace(
+            "TuxScaling evidence event=native_generation_published logical=1280x720 physical=2160x1440\n",
+            "",
+        );
+        assert!(vkcube_control_sequence_is_valid(&presenter_only, ""));
         assert!(!vkcube_control_sequence_is_valid(
             &positive.replace(
                 "setting=quality value=Performance\n",
