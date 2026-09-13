@@ -1,6 +1,9 @@
 use std::{thread, time::Duration};
-use tuxscaling_input::{InputRoute, PointerViewport, X11Input};
-use x11rb::{connection::Connection, protocol::xproto::*};
+use tuxscaling_input::{CursorOwner, InputRoute, PointerViewport, X11Input};
+use x11rb::{
+    connection::Connection,
+    protocol::{xproto::*, xtest::ConnectionExt as _},
+};
 
 #[test]
 #[ignore = "requires an X11 desktop and temporarily focuses a test window"]
@@ -61,26 +64,7 @@ fn keyboard_and_pointer_work_after_resize_and_release_on_close() {
     .unwrap();
     let key = |kind| {
         connection
-            .send_event(
-                false,
-                window,
-                EventMask::KEY_PRESS | EventMask::KEY_RELEASE,
-                KeyPressEvent {
-                    response_type: kind,
-                    detail: insert,
-                    sequence: 0,
-                    time: 0,
-                    root,
-                    event: window,
-                    child: 0,
-                    root_x: 100,
-                    root_y: 100,
-                    event_x: 100,
-                    event_y: 100,
-                    state: KeyButMask::default(),
-                    same_screen: true,
-                },
-            )
+            .xtest_fake_input(kind, insert, 0, root, 100, 100, 0)
             .unwrap()
             .check()
             .unwrap();
@@ -98,42 +82,30 @@ fn keyboard_and_pointer_work_after_resize_and_release_on_close() {
         .unwrap()
         .check()
         .unwrap();
-    key(KEY_PRESS_EVENT);
-    assert!(input.poll().toggle_overlay, "Insert must open the overlay");
-    key(KEY_RELEASE_EVENT);
+    connection.flush().unwrap();
+    thread::sleep(Duration::from_millis(30));
     input.poll();
+    key(KEY_PRESS_EVENT);
+    let opened = input.poll();
+    assert!(opened.toggle_overlay, "Insert must open the overlay");
+    assert_eq!(opened.cursor_owner, CursorOwner::Overlay);
+    key(KEY_RELEASE_EVENT);
+    let released = input.poll();
+    assert_eq!(released.cursor_owner, CursorOwner::Overlay);
     connection
-        .send_event(
-            false,
-            window,
-            EventMask::POINTER_MOTION,
-            MotionNotifyEvent {
-                response_type: MOTION_NOTIFY_EVENT,
-                detail: Motion::NORMAL,
-                sequence: 0,
-                time: 0,
-                root,
-                event: window,
-                child: 0,
-                root_x: 200,
-                root_y: 150,
-                event_x: 200,
-                event_y: 150,
-                state: KeyButMask::default(),
-                same_screen: true,
-            },
-        )
+        .warp_pointer(0u32, window, 0, 0, 0, 0, 200, 150)
         .unwrap()
         .check()
         .unwrap();
     connection.flush().unwrap();
     thread::sleep(Duration::from_millis(30));
+    let frame = input.poll();
     assert!(
-        input
-            .poll()
+        frame
             .events
             .iter()
-            .any(|event| matches!(event, egui::Event::PointerMoved(_)))
+            .any(|event| matches!(event, egui::Event::PointerMoved(_))),
+        "expected a genuine X11 pointer event after opening the overlay, got {frame:?}",
     );
     key(KEY_PRESS_EVENT);
     assert!(input.poll().toggle_overlay, "Insert must close the overlay");

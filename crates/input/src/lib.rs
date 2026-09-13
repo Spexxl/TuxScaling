@@ -14,6 +14,8 @@ const ENTER_NOTIFY: c_int = 7;
 const LEAVE_NOTIFY: c_int = 8;
 const FOCUS_IN: c_int = 9;
 const FOCUS_OUT: c_int = 10;
+const NOTIFY_GRAB: c_int = 1;
+const NOTIFY_UNGRAB: c_int = 2;
 const INSERT_KEYSYM: c_ulong = 0xff63;
 const POINTER_GRAB_MASK: c_ulong = (1 << 2) | (1 << 3) | (1 << 6);
 const PASSIVE_EVENT_MASK: c_long = 1 | 2 | 4 | 8 | 16 | 32 | (1 << 6) | (1 << 21);
@@ -333,6 +335,10 @@ pub fn should_forward_to_game(route: &InputRoute, overlay_open: bool) -> bool {
         && route.event_window != route.game_window
 }
 
+const fn focus_out_closes_overlay(mode: c_int) -> bool {
+    !matches!(mode, NOTIFY_GRAB | NOTIFY_UNGRAB)
+}
+
 pub struct X11Input {
     _library: Library,
     _xtest_library: Option<Library>,
@@ -642,7 +648,10 @@ impl X11Input {
                     if self.overlay_open {
                         frame.events.push(Event::WindowFocused(kind == FOCUS_IN));
                     }
-                    if kind == FOCUS_OUT {
+                    // XGrabKeyboard/XUngrabKeyboard emit focus transitions
+                    // with NotifyGrab/NotifyUngrab. They acknowledge the
+                    // overlay's own input grab, rather than a real focus loss.
+                    if kind == FOCUS_OUT && focus_out_closes_overlay(event.mode) {
                         self.pointer_present = false;
                         if self.overlay_open {
                             self.overlay_open = false;
@@ -981,5 +990,13 @@ mod tests {
                 CursorOwner::Native
             );
         }
+    }
+
+    #[test]
+    fn focus_grab_transitions_do_not_close_the_overlay() {
+        assert!(!super::focus_out_closes_overlay(super::NOTIFY_GRAB));
+        assert!(!super::focus_out_closes_overlay(super::NOTIFY_UNGRAB));
+        assert!(super::focus_out_closes_overlay(0));
+        assert!(super::focus_out_closes_overlay(3));
     }
 }
