@@ -2806,11 +2806,13 @@ unsafe fn create_swapchain_inner(
             },
         );
         if virtual_eligible {
-            let mut surfaces = surfaces().lock().unwrap_or_else(|error| error.into_inner());
-            if let Some(surface) = surfaces.get_mut(&original.surface) {
-                surface.logical_extent = Some(original.image_extent);
-                surface.logical_capabilities = advertised_logical_capabilities;
-                surface.negotiation = negotiation;
+            {
+                let mut surfaces = surfaces().lock().unwrap_or_else(|error| error.into_inner());
+                if let Some(surface) = surfaces.get_mut(&original.surface) {
+                    surface.logical_extent = Some(original.image_extent);
+                    surface.logical_capabilities = advertised_logical_capabilities;
+                    surface.negotiation = negotiation;
+                }
             }
             unsafe { *swapchain = logical_handle };
             publish_negotiation(original.surface, negotiation);
