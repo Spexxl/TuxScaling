@@ -39,6 +39,7 @@ fn keyboard_and_pointer_work_after_resize_and_release_on_close() {
         .unwrap()
         .check()
         .unwrap();
+    connection.get_input_focus().unwrap().reply().unwrap();
     let setup = connection.setup();
     let mapping = connection
         .get_keyboard_mapping(setup.min_keycode, setup.max_keycode - setup.min_keycode + 1)
@@ -82,6 +83,7 @@ fn keyboard_and_pointer_work_after_resize_and_release_on_close() {
         .unwrap()
         .check()
         .unwrap();
+    connection.get_input_focus().unwrap().reply().unwrap();
     connection.flush().unwrap();
     thread::sleep(Duration::from_millis(30));
     input.poll();
