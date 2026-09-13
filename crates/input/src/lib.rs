@@ -17,6 +17,7 @@ const FOCUS_OUT: c_int = 10;
 const INSERT_KEYSYM: c_ulong = 0xff63;
 const ANY_MODIFIER: c_uint = 1 << 15;
 const GRAB_MODE_ASYNC: c_int = 1;
+const SHAPE_INPUT: c_int = 2;
 const POINTER_GRAB_MASK: c_ulong = (1 << 2) | (1 << 3) | (1 << 6);
 const PASSIVE_EVENT_MASK: c_long = 1 | 2 | 4 | 8 | 16 | 32 | (1 << 6) | (1 << 21);
 
@@ -173,6 +174,10 @@ type QueryXFixesExtension = unsafe extern "C" fn(*mut Display, *mut c_int, *mut 
 type QueryXFixesVersion = unsafe extern "C" fn(*mut Display, *mut c_int, *mut c_int) -> c_int;
 type HideCursor = unsafe extern "C" fn(*mut Display, c_ulong);
 type ShowCursor = unsafe extern "C" fn(*mut Display, c_ulong);
+type CreateRegion = unsafe extern "C" fn(*mut Display, *const std::ffi::c_void, c_int) -> c_ulong;
+type DestroyRegion = unsafe extern "C" fn(*mut Display, c_ulong);
+type SetWindowShapeRegion =
+    unsafe extern "C" fn(*mut Display, c_ulong, c_int, c_int, c_int, c_ulong);
 
 #[derive(Debug, Error)]
 pub enum InputError {
@@ -331,10 +336,12 @@ pub fn should_accept_event(route: &InputRoute, event_window: u64) -> bool {
     route.event_window != 0 && event_window == route.event_window
 }
 
-pub fn should_accept_toggle_key(route: &InputRoute, event_window: u64) -> bool {
+pub fn should_accept_toggle_key(route: &InputRoute, hotkey_window: u64, event_window: u64) -> bool {
     route.event_window != 0
-        && (event_window == route.event_window
-            || (route.game_window != 0 && event_window == route.game_window))
+        && event_window != 0
+        && (event_window == hotkey_window
+            || event_window == route.event_window
+            || event_window == route.game_window)
 }
 
 pub const fn overlay_hotkey_uses_passive_grab(overlay_open: bool) -> bool {
@@ -342,10 +349,8 @@ pub const fn overlay_hotkey_uses_passive_grab(overlay_open: bool) -> bool {
 }
 
 pub fn should_forward_to_game(route: &InputRoute, overlay_open: bool) -> bool {
-    !overlay_open
-        && route.event_window != 0
-        && route.game_window != 0
-        && route.event_window != route.game_window
+    let _ = (route, overlay_open);
+    false
 }
 
 const fn focus_out_closes_overlay(_mode: c_int) -> bool {
@@ -358,6 +363,7 @@ pub struct X11Input {
     _xfixes_library: Option<Library>,
     display: *mut Display,
     route: InputRoute,
+    root_window: c_ulong,
     event_window: c_ulong,
     insert_keycode: u8,
     overlay_open: bool,
@@ -381,6 +387,9 @@ pub struct X11Input {
     fake_relative_motion: Option<FakeRelativeMotionEvent>,
     hide_cursor: Option<HideCursor>,
     show_cursor: Option<ShowCursor>,
+    empty_input_region: c_ulong,
+    destroy_region: Option<DestroyRegion>,
+    set_window_shape_region: Option<SetWindowShapeRegion>,
 }
 
 unsafe impl Send for X11Input {}
@@ -430,13 +439,17 @@ impl X11Input {
             load::<FakeRelativeMotionEvent>(library, b"XTestFakeRelativeMotionEvent\0").ok()
         });
         let xfixes_library = unsafe { Library::new("libXfixes.so.3") }.ok();
-        let xfixes_cursor = xfixes_library.as_ref().and_then(|library| {
+        let xfixes = xfixes_library.as_ref().and_then(|library| {
             let query_extension =
                 load::<QueryXFixesExtension>(library, b"XFixesQueryExtension\0").ok()?;
             let query_version =
                 load::<QueryXFixesVersion>(library, b"XFixesQueryVersion\0").ok()?;
             let hide_cursor = load::<HideCursor>(library, b"XFixesHideCursor\0").ok()?;
             let show_cursor = load::<ShowCursor>(library, b"XFixesShowCursor\0").ok()?;
+            let create_region = load::<CreateRegion>(library, b"XFixesCreateRegion\0").ok()?;
+            let destroy_region = load::<DestroyRegion>(library, b"XFixesDestroyRegion\0").ok()?;
+            let set_window_shape_region =
+                load::<SetWindowShapeRegion>(library, b"XFixesSetWindowShapeRegion\0").ok()?;
             let mut event_base = 0;
             let mut error_base = 0;
             let mut major = 0;
@@ -446,19 +459,34 @@ impl X11Input {
                     && query_version(display, &mut major, &mut minor) != 0
                     && (major > 4 || major == 4 && minor >= 0)
             };
-            available.then_some((hide_cursor, show_cursor))
+            available.then(|| {
+                let empty_input_region = unsafe { create_region(display, std::ptr::null(), 0) };
+                (
+                    hide_cursor,
+                    show_cursor,
+                    destroy_region,
+                    set_window_shape_region,
+                    empty_input_region,
+                )
+            })
         });
-        if xfixes_cursor.is_none() {
-            eprintln!("TuxScaling input: XFixes cursor extension is unavailable");
+        if xfixes.is_none() {
+            eprintln!("TuxScaling input: XFixes input and cursor support is unavailable");
         }
-        let (hide_cursor, show_cursor) =
-            xfixes_cursor.map_or((None, None), |(hide, show)| (Some(hide), Some(show)));
+        let (hide_cursor, show_cursor, destroy_region, set_window_shape_region, empty_input_region) =
+            xfixes.map_or(
+                (None, None, None, None, 0),
+                |(hide, show, destroy, shape, region)| {
+                    (Some(hide), Some(show), Some(destroy), Some(shape), region)
+                },
+            );
         let input = Self {
             _library: library,
             _xtest_library: xtest_library,
             _xfixes_library: xfixes_library,
             display,
             route,
+            root_window: root,
             event_window: if route.event_window == 0 {
                 root
             } else {
@@ -486,6 +514,9 @@ impl X11Input {
             fake_relative_motion,
             hide_cursor,
             show_cursor,
+            empty_input_region,
+            destroy_region,
+            set_window_shape_region,
         };
         input.update_grab();
         let sync = load::<Sync>(&input._library, b"XSync\0")?;
@@ -531,7 +562,7 @@ impl X11Input {
                     let is_insert = event.keycode as u8 == self.insert_keycode;
                     if event.send_event != 0
                         || if is_insert {
-                            !should_accept_toggle_key(&self.route, event.window)
+                            !should_accept_toggle_key(&self.route, self.root_window, event.window)
                         } else {
                             !should_accept_event(&self.route, event.window)
                         }
@@ -551,7 +582,7 @@ impl X11Input {
                     let is_insert = event.keycode as u8 == self.insert_keycode;
                     if event.send_event != 0
                         || if is_insert {
-                            !should_accept_toggle_key(&self.route, event.window)
+                            !should_accept_toggle_key(&self.route, self.root_window, event.window)
                         } else {
                             !should_accept_event(&self.route, event.window)
                         }
@@ -719,6 +750,7 @@ impl X11Input {
     fn update_grab(&self) {
         if self.overlay_open {
             self.release_insert_hotkey();
+            self.set_presenter_interactive(true);
             unsafe {
                 (self.grab_keyboard)(self.display, self.event_window, 0, 1, 1, 0);
                 (self.grab_pointer)(
@@ -738,6 +770,7 @@ impl X11Input {
                 (self.ungrab_keyboard)(self.display, 0);
                 (self.ungrab_pointer)(self.display, 0);
             }
+            self.set_presenter_interactive(false);
             self.grab_insert_hotkey();
         }
         unsafe {
@@ -781,13 +814,32 @@ impl X11Input {
     }
 
     fn hotkey_windows(&self) -> impl Iterator<Item = c_ulong> {
-        let event = self.event_window;
-        let game = self.route.game_window as c_ulong;
-        [event, game]
-            .into_iter()
-            .filter(move |window| *window != 0)
-            .enumerate()
-            .filter_map(move |(index, window)| (index == 0 || window != event).then_some(window))
+        std::iter::once(self.root_window).filter(|window| *window != 0)
+    }
+
+    fn set_presenter_interactive(&self, interactive: bool) {
+        if self.route.event_window == 0
+            || self.route.event_window == self.route.game_window
+            || self.empty_input_region == 0
+        {
+            return;
+        }
+        if let Some(set_window_shape_region) = self.set_window_shape_region {
+            unsafe {
+                set_window_shape_region(
+                    self.display,
+                    self.event_window,
+                    SHAPE_INPUT,
+                    0,
+                    0,
+                    if interactive {
+                        0
+                    } else {
+                        self.empty_input_region
+                    },
+                );
+            }
+        }
     }
 
     fn update_cursor_visibility(&mut self) {
@@ -886,6 +938,12 @@ impl Drop for X11Input {
                 self.release_insert_hotkey();
                 (self.ungrab_keyboard)(self.display, 0);
                 (self.ungrab_pointer)(self.display, 0);
+                self.set_presenter_interactive(false);
+                if self.empty_input_region != 0
+                    && let Some(destroy_region) = self.destroy_region
+                {
+                    destroy_region(self.display, self.empty_input_region);
+                }
                 (self.close_display)(self.display);
             }
         }
@@ -1041,15 +1099,16 @@ mod tests {
     }
 
     #[test]
-    fn event_and_forwarding_policy_prevents_feedback_when_overlay_is_open() {
+    fn separate_presenter_never_synthesizes_pointer_input_back_to_itself() {
         let route = route();
 
         assert!(should_accept_event(&route, route.event_window));
         assert!(!should_accept_event(&route, route.game_window));
-        assert!(should_accept_toggle_key(&route, route.event_window));
-        assert!(should_accept_toggle_key(&route, route.game_window));
-        assert!(!should_accept_toggle_key(&route, 0x1));
-        assert!(should_forward_to_game(&route, false));
+        assert!(should_accept_toggle_key(&route, 0x1, route.event_window));
+        assert!(should_accept_toggle_key(&route, 0x1, route.game_window));
+        assert!(should_accept_toggle_key(&route, 0x1, 0x1));
+        assert!(!should_accept_toggle_key(&route, 0x1, 0x2));
+        assert!(!should_forward_to_game(&route, false));
         assert!(!should_forward_to_game(&route, true));
         assert!(!should_forward_to_game(
             &InputRoute::new(

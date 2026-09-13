@@ -6,7 +6,10 @@ use tuxscaling_input::{CursorOwner, InputFrame, InputRoute, PointerViewport, X11
 use x11rb::{
     connection::Connection,
     protocol::{
-        xproto::ConnectionExt as XprotoConnectionExt, xproto::*, xtest::ConnectionExt as _,
+        shape::{ConnectionExt as ShapeConnectionExt, SK},
+        xproto::ConnectionExt as XprotoConnectionExt,
+        xproto::*,
+        xtest::ConnectionExt as _,
     },
 };
 
@@ -202,4 +205,123 @@ fn keyboard_and_pointer_work_after_resize_and_release_on_close() {
     assert_eq!(reply.status, GrabStatus::SUCCESS);
     connection.ungrab_keyboard(0u32).unwrap().check().unwrap();
     connection.destroy_window(window).unwrap().check().unwrap();
+}
+
+#[test]
+#[ignore = "requires an X11 desktop and temporarily focuses a test window"]
+fn presenter_accepts_input_only_while_the_overlay_is_open() {
+    let (connection, screen) = x11rb::connect(None).unwrap();
+    let root = connection.setup().roots[screen].root;
+    let root_geometry = connection.get_geometry(root).unwrap().reply().unwrap();
+    let game_window = connection.generate_id().unwrap();
+    connection
+        .create_window(
+            0,
+            game_window,
+            root,
+            0,
+            0,
+            320,
+            240,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &CreateWindowAux::new().override_redirect(1),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    connection.map_window(game_window).unwrap().check().unwrap();
+    connection.flush().unwrap();
+    let presenter = tuxscaling_display::PresenterWindow::new(
+        game_window.into(),
+        tuxscaling_display::Monitor::new(tuxscaling_display::Rect::new(
+            0,
+            0,
+            root_geometry.width.into(),
+            root_geometry.height.into(),
+        )),
+    )
+    .unwrap();
+    let presenter_window = presenter.window();
+    let mut input = X11Input::connect(InputRoute::new(
+        presenter_window.into(),
+        game_window.into(),
+        [root_geometry.width.into(), root_geometry.height.into()],
+        [320, 240],
+        PointerViewport {
+            offset: [0.0, 0.0],
+            extent: [root_geometry.width.into(), root_geometry.height.into()],
+        },
+    ))
+    .unwrap();
+    let input_rectangles = || {
+        connection
+            .shape_get_rectangles(presenter_window, SK::INPUT)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .rectangles
+    };
+    assert!(input_rectangles().is_empty());
+
+    ensure_focused(&connection, game_window);
+    let setup = connection.setup();
+    let mapping = connection
+        .get_keyboard_mapping(setup.min_keycode, setup.max_keycode - setup.min_keycode + 1)
+        .unwrap()
+        .reply()
+        .unwrap();
+    let insert = mapping
+        .keysyms
+        .chunks(mapping.keysyms_per_keycode as usize)
+        .position(|keys| keys.first() == Some(&0xff63))
+        .unwrap() as u8
+        + setup.min_keycode;
+    let key = |kind| {
+        connection
+            .xtest_fake_input(kind, insert, 0, root, 100, 100, 0)
+            .unwrap()
+            .check()
+            .unwrap();
+        connection.flush().unwrap();
+        barrier(&connection);
+    };
+
+    let mut opened = None;
+    for _ in 0..MAX_TOGGLE_ATTEMPTS {
+        ensure_focused(&connection, game_window);
+        key(KEY_PRESS_EVENT);
+        let frame = wait_frame(&mut input, EVENT_DEADLINE, |frame| frame.toggle_overlay);
+        key(KEY_RELEASE_EVENT);
+        input.poll();
+        if frame.toggle_overlay && frame.cursor_owner == CursorOwner::Overlay {
+            opened = Some(frame);
+            break;
+        }
+    }
+    assert!(opened.is_some(), "Insert must open the overlay");
+    assert!(!input_rectangles().is_empty());
+
+    let mut closed = None;
+    for _ in 0..MAX_TOGGLE_ATTEMPTS {
+        key(KEY_PRESS_EVENT);
+        let frame = wait_frame(&mut input, EVENT_DEADLINE, |frame| frame.toggle_overlay);
+        key(KEY_RELEASE_EVENT);
+        input.poll();
+        if frame.toggle_overlay && frame.cursor_owner == CursorOwner::Native {
+            closed = Some(frame);
+            break;
+        }
+    }
+    assert!(closed.is_some(), "Insert must close the overlay");
+    assert!(input_rectangles().is_empty());
+
+    drop(input);
+    drop(presenter);
+    connection
+        .destroy_window(game_window)
+        .unwrap()
+        .check()
+        .unwrap();
 }

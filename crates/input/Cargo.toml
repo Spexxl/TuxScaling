@@ -11,4 +11,5 @@ thiserror.workspace = true
 libloading.workspace = true
 
 [dev-dependencies]
+tuxscaling-display = { path = "../display" }
 x11rb.workspace = true

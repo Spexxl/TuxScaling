@@ -3,9 +3,10 @@ use std::ffi::c_void;
 use x11rb::{
     COPY_DEPTH_FROM_PARENT,
     connection::Connection,
-    protocol::xfixes::ConnectionExt as _,
-    protocol::xproto::{
-        AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, WindowClass,
+    protocol::{
+        shape::SK,
+        xfixes::ConnectionExt as _,
+        xproto::{AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, WindowClass},
     },
     wrapper::ConnectionExt as _,
     xcb_ffi::XCBConnection,
@@ -92,6 +93,11 @@ impl PresenterWindow {
     pub fn new(game_window: u64, monitor: Monitor) -> Result<Self, DisplayError> {
         let rect = presenter_geometry(monitor).ok_or(DisplayError::Geometry)?;
         let (connection, screen_number) = XCBConnection::connect(None).map_err(operation)?;
+        connection
+            .xfixes_query_version(5, 0)
+            .map_err(operation)?
+            .reply()
+            .map_err(operation)?;
         let screen = connection
             .setup()
             .roots
@@ -134,6 +140,24 @@ impl PresenterWindow {
             .map_err(operation)?
             .check()
             .map_err(operation)?;
+        let empty_input = connection.generate_id().map_err(operation)?;
+        connection
+            .xfixes_create_region(empty_input, &[])
+            .map_err(operation)?
+            .check()
+            .map_err(operation)?;
+        let input_result = connection
+            .xfixes_set_window_shape_region(window, SK::INPUT, 0, 0, empty_input)
+            .map_err(operation)?
+            .check()
+            .map_err(operation);
+        let destroy_result = connection
+            .xfixes_destroy_region(empty_input)
+            .map_err(operation)?
+            .check()
+            .map_err(operation);
+        input_result?;
+        destroy_result?;
         connection
             .map_window(window)
             .map_err(operation)?
@@ -301,7 +325,10 @@ mod tests {
     #[test]
     #[ignore = "requires a nested XWayland display"]
     fn presenter_preserves_original_window_and_owns_its_xcb_connection() {
-        use x11rb::protocol::xproto::{ConnectionExt, CreateWindowAux, WindowClass};
+        use x11rb::protocol::{
+            shape::{ConnectionExt as ShapeConnectionExt, SK},
+            xproto::{ConnectionExt, CreateWindowAux, WindowClass},
+        };
         use x11rb::{COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT, connection::Connection};
 
         let (connection, screen_number) = x11rb::xcb_ffi::XCBConnection::connect(None).unwrap();
@@ -353,6 +380,15 @@ mod tests {
             .reply()
             .unwrap();
         assert!(attributes.override_redirect);
+        let input_shape = connection
+            .shape_get_rectangles(info.window, SK::INPUT)
+            .unwrap()
+            .reply()
+            .unwrap();
+        assert!(
+            input_shape.rectangles.is_empty(),
+            "a closed presenter must be click-through"
+        );
         let after = connection
             .get_geometry(game_window)
             .unwrap()
