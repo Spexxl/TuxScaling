@@ -79,14 +79,17 @@ Contracts that cannot be translated select direct presentation before a logical 
 
 Wine/Proton Win32 surfaces (`vkCreateWin32SurfaceKHR`) are translated as a generic WSI contract without executable, Steam app, Wine prefix, or game detection. The layer associates the surface with the calling process X11 window through `_NET_WM_PID`, preferring the largest valid window when several belong to the process. When no window exists yet, the surface stays pending and swapchain creation retries the association; unrelated unknown surfaces (including native Wayland) remain direct presentation. Configure requests use parent-relative coordinates because Wine reparents game windows into frame windows. Exact monitor geometry counts as native output without requiring the EWMH fullscreen flag, which Wine-owned windows never retain; stale logical capability overrides are dropped whenever virtualization is abandoned with no live virtual swapchain, so capability queries stay truthful. Applications that track the window size and adopt a promoted window as their own resolution simply go direct with no logical predecessor inferred: the lease is kept, so a later smaller request promotes idempotently and virtualizes again without disturbing the window. The overlay itself only exists on virtual swapchains.
 
-Run `cargo xtask wsi-compatibility --backend fsr_3_1_4` for the portable mutable-format, present-wait, HDR-replacement, display-timing, and incompatible-direct scenarios. It requires a display-backed X11/XWayland session and Vulkan validation; the native extent is read from the active monitor at runtime. If the required display-timing or display-control extension is unavailable, that scenario is reported as `unverified` rather than passed. The current milestone covers X11/XWayland only; native Wayland remains direct presentation.
+Run `cargo xtask wsi-compatibility --backend fsr_3_1_4` for the portable mutable-format, present-wait, HDR-replacement, display-timing, and incompatible-direct scenarios. It requires a display-backed X11/XWayland session and Vulkan validation; the native extent is read from the active monitor at runtime. If the required display-timing or display-control extension is unavailable, that scenario is reported as `unverified` rather than passed. `cargo xtask wsi-compatibility --allow-unverified display_timing` keeps the other scenarios strict and only excuses a clean `unverified` display-timing result. The current milestone covers X11/XWayland only; native Wayland remains direct presentation.
 
 The default profile is equivalent to:
 
 ```toml
-motion_quality = "ultra"
+motion_quality = "balanced"
 output_resolution = "native"
 guidance_scale = 1.0
+guidance_mode = "estimated"
+sharpening_enabled = true
+sharpness = 0.2
 debug_view = "original"
 upscaler = "reference"
 ```
@@ -99,7 +102,21 @@ Run the acceptance benchmark with `cargo xtask benchmark`. It builds the release
 
 The deterministic acceptance gates are shared across presets and tested scales: mean motion EPE `<= 1.0 px`, p95 EPE `<= 2.0 px`, confidence AUROC `>= 0.90`, disocclusion F1 `>= 0.75`, reactive F1 `>= 0.70`, composition F1 `>= 0.65`, exposure error `<= 0.15 EV`, and depth ordering `>= 0.85`. `tests/fixtures/quality-baselines.txt` lists the stable metric names; it does not replace the actual estimator gate.
 
-Run a controlled visible `vkcube` session with `cargo xtask vkcube --seconds 10`. The runner builds the layer in the selected debug or release profile, enables the TuxScaling and Vulkan validation layers, captures both child output streams, requires the layer's `TuxScaling swapchain:` evidence, rejects validation errors, and terminates and reaps `vkcube` after the requested interval. Use `--release` for the release profile and `--seconds N` for a positive duration. For a finite normal-exit maintenance regression, use the display-backed environment and command below after the maintenance smoke gates:
+Run a controlled visible `vkcube` session with `cargo xtask vkcube --seconds 10`. The runner builds the layer in the selected debug or release profile, loads it from the active Cargo target directory, enables the TuxScaling and Vulkan validation layers, captures both child output streams, requires the layer's `TuxScaling swapchain:` evidence, rejects validation errors, and terminates and reaps `vkcube` after the requested interval. Use `--release` for the release profile, `--seconds N` for a positive duration, `--backend fsr_3_1_4` for FSR, and `--control-sequence` to apply overlay-equivalent upscaler, guidance, quality, and sharpening toggles without recreating the presenter.
+
+For nested visual-quality captures:
+
+```bash
+cargo xtask visual-quality --display nested-xwayland --input 1280x720 --output 2160x1440 --warmup 180 --frames 120
+```
+
+Proton/R.E.P.O. acceptance is opt-in and never infers a game command. Probe the host without launching anything:
+
+```bash
+cargo xtask proton-acceptance --evidence-dir target/proton-evidence --preflight-only
+```
+
+A full session still requires `--game-command -- <explicit game command>`. For a finite normal-exit maintenance regression, use the display-backed environment and command below after the maintenance smoke gates:
 
 ```bash
 env \
