@@ -108,6 +108,15 @@ fn record_secondary_transaction<E>(
     execute();
     Ok(())
 }
+
+fn submitted_fences(fences: &[vk::Fence]) -> Vec<vk::Fence> {
+    fences
+        .iter()
+        .copied()
+        .filter(|fence| *fence != vk::Fence::null())
+        .collect()
+}
+
 const GPU_PHASES: usize = 15;
 const GPU_TIMESTAMPS: usize = 18;
 const GPU_WARMUP_FRAMES: u64 = 180;
@@ -1171,6 +1180,15 @@ impl SwapchainRuntime {
         self.slots.iter().map(|slot| slot.fence).collect()
     }
 
+    unsafe fn wait_for_in_flight_slots(&self) -> Result<(), vk::Result> {
+        let fences = submitted_fences(&self.diagnostic_fences());
+        if fences.is_empty() {
+            Ok(())
+        } else {
+            unsafe { self.device.wait_for_fences(&fences, true, u64::MAX) }
+        }
+    }
+
     unsafe fn service_diagnostic_capture(&mut self) {
         let fences = self.diagnostic_fences();
         if let Some(capture) = &mut self.diagnostic_capture {
@@ -1383,9 +1401,7 @@ impl SwapchainRuntime {
         if (scale - self.diagnostics.guidance_scale).abs() < f32::EPSILON {
             return Ok(());
         }
-        for slot in &self.slots {
-            unsafe { self.device.wait_for_fences(&[slot.fence], true, u64::MAX) }?;
-        }
+        unsafe { self.wait_for_in_flight_slots()? };
         let mut config = self.temporal.config.clone();
         config.guidance_scale = scale;
         let resolution = ResolutionPlan::new(
@@ -1654,6 +1670,12 @@ impl SwapchainRuntime {
             *state = "Unavailable".into();
         }
         self.diagnostics.depth_semantics = "FlatFallback".into();
+        // Destroying FSR pipelines must wait every in-flight slot, not only
+        // the image being recorded. The current fence is already idle, but
+        // sibling command buffers can still reference the old backend.
+        if self.temporal.pending_upscaler.is_some() {
+            unsafe { self.wait_for_in_flight_slots()? };
+        }
         // A pending switch back to a real upscaler falls through to the
         // normal path below so simulations resume on this very frame. Every
         // other disabled state skips all simulation stages: no capture
@@ -2605,8 +2627,8 @@ impl Drop for SwapchainRuntime {
         // The final submitted frame has no following prepare call to service
         // its diagnostic fence.  Drain all completed readbacks before
         // shutting capture down so the requested frame range is durable.
+        let _ = unsafe { self.device.device_wait_idle() };
         if self.diagnostic_capture.is_some() {
-            let _ = unsafe { self.device.device_wait_idle() };
             unsafe { self.service_diagnostic_capture() };
         }
         if let Some(capture) = &mut self.diagnostic_capture {
@@ -2689,10 +2711,26 @@ impl Drop for SwapchainRuntime {
 mod tests {
     use super::{
         GPU_PHASES, GpuTimingWindow, SwapchainImages, backend_debug_view, debug_mode_id,
-        record_secondary_transaction,
+        record_secondary_transaction, submitted_fences,
     };
     use ash::vk;
     use ash::vk::Handle;
+
+    #[test]
+    fn submitted_fences_include_every_in_flight_slot_before_backend_teardown() {
+        let current = vk::Fence::from_raw(11);
+        let fences = [
+            vk::Fence::null(),
+            current,
+            vk::Fence::from_raw(22),
+            vk::Fence::from_raw(33),
+        ];
+        let waited = submitted_fences(&fences);
+        assert_eq!(
+            waited,
+            vec![current, vk::Fence::from_raw(22), vk::Fence::from_raw(33)]
+        );
+    }
 
     #[test]
     fn accepts_independent_logical_and_physical_image_counts() {
