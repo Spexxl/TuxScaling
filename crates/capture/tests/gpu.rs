@@ -271,5 +271,6 @@ fn capture_resampling_applies_experimental_subpixel_jitter_without_changing_off(
         assert_eq!(&off[4..8], &[32, 0, 0, 255]);
         assert_ne!(&on[4..8], &[32, 0, 0, 255]);
         assert!(on[4] > 32);
+        eprintln!("capture jitter: off_red={} jittered_red={}", off[4], on[4]);
     }
 }

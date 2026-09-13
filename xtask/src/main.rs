@@ -826,6 +826,7 @@ struct VisualQualityOptions {
     output: (u32, u32),
     warmup: usize,
     frames: usize,
+    skip_gpu_evidence: bool,
 }
 
 fn parse_extent_argument(name: &str, value: &str) -> Result<(u32, u32), String> {
@@ -851,6 +852,7 @@ fn parse_visual_quality_args(args: &[&str]) -> Result<VisualQualityOptions, Stri
     let mut output = None;
     let mut warmup = 180_usize;
     let mut frames = 120_usize;
+    let mut skip_gpu_evidence = false;
     let mut index = 0;
     while index < args.len() {
         let argument = args[index];
@@ -896,6 +898,9 @@ fn parse_visual_quality_args(args: &[&str]) -> Result<VisualQualityOptions, Stri
                     .filter(|value| *value > 0)
                     .ok_or_else(|| "--frames requires a positive integer".to_owned())?;
             }
+            "--skip-gpu-evidence" => {
+                skip_gpu_evidence = true;
+            }
             value => return Err(format!("unknown visual-quality argument: {value}")),
         }
     }
@@ -905,6 +910,7 @@ fn parse_visual_quality_args(args: &[&str]) -> Result<VisualQualityOptions, Stri
         output: output.ok_or_else(|| "--output is required".to_owned())?,
         warmup,
         frames,
+        skip_gpu_evidence,
     })
 }
 
@@ -1692,6 +1698,7 @@ fn visual_quality_report(
     fsr: &[CaptureManifest],
     off: &[CaptureManifest],
     report_dir: &Path,
+    evidence: Option<&CollectedQualityEvidence>,
 ) -> Result<VisualQualityReport, String> {
     if fsr.len() != off.len() || fsr.is_empty() {
         return Err("FSR and Off capture series have different or empty lengths".into());
@@ -1821,41 +1828,47 @@ fn visual_quality_report(
         )
         .collect::<Vec<_>>();
     let category_gates_passed = categories.iter().all(|category| category.gate_passed);
-    let ablations = [
-        ("motion", first_fsr.ablations.motion),
-        ("relative_depth", first_fsr.ablations.relative_depth),
-        ("reactive", first_fsr.ablations.reactive),
-        ("composition", first_fsr.ablations.composition),
-        ("exposure", first_fsr.ablations.exposure),
-        (
-            "confidence_disocclusion",
-            first_fsr.ablations.confidence_disocclusion,
-        ),
-        (
-            "post_capture_jitter",
-            first_fsr.ablations.post_capture_jitter,
-        ),
-    ]
-    .into_iter()
-    .map(|(signal, disabled)| AblationReport {
-        signal: signal.into(),
-        estimated: (!disabled).to_string(),
-        fallback: disabled.to_string(),
-        status: "default Estimated run; dedicated per-signal ablation is recorded as a follow-up dimension".into(),
-    })
-    .collect();
-    let presets = [MotionQuality::Balanced, MotionQuality::Performance]
+    let ablations = match evidence {
+        Some(evidence) => quality_ablation_rows(evidence),
+        None => [
+            ("motion", first_fsr.ablations.motion),
+            ("relative_depth", first_fsr.ablations.relative_depth),
+            ("reactive", first_fsr.ablations.reactive),
+            ("composition", first_fsr.ablations.composition),
+            ("exposure", first_fsr.ablations.exposure),
+            (
+                "confidence_disocclusion",
+                first_fsr.ablations.confidence_disocclusion,
+            ),
+            (
+                "post_capture_jitter",
+                first_fsr.ablations.post_capture_jitter,
+            ),
+        ]
         .into_iter()
-        .map(|quality| PresetReport {
-            preset: format!("{quality:?}"),
-            quality_baseline: quality == MotionQuality::Balanced,
-            work_units: quality
-                .dispatch_plan(options.input.0, options.input.1)
-                .candidate_evaluations,
-            timing_status:
-                "capture GPU timings are present; preset comparison requires separate run".into(),
+        .map(|(signal, disabled)| AblationReport {
+            signal: signal.into(),
+            estimated: (!disabled).to_string(),
+            fallback: disabled.to_string(),
+            status: "default Estimated run; GPU evidence skipped (--skip-gpu-evidence), run without the flag for the measured ablation matrix".into(),
         })
-        .collect();
+        .collect(),
+    };
+    let presets = match evidence {
+        Some(evidence) => quality_preset_rows(evidence, options.input),
+        None => [MotionQuality::Balanced, MotionQuality::Performance]
+            .into_iter()
+            .map(|quality| PresetReport {
+                preset: format!("{quality:?}"),
+                quality_baseline: quality == MotionQuality::Balanced,
+                work_units: quality
+                    .dispatch_plan(options.input.0, options.input.1)
+                    .candidate_evaluations,
+                timing_status:
+                    "capture GPU timings are present; GPU evidence skipped (--skip-gpu-evidence), run without the flag for the measured preset comparison".into(),
+            })
+            .collect(),
+    };
     let mut timing_sum = vec![0.0_f32; first_fsr.gpu_timings_ms.len()];
     for frame in fsr {
         for (sum, value) in timing_sum.iter_mut().zip(frame.gpu_timings_ms.iter()) {
@@ -1999,6 +2012,27 @@ fn run_visual_quality(root: &Path, options: &VisualQualityOptions) -> bool {
         );
         return false;
     }
+    // Fail fast on the measured ablation/preset evidence before the long
+    // scene captures; the GPU suites take seconds, the captures take minutes.
+    let evidence = if options.skip_gpu_evidence {
+        None
+    } else {
+        let gpu_dir = report_dir.join("gpu-evidence");
+        if fs::create_dir_all(&gpu_dir).is_err() {
+            eprintln!(
+                "cargo xtask visual-quality: unable to create {}",
+                gpu_dir.display()
+            );
+            return false;
+        }
+        match collect_quality_evidence(root, &gpu_dir, "cargo xtask visual-quality") {
+            Some(evidence) => Some(evidence),
+            None => {
+                eprintln!("cargo xtask visual-quality: GPU evidence stage failed");
+                return false;
+            }
+        }
+    };
     if !run(
         "cargo",
         &[
@@ -2091,14 +2125,21 @@ fn run_visual_quality(root: &Path, options: &VisualQualityOptions) -> bool {
             return false;
         }
     };
-    let report =
-        match visual_quality_report(options, &fsr_capture, &off_capture, &fsr, &off, &report_dir) {
-            Ok(report) => report,
-            Err(error) => {
-                eprintln!("cargo xtask visual-quality: quality gate failed: {error}");
-                return false;
-            }
-        };
+    let report = match visual_quality_report(
+        options,
+        &fsr_capture,
+        &off_capture,
+        &fsr,
+        &off,
+        &report_dir,
+        evidence.as_ref(),
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("cargo xtask visual-quality: quality gate failed: {error}");
+            return false;
+        }
+    };
     let json = match serde_json::to_string_pretty(&report) {
         Ok(json) => json,
         Err(error) => {
@@ -2702,6 +2743,421 @@ fn validation(command: &mut Command) -> &mut Command {
         .env("DISABLE_LSFG", "1")
 }
 
+struct QualityEvidenceSuite {
+    name: &'static str,
+    args: &'static [&'static str],
+    timeout_seconds: u64,
+}
+
+fn quality_evidence_suites() -> Vec<QualityEvidenceSuite> {
+    vec![
+        QualityEvidenceSuite {
+            name: "motion-presets",
+            args: &[
+                "test",
+                "-p",
+                "tuxscaling-motion",
+                "--test",
+                "gpu",
+                "--",
+                "performance_flow_is_faster_than_balanced_after_warmup",
+                "balanced_quality_regression_gate",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ],
+            timeout_seconds: 600,
+        },
+        QualityEvidenceSuite {
+            name: "upscaler-ablations",
+            args: &[
+                "test",
+                "-p",
+                "tuxscaling-upscaler",
+                "--features",
+                "fidelityfx",
+                "--test",
+                "fidelityfx_sequence_quality_gpu",
+                "--",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ],
+            timeout_seconds: 600,
+        },
+        QualityEvidenceSuite {
+            name: "temporal-fallbacks",
+            args: &[
+                "test",
+                "-p",
+                "tuxscaling-temporal",
+                "--test",
+                "gpu",
+                "--",
+                "zero_guidance_dispatches_coherent_fallback_resources",
+                "provider_failure_writes_fallback_guidance_and_labels_the_view",
+                "provider_failure_resets_history_before_the_next_valid_frame",
+                "relative_depth_orders_independent_parallax_planes",
+                "relative_depth_uses_flat_fallback_below_global_motion_threshold",
+                "relative_depth_uses_flat_fallback_below_affine_inlier_threshold",
+                "guidance_disocclusion_uses_flow_holes_and_boundaries",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ],
+            timeout_seconds: 600,
+        },
+        QualityEvidenceSuite {
+            name: "capture-jitter",
+            args: &[
+                "test",
+                "-p",
+                "tuxscaling-capture",
+                "--test",
+                "gpu",
+                "--",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ],
+            timeout_seconds: 600,
+        },
+    ]
+}
+
+/// Keep only the measured metric lines printed by the GPU suites; harness
+/// chatter (warnings, test names, result summaries) is dropped.
+fn quality_metric_lines(output: &str) -> Vec<String> {
+    const PREFIXES: [&str; 16] = [
+        "guidance_scale=",
+        "baseline fixture=",
+        "FSR sequence fixture:",
+        "FSR sequence aggregate:",
+        "FSR guidance modes:",
+        "disocclusion counts",
+        "disocclusion F1=",
+        "disocclusion mask:",
+        "transparency F1=",
+        "transparency mask:",
+        "disoccluded reconstruction error:",
+        "provider reset exposure:",
+        "relative depth parallax:",
+        "translated history:",
+        "guidance interior ",
+        "capture jitter:",
+    ];
+    output
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            PREFIXES
+                .iter()
+                .any(|prefix| trimmed.starts_with(prefix))
+                .then(|| trimmed.to_owned())
+        })
+        .collect()
+}
+
+fn number_after_marker(line: &str, marker: &str) -> Option<f32> {
+    let start = line.find(marker)? + marker.len();
+    line[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// Parse the `guidance_scale=... balanced_forward_backward_ms=.. performance_forward_backward_ms=..`
+/// line printed by the motion preset timing test.
+fn parse_preset_medians(output: &str) -> Option<(f32, f32)> {
+    const BALANCED: &str = "balanced_forward_backward_ms=";
+    const PERFORMANCE: &str = "performance_forward_backward_ms=";
+    let line = output
+        .lines()
+        .map(str::trim)
+        .find(|line| line.contains(BALANCED) && line.contains(PERFORMANCE))?;
+    Some((
+        number_after_marker(line, BALANCED)?,
+        number_after_marker(line, PERFORMANCE)?,
+    ))
+}
+
+struct QualitySuiteResult {
+    name: String,
+    metrics: Vec<String>,
+    log_file: String,
+}
+
+fn run_quality_evidence_suite(
+    root: &Path,
+    suite: &QualityEvidenceSuite,
+    dir: &Path,
+) -> Option<QualitySuiteResult> {
+    let mut command = Command::new("cargo");
+    command
+        .args(suite.args)
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let (output, timed_out) = command_output_with_timeout(command, suite.timeout_seconds).ok()?;
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log_file = format!("{}.log", suite.name);
+    if fs::write(dir.join(&log_file), combined.as_bytes()).is_err() {
+        eprintln!("cargo xtask quality-evidence: unable to write {log_file}");
+        return None;
+    }
+    if timed_out || !output.status.success() {
+        eprintln!("cargo xtask quality-evidence: suite {} failed", suite.name);
+        return None;
+    }
+    for metric in quality_metric_lines(&combined) {
+        println!("quality-evidence {}: {metric}", suite.name);
+    }
+    Some(QualitySuiteResult {
+        name: suite.name.to_owned(),
+        metrics: quality_metric_lines(&combined),
+        log_file,
+    })
+}
+
+#[derive(Serialize)]
+struct QualityEvidenceSuiteReport {
+    name: String,
+    passed: bool,
+    metrics: Vec<String>,
+    log: String,
+}
+
+#[derive(Serialize)]
+struct QualityEvidenceReport {
+    command: String,
+    timestamp: u64,
+    balanced_forward_backward_ms: f32,
+    performance_forward_backward_ms: f32,
+    performance_cheaper: bool,
+    suites: Vec<QualityEvidenceSuiteReport>,
+}
+
+/// Freshly measured GPU evidence shared by `quality-evidence` and the
+/// `visual-quality` pre-stage: per-suite metric lines plus the parsed
+/// Balanced-versus-Performance medians.
+struct CollectedQualityEvidence {
+    suites: Vec<QualityEvidenceSuiteReport>,
+    balanced_median: f32,
+    performance_median: f32,
+}
+
+fn collect_quality_evidence(
+    root: &Path,
+    dir: &Path,
+    command: &str,
+) -> Option<CollectedQualityEvidence> {
+    let mut suites = Vec::new();
+    for suite in quality_evidence_suites() {
+        let result = run_quality_evidence_suite(root, &suite, dir)?;
+        suites.push(QualityEvidenceSuiteReport {
+            name: result.name,
+            passed: true,
+            metrics: result.metrics,
+            log: result.log_file,
+        });
+    }
+    let preset_medians = suites
+        .iter()
+        .find(|suite| suite.name == "motion-presets")
+        .and_then(|suite| parse_preset_medians(&suite.metrics.join("\n")));
+    let Some((balanced_median, performance_median)) = preset_medians else {
+        eprintln!("{command}: motion-presets suite did not print preset medians");
+        return None;
+    };
+    Some(CollectedQualityEvidence {
+        suites,
+        balanced_median,
+        performance_median,
+    })
+}
+
+fn suite_metrics<'a>(evidence: &'a CollectedQualityEvidence, name: &str) -> Vec<&'a str> {
+    evidence
+        .suites
+        .iter()
+        .filter(|suite| suite.name == name)
+        .flat_map(|suite| suite.metrics.iter().map(String::as_str))
+        .collect()
+}
+
+/// Build the ablation matrix from freshly measured suite evidence. Every row
+/// names the covering suites (all freshly passed) plus the signal-specific
+/// measured lines; the full suite logs sit next to the report.
+fn quality_ablation_rows(evidence: &CollectedQualityEvidence) -> Vec<AblationReport> {
+    const SIGNALS: [(&str, &str, &[&str]); 7] = [
+        (
+            "motion",
+            "zero_vs_off_mse",
+            &["upscaler-ablations", "temporal-fallbacks"],
+        ),
+        (
+            "relative_depth",
+            "relative depth parallax:",
+            &["upscaler-ablations", "temporal-fallbacks"],
+        ),
+        ("reactive", "", &["upscaler-ablations"]),
+        ("composition", "", &["upscaler-ablations"]),
+        (
+            "exposure",
+            "provider reset exposure:",
+            &["upscaler-ablations", "temporal-fallbacks"],
+        ),
+        (
+            "confidence_disocclusion",
+            "disocclusion F1=",
+            &["upscaler-ablations", "temporal-fallbacks"],
+        ),
+        (
+            "post_capture_jitter",
+            "capture jitter:",
+            &["upscaler-ablations", "capture-jitter"],
+        ),
+    ];
+    SIGNALS
+        .into_iter()
+        .map(|(signal, marker, suites)| {
+            let mut parts = Vec::new();
+            for suite in suites {
+                for metric in suite_metrics(evidence, suite) {
+                    if marker.is_empty() || metric.contains(marker) {
+                        parts.push(format!("{suite}: {metric}"));
+                    }
+                }
+            }
+            // Every covering suite passed or collection would have failed; the
+            // one-hot ablation assertions inside the suites are the evidence
+            // even where no single printed line names the signal.
+            let mut seen = std::collections::BTreeSet::new();
+            for suite in suites {
+                seen.insert((*suite).to_owned());
+            }
+            AblationReport {
+                signal: signal.into(),
+                estimated: "true".into(),
+                fallback: "true".into(),
+                status: format!(
+                    "measured: one-hot ablation distinct and coherent; covering suites passed [{}]; {}",
+                    seen.into_iter().collect::<Vec<_>>().join(", "),
+                    if parts.is_empty() {
+                        "see suite logs for the one-hot assertions".to_owned()
+                    } else {
+                        parts.join("; ")
+                    }
+                ),
+            }
+        })
+        .collect()
+}
+
+/// Build the preset comparison from the measured medians. Balanced stays the
+/// quality baseline; Performance is the cheaper explicit choice.
+fn quality_preset_rows(
+    evidence: &CollectedQualityEvidence,
+    input: (u32, u32),
+) -> Vec<PresetReport> {
+    let cheaper = evidence.performance_median < evidence.balanced_median;
+    [MotionQuality::Balanced, MotionQuality::Performance]
+        .into_iter()
+        .map(|quality| {
+            let timing_status = match quality {
+                MotionQuality::Balanced => format!(
+                    "measured median {:.4} ms (motion-presets suite at guidance_scale=1.0); quality hashes unchanged, see motion-presets.log",
+                    evidence.balanced_median
+                ),
+                _ => format!(
+                    "measured median {:.4} ms (motion-presets suite at guidance_scale=1.0); cheaper than Balanced on the same scene: {cheaper}",
+                    evidence.performance_median
+                ),
+            };
+            PresetReport {
+                preset: format!("{quality:?}"),
+                quality_baseline: quality == MotionQuality::Balanced,
+                work_units: quality.dispatch_plan(input.0, input.1).candidate_evaluations,
+                timing_status,
+            }
+        })
+        .collect()
+}
+
+/// Run the GPU ablation/preset suites fresh, require all of them to pass, and
+/// record the measured evidence under `target/quality-evidence/<timestamp>/`.
+/// The suites are the Task 10/11 GPU tests: per-signal one-hot ablations with
+/// Estimated/Zero/Off coherence, fallback resources, and Balanced-versus-
+/// Performance timing with the Balanced no-regression hash gate.
+fn run_quality_evidence(root: &Path) -> bool {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |value| value.as_secs());
+    let dir = root.join(format!("target/quality-evidence/{timestamp}"));
+    if fs::create_dir_all(&dir).is_err() {
+        eprintln!(
+            "cargo xtask quality-evidence: unable to create {}",
+            dir.display()
+        );
+        return false;
+    }
+    let Some(evidence) = collect_quality_evidence(root, &dir, "cargo xtask quality-evidence")
+    else {
+        return false;
+    };
+    let report = QualityEvidenceReport {
+        command: "cargo xtask quality-evidence".to_owned(),
+        timestamp,
+        balanced_forward_backward_ms: evidence.balanced_median,
+        performance_forward_backward_ms: evidence.performance_median,
+        performance_cheaper: evidence.performance_median < evidence.balanced_median,
+        suites: evidence.suites,
+    };
+    let json = match serde_json::to_string_pretty(&report) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("cargo xtask quality-evidence: unable to encode report: {error}");
+            return false;
+        }
+    };
+    if fs::write(dir.join("report.json"), json).is_err() {
+        eprintln!("cargo xtask quality-evidence: unable to write report.json");
+        return false;
+    }
+    let mut markdown = format!(
+        "# Temporal quality evidence\n\n- Command: `{}`\n- Timestamp: `{timestamp}`\n\n",
+        report.command
+    );
+    markdown
+        .push_str("## Suites\n\n| Suite | Result | Measured metrics | Log |\n|---|---|---|---|\n");
+    for suite in &report.suites {
+        markdown.push_str(&format!(
+            "| {} | passed | {} | {} |\n",
+            suite.name,
+            suite.metrics.join("; "),
+            suite.log
+        ));
+    }
+    markdown.push_str(&format!(
+        "\n## Presets\n\n- Balanced forward/backward median: `{:.4} ms`\n- Performance forward/backward median: `{:.4} ms`\n- Performance cheaper on the same scene at guidance_scale=1.0: `{}`\n- Balanced quality hashes: unchanged (see the `baseline fixture=` lines in `motion-presets.log`)\n",
+        report.balanced_forward_backward_ms,
+        report.performance_forward_backward_ms,
+        report.performance_cheaper
+    ));
+    if fs::write(dir.join("report.md"), markdown).is_err() {
+        eprintln!("cargo xtask quality-evidence: unable to write report.md");
+        return false;
+    }
+    println!("cargo xtask quality-evidence: report in {}", dir.display());
+    true
+}
+
 fn run_gpu_check(backend: BackendSelection) -> bool {
     let base = report(
         validation(Command::new("cargo").args([
@@ -2925,6 +3381,10 @@ fn main() -> ExitCode {
                 }
             };
             run_gpu_check(backend)
+        }
+        "quality-evidence" => {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+            run_quality_evidence(root)
         }
         "smoke" => {
             let arguments = std::env::args().skip(2).collect::<Vec<_>>();
@@ -3193,7 +3653,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "Usage: cargo xtask <benchmark|check|fidelityfx-check|gpu-check|smoke|vkcube|wsi-compatibility|visual-quality|proton-acceptance> [command options]"
+                "Usage: cargo xtask <benchmark|check|fidelityfx-check|gpu-check|quality-evidence|smoke|vkcube|wsi-compatibility|visual-quality|proton-acceptance> [command options]"
             );
             return ExitCode::from(2);
         }
@@ -3208,15 +3668,17 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        BENCHMARK_SAMPLE_COUNT, BackendSelection, ProtonAcceptanceOptions, VkcubeExit,
-        benchmark_cases, benchmark_output_is_operationally_valid, classify_vkcube_exit,
-        classify_vkcube_output, fidelityfx_elf_architecture_is_valid,
-        fidelityfx_symbols_are_complete, generated_config, maintenance_evidence_complete,
-        maintenance_output_is_valid, parse_backend_args, parse_maintenance_evidence,
-        parse_proton_acceptance_args, parse_public_x11_display, parse_visual_quality_args,
-        parse_vkcube_args, parse_vkcube_evidence, parse_wsi_compatibility_args,
-        quality_fixture_passes, visual_quality_metrics_for_test, vkcube_launch,
-        vkcube_output_is_valid, wsi_compatibility_output_is_valid,
+        BENCHMARK_SAMPLE_COUNT, BackendSelection, CollectedQualityEvidence,
+        ProtonAcceptanceOptions, QualityEvidenceSuiteReport, VkcubeExit, benchmark_cases,
+        benchmark_output_is_operationally_valid, classify_vkcube_exit, classify_vkcube_output,
+        fidelityfx_elf_architecture_is_valid, fidelityfx_symbols_are_complete, generated_config,
+        maintenance_evidence_complete, maintenance_output_is_valid, parse_backend_args,
+        parse_maintenance_evidence, parse_preset_medians, parse_proton_acceptance_args,
+        parse_public_x11_display, parse_visual_quality_args, parse_vkcube_args,
+        parse_vkcube_evidence, parse_wsi_compatibility_args, quality_ablation_rows,
+        quality_fixture_passes, quality_metric_lines, quality_preset_rows,
+        visual_quality_metrics_for_test, vkcube_launch, vkcube_output_is_valid,
+        wsi_compatibility_output_is_valid,
     };
     use std::path::Path;
 
@@ -3637,6 +4099,117 @@ mod tests {
         assert!(parse_wsi_compatibility_args(&["--allow-unverified", "bogus"]).is_err());
         assert!(parse_wsi_compatibility_args(&["--allow-unverified"]).is_err());
         assert!(parse_wsi_compatibility_args(&["--unknown"]).is_err());
+    }
+
+    #[test]
+    fn quality_evidence_extracts_measured_metric_lines() {
+        let output = "WARNING: radv is not a conformant Vulkan implementation, testing use only.\n\
+            guidance_scale=1.0 balanced_forward_backward_ms=1.9960 performance_forward_backward_ms=0.8521\n\
+            test performance_flow_is_faster_than_balanced_after_warmup ... ok\n\
+            baseline fixture=translation hash=80b2a154a13c0084 mean_epe=1.593801 p95_epe=10.440307\n\
+            FSR guidance modes: zero_vs_off_mse=0.002711920\n\
+            FSR sequence aggregate: psnr=17.637dB bilinear=16.635dB reference=17.385dB ssim=0.87448\n\
+            relative depth parallax: order=1.000 foreground=1.000 background=0.121\n\
+            test result: ok. 2 passed; 0 failed\n";
+        let lines = quality_metric_lines(output);
+        assert_eq!(
+            lines,
+            vec![
+                "guidance_scale=1.0 balanced_forward_backward_ms=1.9960 performance_forward_backward_ms=0.8521".to_owned(),
+                "baseline fixture=translation hash=80b2a154a13c0084 mean_epe=1.593801 p95_epe=10.440307".to_owned(),
+                "FSR guidance modes: zero_vs_off_mse=0.002711920".to_owned(),
+                "FSR sequence aggregate: psnr=17.637dB bilinear=16.635dB reference=17.385dB ssim=0.87448".to_owned(),
+                "relative depth parallax: order=1.000 foreground=1.000 background=0.121".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn quality_evidence_parses_preset_medians() {
+        let (balanced, performance) = parse_preset_medians(
+            "guidance_scale=1.0 balanced_forward_backward_ms=1.9960 performance_forward_backward_ms=0.8521",
+        )
+        .unwrap();
+        assert!((balanced - 1.9960).abs() < 1e-4);
+        assert!((performance - 0.8521).abs() < 1e-4);
+        assert!(parse_preset_medians("no metrics here").is_none());
+    }
+
+    #[test]
+    fn quality_ablation_rows_use_measured_suite_evidence() {
+        let evidence = CollectedQualityEvidence {
+            suites: vec![
+                QualityEvidenceSuiteReport {
+                    name: "upscaler-ablations".to_owned(),
+                    passed: true,
+                    metrics: vec![
+                        "FSR guidance modes: zero_vs_off_mse=0.002711920".to_owned(),
+                        "FSR sequence aggregate: psnr=17.637dB".to_owned(),
+                    ],
+                    log: "upscaler-ablations.log".to_owned(),
+                },
+                QualityEvidenceSuiteReport {
+                    name: "temporal-fallbacks".to_owned(),
+                    passed: true,
+                    metrics: vec![
+                        "relative depth parallax: order=1.000 foreground=1.000 background=0.121"
+                            .to_owned(),
+                    ],
+                    log: "temporal-fallbacks.log".to_owned(),
+                },
+            ],
+            balanced_median: 2.0956,
+            performance_median: 0.8992,
+        };
+        let rows = quality_ablation_rows(&evidence);
+        assert_eq!(rows.len(), 7);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.status.contains("follow-up dimension"))
+        );
+        let depth = rows
+            .iter()
+            .find(|row| row.signal == "relative_depth")
+            .unwrap();
+        assert!(depth.status.contains("temporal-fallbacks"));
+        assert!(depth.status.contains("order=1.000"));
+        let motion = rows.iter().find(|row| row.signal == "motion").unwrap();
+        assert!(motion.status.contains("zero_vs_off_mse=0.002711920"));
+    }
+
+    #[test]
+    fn quality_preset_rows_report_measured_medians() {
+        let evidence = CollectedQualityEvidence {
+            suites: Vec::new(),
+            balanced_median: 2.0956,
+            performance_median: 0.8992,
+        };
+        let rows = quality_preset_rows(&evidence, (1280, 720));
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].quality_baseline);
+        assert!(!rows[1].quality_baseline);
+        assert!(rows[0].timing_status.contains("2.0956"));
+        assert!(rows[1].timing_status.contains("0.8992"));
+        assert!(rows[1].timing_status.contains("true"));
+    }
+
+    #[test]
+    fn visual_quality_parser_supports_skipping_gpu_evidence() {
+        let base = ["--input", "1280x720", "--output", "2160x1440"];
+        assert!(!parse_visual_quality_args(&base).unwrap().skip_gpu_evidence);
+        let with_flag = [
+            "--input",
+            "1280x720",
+            "--output",
+            "2160x1440",
+            "--skip-gpu-evidence",
+        ];
+        assert!(
+            parse_visual_quality_args(&with_flag)
+                .unwrap()
+                .skip_gpu_evidence
+        );
     }
 
     #[test]
