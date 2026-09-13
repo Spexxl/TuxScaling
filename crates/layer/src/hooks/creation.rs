@@ -1355,32 +1355,35 @@ fn augment_instance_extensions(
     }
 }
 
-unsafe fn enumerate_instance_extensions(
-    get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
-) -> Option<Vec<Vec<u8>>> {
-    let proc = unsafe {
-        get_instance_proc_addr(
-            vk::Instance::null(),
-            c"vkEnumerateInstanceExtensionProperties".as_ptr(),
-        )
-    }?;
-    let enumerate: vk::PFN_vkEnumerateInstanceExtensionProperties =
-        unsafe { std::mem::transmute(proc) };
-    let mut count = 0;
-    if unsafe { enumerate(std::ptr::null(), &mut count, std::ptr::null_mut()) }
-        != vk::Result::SUCCESS
-    {
-        return None;
-    }
-    if count == 0 {
-        return Some(Vec::new());
-    }
-    let mut properties = vec![vk::ExtensionProperties::default(); count as usize];
-    let result = unsafe { enumerate(std::ptr::null(), &mut count, properties.as_mut_ptr()) };
-    if !matches!(result, vk::Result::SUCCESS | vk::Result::INCOMPLETE) {
-        return None;
-    }
-    properties.truncate(count as usize);
+unsafe fn enumerate_instance_extensions() -> Option<Vec<Vec<u8>>> {
+    // The next layer's global function pointer can bind to that layer's
+    // vkEnumerateInstanceExtensionProperties entry point. Passing a null
+    // layer name through it then returns VK_ERROR_LAYER_NOT_PRESENT instead
+    // of enumerating the loader/ICD instance extensions. Load the loader's
+    // global entry point directly so presenter capability detection reflects
+    // the same extension set visible to the application.
+    let entry = match unsafe { ash::Entry::load() } {
+        Ok(entry) => entry,
+        Err(error) => {
+            eprintln!(
+                "TuxScaling evidence event=instance_extension_enumeration result=loader_unavailable detail={error:?}"
+            );
+            return None;
+        }
+    };
+    let properties = match unsafe { entry.enumerate_instance_extension_properties(None) } {
+        Ok(properties) => properties,
+        Err(error) => {
+            eprintln!(
+                "TuxScaling evidence event=instance_extension_enumeration result=loader_{error:?}"
+            );
+            return None;
+        }
+    };
+    eprintln!(
+        "TuxScaling evidence event=instance_extension_enumeration result=success count={}",
+        properties.len()
+    );
     Some(
         properties
             .iter()
@@ -1575,7 +1578,7 @@ unsafe fn create_instance_inner(
             )
         }
     };
-    let extension_plan = unsafe { enumerate_instance_extensions(get_instance_proc_addr) };
+    let extension_plan = unsafe { enumerate_instance_extensions() };
     let extension_plan = extension_plan
         .map(|supported| augment_instance_extensions(requested_extensions, &supported));
     let mut modified_application_info = unsafe {
