@@ -1008,13 +1008,6 @@ struct CaptureResource {
     bytes: usize,
 }
 
-#[derive(Debug)]
-struct CapturedVisualFrame {
-    manifest: CaptureManifest,
-    source: Vec<[f32; 4]>,
-    output: Vec<[f32; 4]>,
-}
-
 fn read_capture_resource(
     directory: &Path,
     manifest: &CaptureManifest,
@@ -1076,9 +1069,8 @@ fn read_capture_resource(
 fn read_capture_series(
     directory: &Path,
     options: &VisualQualityOptions,
-    output_resource: &str,
     expected_backend: &str,
-) -> Result<Vec<CapturedVisualFrame>, String> {
+) -> Result<Vec<CaptureManifest>, String> {
     let mut manifests = fs::read_dir(directory)
         .map_err(|error| format!("read capture directory {}: {error}", directory.display()))?
         .filter_map(Result::ok)
@@ -1116,8 +1108,7 @@ fn read_capture_series(
             selected.len()
         ));
     }
-    let mut frames = Vec::with_capacity(selected.len());
-    for manifest in selected {
+    for manifest in &selected {
         if manifest.game_extent != [options.input.0, options.input.1]
             || manifest.output_extent != [options.output.0, options.output.1]
             || manifest.guidance_extent != manifest.game_extent
@@ -1166,21 +1157,8 @@ fn read_capture_series(
                 manifest.frame_id
             ));
         }
-        let (source, source_extent) = read_capture_resource(directory, &manifest, "source")?;
-        let (output, output_extent) = read_capture_resource(directory, &manifest, output_resource)?;
-        if source_extent != manifest.game_extent || output_extent != manifest.output_extent {
-            return Err(format!(
-                "frame {} resource extents do not match metadata",
-                manifest.frame_id
-            ));
-        }
-        frames.push(CapturedVisualFrame {
-            manifest,
-            source,
-            output,
-        });
     }
-    Ok(frames)
+    Ok(selected)
 }
 
 fn scene_category(frame_id: u64) -> &'static str {
@@ -1648,36 +1626,48 @@ fn category_gate_passed(psnr: f32, ssim: f32, flicker: f32, ghost: f32, shimmer:
 
 fn visual_quality_report(
     options: &VisualQualityOptions,
-    fsr: &[CapturedVisualFrame],
-    off: &[CapturedVisualFrame],
+    fsr_directory: &Path,
+    off_directory: &Path,
+    fsr: &[CaptureManifest],
+    off: &[CaptureManifest],
     report_dir: &Path,
 ) -> Result<VisualQualityReport, String> {
     if fsr.len() != off.len() || fsr.is_empty() {
         return Err("FSR and Off capture series have different or empty lengths".into());
     }
-    let source_frames_match = fsr.iter().zip(off.iter()).all(|(fsr, off)| {
-        fsr.manifest.frame_id == off.manifest.frame_id
-            && fsr.source.len() == off.source.len()
-            && image_mse(&fsr.source, &off.source) <= f32::EPSILON
-    });
-    if !source_frames_match {
-        return Err("FSR and Off captures do not share identical source frames".into());
-    }
     let width = options.output.0;
     let height = options.output.1;
     let mut categories = BTreeMap::new();
-    let mut previous = off[0].output.as_slice();
+    let (mut previous, _) = read_capture_resource(off_directory, &off[0], "spatial_off")?;
+    let mut source_frames_match = true;
     let mut all_finite = true;
-    for (fsr_frame, off_frame) in fsr.iter().zip(off.iter()) {
-        if fsr_frame.output.len() != off_frame.output.len()
-            || fsr_frame.output.len() != width as usize * height as usize
+    for (fsr_manifest, off_manifest) in fsr.iter().zip(off.iter()) {
+        if fsr_manifest.frame_id != off_manifest.frame_id {
+            source_frames_match = false;
+            break;
+        }
+        let (fsr_source, _) = read_capture_resource(fsr_directory, fsr_manifest, "source")?;
+        let (fsr_output, fsr_output_extent) =
+            read_capture_resource(fsr_directory, fsr_manifest, "reconstructed")?;
+        let (off_source, _) = read_capture_resource(off_directory, off_manifest, "source")?;
+        let (off_output, off_output_extent) =
+            read_capture_resource(off_directory, off_manifest, "spatial_off")?;
+        source_frames_match &= fsr_source.len() == off_source.len()
+            && image_mse(&fsr_source, &off_source) <= f32::EPSILON;
+        if !source_frames_match {
+            break;
+        }
+        if fsr_output_extent != [width, height]
+            || off_output_extent != [width, height]
+            || fsr_output.len() != off_output.len()
+            || fsr_output.len() != width as usize * height as usize
         {
             return Err(format!(
                 "frame {} output extent does not match requested output",
-                fsr_frame.manifest.frame_id
+                fsr_manifest.frame_id
             ));
         }
-        let metrics = visual_quality_metrics(&off_frame.output, &fsr_frame.output, previous);
+        let metrics = visual_quality_metrics(&off_output, &fsr_output, &previous);
         all_finite &= metrics.mse.is_finite()
             && metrics.psnr.is_finite()
             && metrics.ssim.is_finite()
@@ -1687,10 +1677,13 @@ fn visual_quality_report(
             && finite_image(&metrics.difference_map);
         update_category(
             &mut categories,
-            scene_category(fsr_frame.manifest.frame_id),
+            scene_category(fsr_manifest.frame_id),
             &metrics,
         );
-        previous = fsr_frame.output.as_slice();
+        previous = fsr_output;
+    }
+    if !source_frames_match {
+        return Err("FSR and Off captures do not share identical source frames".into());
     }
     if !all_finite {
         return Err("visual-quality metrics contain non-finite values".into());
@@ -1698,35 +1691,39 @@ fn visual_quality_report(
 
     let first_fsr = &fsr[0];
     let first_off = &off[0];
-    let guidance_resources = validate_diagnostic_resources(
-        report_dir.join("capture-fsr").as_path(),
-        &first_fsr.manifest,
-    )?;
+    let guidance_resources = validate_diagnostic_resources(fsr_directory, first_fsr)?;
+    let (first_fsr_output, first_fsr_output_extent) =
+        read_capture_resource(fsr_directory, first_fsr, "reconstructed")?;
+    let (first_off_output, first_off_output_extent) =
+        read_capture_resource(off_directory, first_off, "spatial_off")?;
+    if first_fsr_output_extent != [width, height] || first_off_output_extent != [width, height] {
+        return Err("first visual-quality output extent is invalid".into());
+    }
     write_png(
         &report_dir.join("fsr.png"),
-        &first_fsr.output,
+        &first_fsr_output,
         width,
         height,
     )?;
     write_png(
         &report_dir.join("off.png"),
-        &first_off.output,
+        &first_off_output,
         width,
         height,
     )?;
     write_png(
         &report_dir.join("side-by-side.png"),
-        &side_by_side(&first_off.output, &first_fsr.output, width, height),
+        &side_by_side(&first_off_output, &first_fsr_output, width, height),
         width.saturating_mul(2),
         height,
     )?;
     write_png(
         &report_dir.join("wipe.png"),
-        &vertical_wipe(&first_off.output, &first_fsr.output, width, height),
+        &vertical_wipe(&first_off_output, &first_fsr_output, width, height),
         width,
         height,
     )?;
-    let (crop, crop_width, crop_height) = magnified_crop(&first_fsr.output, width, height);
+    let (crop, crop_width, crop_height) = magnified_crop(&first_fsr_output, width, height);
     write_png(
         &report_dir.join("magnified.png"),
         &crop,
@@ -1735,7 +1732,7 @@ fn visual_quality_report(
     )?;
     write_png(
         &report_dir.join("amplified-diff.png"),
-        &amplified_difference(&first_off.output, &first_fsr.output, 8.0),
+        &amplified_difference(&first_off_output, &first_fsr_output, 8.0),
         width,
         height,
     )?;
@@ -1764,18 +1761,18 @@ fn visual_quality_report(
         .collect::<Vec<_>>();
     let category_gates_passed = categories.iter().all(|category| category.gate_passed);
     let ablations = [
-        ("motion", first_fsr.manifest.ablations.motion),
-        ("relative_depth", first_fsr.manifest.ablations.relative_depth),
-        ("reactive", first_fsr.manifest.ablations.reactive),
-        ("composition", first_fsr.manifest.ablations.composition),
-        ("exposure", first_fsr.manifest.ablations.exposure),
+        ("motion", first_fsr.ablations.motion),
+        ("relative_depth", first_fsr.ablations.relative_depth),
+        ("reactive", first_fsr.ablations.reactive),
+        ("composition", first_fsr.ablations.composition),
+        ("exposure", first_fsr.ablations.exposure),
         (
             "confidence_disocclusion",
-            first_fsr.manifest.ablations.confidence_disocclusion,
+            first_fsr.ablations.confidence_disocclusion,
         ),
         (
             "post_capture_jitter",
-            first_fsr.manifest.ablations.post_capture_jitter,
+            first_fsr.ablations.post_capture_jitter,
         ),
     ]
     .into_iter()
@@ -1798,28 +1795,17 @@ fn visual_quality_report(
                 "capture GPU timings are present; preset comparison requires separate run".into(),
         })
         .collect();
-    let mut timing_sum = vec![0.0_f32; first_fsr.manifest.gpu_timings_ms.len()];
+    let mut timing_sum = vec![0.0_f32; first_fsr.gpu_timings_ms.len()];
     for frame in fsr {
-        for (sum, value) in timing_sum
-            .iter_mut()
-            .zip(frame.manifest.gpu_timings_ms.iter())
-        {
+        for (sum, value) in timing_sum.iter_mut().zip(frame.gpu_timings_ms.iter()) {
             *sum += *value;
         }
     }
     let diagnostics = DiagnosticReport {
-        guidance_mode: first_fsr.manifest.guidance_mode.clone(),
+        guidance_mode: first_fsr.guidance_mode.clone(),
         frames: fsr.len(),
-        history_age_min: fsr
-            .iter()
-            .map(|frame| frame.manifest.history_age)
-            .min()
-            .unwrap_or(0),
-        history_age_max: fsr
-            .iter()
-            .map(|frame| frame.manifest.history_age)
-            .max()
-            .unwrap_or(0),
+        history_age_min: fsr.iter().map(|frame| frame.history_age).min().unwrap_or(0),
+        history_age_max: fsr.iter().map(|frame| frame.history_age).max().unwrap_or(0),
         gpu_timing_mean_ms: timing_sum
             .into_iter()
             .map(|value| value / fsr.len() as f32)
@@ -1855,8 +1841,8 @@ fn visual_quality_report(
         warmup: options.warmup,
         frames: options.frames,
         source_frames_match,
-        fsr_backend: first_fsr.manifest.backend.clone(),
-        off_backend: first_off.manifest.backend.clone(),
+        fsr_backend: first_fsr.backend.clone(),
+        off_backend: first_off.backend.clone(),
         categories,
         ablations,
         presets,
@@ -2030,27 +2016,28 @@ fn run_visual_quality(root: &Path, options: &VisualQualityOptions) -> bool {
         eprintln!("cargo xtask visual-quality: Off capture failed: {error}");
         return false;
     }
-    let fsr = match read_capture_series(&fsr_capture, options, "reconstructed", "FSR 3.1.4") {
+    let fsr = match read_capture_series(&fsr_capture, options, "FSR 3.1.4") {
         Ok(frames) => frames,
         Err(error) => {
             eprintln!("cargo xtask visual-quality: invalid FSR capture: {error}");
             return false;
         }
     };
-    let off = match read_capture_series(&off_capture, options, "spatial_off", "Off") {
+    let off = match read_capture_series(&off_capture, options, "Off") {
         Ok(frames) => frames,
         Err(error) => {
             eprintln!("cargo xtask visual-quality: invalid Off capture: {error}");
             return false;
         }
     };
-    let report = match visual_quality_report(options, &fsr, &off, &report_dir) {
-        Ok(report) => report,
-        Err(error) => {
-            eprintln!("cargo xtask visual-quality: quality gate failed: {error}");
-            return false;
-        }
-    };
+    let report =
+        match visual_quality_report(options, &fsr_capture, &off_capture, &fsr, &off, &report_dir) {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("cargo xtask visual-quality: quality gate failed: {error}");
+                return false;
+            }
+        };
     let json = match serde_json::to_string_pretty(&report) {
         Ok(json) => json,
         Err(error) => {
