@@ -237,6 +237,7 @@ pub(crate) struct SwapchainState {
     pub(crate) virtual_images: Option<Vec<Image>>,
     pub(crate) physical_images: Vec<vk::Image>,
     pub(crate) retired_physical_generations: Vec<vk::SwapchainKHR>,
+    pub(crate) overlay_evidence_submissions: u8,
     pub(crate) maintenance_overlay_reported: bool,
     pub(crate) input_route_reported: bool,
     pub(crate) maintenance_present_reported: bool,

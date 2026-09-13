@@ -2000,7 +2000,7 @@ impl SwapchainRuntime {
                         self.evidence_fsr_dispatches =
                             self.evidence_fsr_dispatches.saturating_add(1);
                         self.diagnostics.fsr_dispatches = self.evidence_fsr_dispatches;
-                        if self.evidence_fsr_dispatches == 1 {
+                        if self.evidence_fsr_dispatches <= 3 {
                             eprintln!(
                                 "TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical={}x{} physical={}x{}",
                                 self.temporal.resolution.game_extent.width,
@@ -2535,19 +2535,17 @@ impl SwapchainRuntime {
             self.diagnostics.history_valid = true;
             self.diagnostics.history_age = self.temporal.history_age;
         }
-        if self.last_backend_dispatch && self.evidence_reconstructed_presents == 0 {
+        if self.last_backend_dispatch {
             self.evidence_reconstructed_presents =
                 self.evidence_reconstructed_presents.saturating_add(1);
             self.diagnostics.reconstructed_presents = self.evidence_reconstructed_presents;
-            eprintln!(
-                "TuxScaling evidence event=reconstructed_present backend={} frame={}",
-                upscaler_name(self.temporal.active_upscaler),
-                self.diagnostics.frame_id,
-            );
-        } else if self.last_backend_dispatch {
-            self.evidence_reconstructed_presents =
-                self.evidence_reconstructed_presents.saturating_add(1);
-            self.diagnostics.reconstructed_presents = self.evidence_reconstructed_presents;
+            if self.evidence_reconstructed_presents <= 3 {
+                eprintln!(
+                    "TuxScaling evidence event=reconstructed_present backend={} frame={}",
+                    upscaler_name(self.temporal.active_upscaler),
+                    self.diagnostics.frame_id,
+                );
+            }
         }
         self.last_backend_dispatch = false;
     }

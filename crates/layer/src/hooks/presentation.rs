@@ -518,10 +518,15 @@ unsafe fn submit_overlay(
             && let Some(overlay) = state.overlay.as_mut()
         {
             overlay.submitted();
-            let overlay_report = state.mapping.is_some() && !state.maintenance_overlay_reported;
+            let overlay_report = state.mapping.is_some() && state.overlay_evidence_submissions < 3;
             let input_route_report = state.present_surface.is_some() && !state.input_route_reported;
-            let maintenance_report = device_state.wsi.maintenance1.enabled && overlay_report;
+            let maintenance_report = device_state.wsi.maintenance1.enabled
+                && state.mapping.is_some()
+                && !state.maintenance_overlay_reported;
             if overlay_report {
+                state.overlay_evidence_submissions += 1;
+            }
+            if maintenance_report {
                 state.maintenance_overlay_reported = true;
             }
             if input_route_report {

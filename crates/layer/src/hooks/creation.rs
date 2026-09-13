@@ -1223,6 +1223,7 @@ pub(super) unsafe fn publish_native_generation(
             guard.negotiation = published_negotiation;
             guard.physical_handle = new_physical;
             guard.physical_images = new_images.clone();
+            guard.overlay_evidence_submissions = 0;
             guard.maintenance_overlay_reported = false;
             guard.maintenance_present_reported = false;
             guard.maintenance_release_reported = false;
@@ -2777,6 +2778,7 @@ unsafe fn create_swapchain_inner(
             virtual_images,
             physical_images: output_images.clone(),
             retired_physical_generations: Vec::new(),
+            overlay_evidence_submissions: 0,
             maintenance_overlay_reported: false,
             input_route_reported: false,
             maintenance_present_reported: false,
