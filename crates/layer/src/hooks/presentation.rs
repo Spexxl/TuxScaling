@@ -185,6 +185,51 @@ fn present_committed(result: vk::Result) -> bool {
     matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR)
 }
 
+/// Presenter WSI suboptimal must not leak to the application. DXVK tears the
+/// logical swapchain down on SUBOPTIMAL, which destroys the presenter window
+/// and overlay every few frames (flicker, Insert never sticks).
+pub(super) fn reported_logical_wsi_result(
+    downstream: vk::Result,
+    independent_presenter: bool,
+) -> vk::Result {
+    if independent_presenter && downstream == vk::Result::SUBOPTIMAL_KHR {
+        vk::Result::SUCCESS
+    } else {
+        downstream
+    }
+}
+
+unsafe fn presents_to_independent_presenter(info: &vk::PresentInfoKHR<'_>) -> bool {
+    if info.swapchain_count == 0 || info.p_swapchains.is_null() {
+        return false;
+    }
+    let presented =
+        unsafe { std::slice::from_raw_parts(info.p_swapchains, info.swapchain_count as usize) };
+    let states = swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    presented.iter().any(|swapchain| {
+        states.get(swapchain).is_some_and(|state| {
+            let state = state.lock().unwrap_or_else(|error| error.into_inner());
+            !state.lifecycle.blocks_frame_operations() && state.present_surface.is_some()
+        })
+    })
+}
+
+unsafe fn hide_independent_presenter_results(
+    info: &vk::PresentInfoKHR<'_>,
+    independent_presenter: bool,
+) {
+    if !independent_presenter || info.swapchain_count == 0 || info.p_results.is_null() {
+        return;
+    }
+    let results =
+        unsafe { std::slice::from_raw_parts_mut(info.p_results, info.swapchain_count as usize) };
+    for result in results {
+        *result = reported_logical_wsi_result(*result, true);
+    }
+}
+
 fn with_overlay_wait<R>(
     mut modified: vk::PresentInfoKHR<'_>,
     overlay_wait: Option<vk::Semaphore>,
@@ -638,8 +683,10 @@ unsafe fn queue_present_inner(
                 // generation while the submitted logical slot is still mapped.
                 // Retry after releasing it so the next generation sees an idle
                 // mapping without delaying or changing the WSI result. A
-                // suboptimal result is returned unchanged so the application
-                // can recreate before native publication is attempted.
+                // suboptimal result on the game window is returned unchanged
+                // so the application can recreate before native publication.
+                // Independent presenter suboptimal is remapped below so DXVK
+                // does not tear down the logical swapchain.
                 unsafe { observe_presented_surfaces(queue_state, info) };
             }
             if let Some(chain) = present_chain.as_ref() {
@@ -651,6 +698,9 @@ unsafe fn queue_present_inner(
         {
             rollback_translation_present_ids(translation);
         }
+        let independent_presenter = unsafe { presents_to_independent_presenter(info) };
+        unsafe { hide_independent_presenter_results(info, independent_presenter) };
+        let result = reported_logical_wsi_result(result, independent_presenter);
         if result != vk::Result::SUCCESS && !info.p_swapchains.is_null() {
             let presented = unsafe {
                 std::slice::from_raw_parts(info.p_swapchains, info.swapchain_count as usize)
@@ -683,7 +733,8 @@ pub(super) unsafe extern "system" fn queue_present_khr(
 #[cfg(test)]
 mod tests {
     use super::{
-        present_committed, should_retry_native_publication, translate_present, with_overlay_wait,
+        present_committed, reported_logical_wsi_result, should_retry_native_publication,
+        translate_present, with_overlay_wait,
     };
     use crate::state::retire_swapchain;
     use ash::vk;
@@ -720,6 +771,28 @@ mod tests {
         assert!(present_committed(vk::Result::SUBOPTIMAL_KHR));
         assert!(present_committed(vk::Result::SUCCESS));
         assert!(!present_committed(vk::Result::ERROR_OUT_OF_DATE_KHR));
+    }
+
+    #[test]
+    fn independent_presenter_hides_suboptimal_from_the_application() {
+        assert_eq!(
+            reported_logical_wsi_result(vk::Result::SUBOPTIMAL_KHR, true),
+            vk::Result::SUCCESS,
+            "DXVK recreates on SUBOPTIMAL and would destroy the presenter overlay"
+        );
+        assert_eq!(
+            reported_logical_wsi_result(vk::Result::SUBOPTIMAL_KHR, false),
+            vk::Result::SUBOPTIMAL_KHR,
+            "game-window native publication still needs the app to recreate"
+        );
+        assert_eq!(
+            reported_logical_wsi_result(vk::Result::ERROR_OUT_OF_DATE_KHR, true),
+            vk::Result::ERROR_OUT_OF_DATE_KHR
+        );
+        assert_eq!(
+            reported_logical_wsi_result(vk::Result::SUCCESS, true),
+            vk::Result::SUCCESS
+        );
     }
 
     #[test]

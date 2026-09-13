@@ -43,7 +43,7 @@ use creation::{
     create_device, create_instance, create_swapchain_khr, get_device_queue, get_device_queue2,
 };
 use lifetime::{destroy_device, destroy_instance, destroy_swapchain_khr};
-use presentation::queue_present_khr;
+use presentation::{queue_present_khr, reported_logical_wsi_result};
 use surface::{
     create_win32_surface_khr, create_xcb_surface_khr, create_xlib_surface_khr, destroy_surface_khr,
     get_physical_device_surface_capabilities_khr, get_physical_device_surface_capabilities2_khr,
@@ -498,11 +498,22 @@ unsafe extern "system" fn get_swapchain_status_khr(
     device: vk::Device,
     swapchain: vk::SwapchainKHR,
 ) -> vk::Result {
+    let independent_presenter = swapchains()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&swapchain)
+        .cloned()
+        .is_some_and(|state| {
+            state
+                .lock()
+                .map(|state| state.present_surface.is_some())
+                .unwrap_or(false)
+        });
     let physical = match current_physical_swapchain(swapchain) {
         Ok(physical) => physical,
         Err(error) => return error,
     };
-    unsafe {
+    let status = unsafe {
         downstream_result(
             device,
             c"vkGetSwapchainStatusKHR",
@@ -512,7 +523,8 @@ unsafe extern "system" fn get_swapchain_status_khr(
                 get_status(device, physical)
             },
         )
-    }
+    };
+    reported_logical_wsi_result(status, independent_presenter)
 }
 
 unsafe extern "system" fn wait_for_present_khr(

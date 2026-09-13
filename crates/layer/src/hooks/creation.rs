@@ -10,6 +10,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tuxscaling_display::{Extent, PresentationNegotiation, PresentationState, SurfaceExtent};
 
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .map(str::to_owned)
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 fn virtual_swapchain_supported(info: &vk::SwapchainCreateInfoKHR<'_>) -> bool {
     if !supported_swapchain_flags(info.flags)
         || info.image_array_layers != 1
@@ -357,6 +366,29 @@ unsafe fn create_physical_swapchain(
     }
 }
 
+unsafe fn load_physical_swapchain_images(
+    device: vk::Device,
+    swapchain: vk::SwapchainKHR,
+) -> Result<Vec<vk::Image>, vk::Result> {
+    let Some(proc) = (unsafe { super::device_downstream(device, c"vkGetSwapchainImagesKHR") })
+    else {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    };
+    let get: vk::PFN_vkGetSwapchainImagesKHR = unsafe { std::mem::transmute(proc) };
+    let mut count = 0u32;
+    let result = unsafe { get(device, swapchain, &mut count, std::ptr::null_mut()) };
+    if result != vk::Result::SUCCESS {
+        return Err(result);
+    }
+    let mut images = vec![vk::Image::null(); count as usize];
+    let result = unsafe { get(device, swapchain, &mut count, images.as_mut_ptr()) };
+    if result != vk::Result::SUCCESS {
+        return Err(result);
+    }
+    images.truncate(count as usize);
+    Ok(images)
+}
+
 unsafe fn destroy_physical_swapchain(
     device: vk::Device,
     allocation_callbacks: *const vk::AllocationCallbacks<'_>,
@@ -642,6 +674,20 @@ fn native_output_target(
         monitor.rect.y,
     );
     Some(InitialOutputTarget { window, monitor })
+}
+
+/// First native-output create keeps the presenter even when the game already
+/// matches the monitor (Native AA). Recreations reuse the live presenter.
+fn select_initial_native_target(
+    native_target: Option<InitialOutputTarget>,
+    _game_extent: vk::Extent2D,
+    continuing_logical: bool,
+) -> Option<InitialOutputTarget> {
+    if continuing_logical {
+        None
+    } else {
+        native_target
+    }
 }
 
 fn has_live_virtual_swapchain(surface: vk::SurfaceKHR) -> bool {
@@ -1105,22 +1151,24 @@ pub(super) unsafe fn publish_native_generation(
         };
         return false;
     }
-    let new_images = match unsafe { loader.get_swapchain_images(new_physical) } {
-        Ok(images) => images,
-        Err(_) => {
-            unsafe {
-                finish_native_generation_failure(
-                    device_state,
-                    snapshot,
-                    runtime,
-                    new_physical,
-                    &loader,
-                    false,
-                )
-            };
-            return false;
-        }
-    };
+    let new_images =
+        match unsafe { load_physical_swapchain_images(device_state.device.handle(), new_physical) }
+        {
+            Ok(images) => images,
+            Err(_) => {
+                unsafe {
+                    finish_native_generation_failure(
+                        device_state,
+                        snapshot,
+                        runtime,
+                        new_physical,
+                        &loader,
+                        false,
+                    )
+                };
+                return false;
+            }
+        };
     if let Some(metadata) = snapshot.hdr_metadata
         && !unsafe {
             super::apply_hdr_metadata(device_state.device.handle(), new_physical, metadata)
@@ -2116,15 +2164,8 @@ unsafe fn create_swapchain_inner(
         .get(&original.surface)
         .copied();
     let native_target = native_output_target(original.surface, virtual_preflight_eligible);
-    let initial_target = if old_logical.is_some() {
-        None
-    } else {
-        native_target.filter(|target| {
-            let extent = target.monitor.rect.extent();
-            extent.width != original.image_extent.width
-                || extent.height != original.image_extent.height
-        })
-    };
+    let initial_target =
+        select_initial_native_target(native_target, original.image_extent, old_logical.is_some());
     let old_present_surface = old_logical.as_ref().and_then(|old| old.present_surface);
     let mut presenter_surface = crate::state::presenter_surface(original.surface);
     let mut presenter_created_here = false;
@@ -2516,8 +2557,7 @@ unsafe fn create_swapchain_inner(
             original.image_format, original.image_color_space, original.flags, modified.image_usage
         );
         let info = physical_swapchain_info(&modified);
-        let loader = ash::khr::swapchain::Device::new(&device_state.instance, &device_state.device);
-        let output_images = match unsafe { loader.get_swapchain_images(handle) } {
+        let output_images = match unsafe { load_physical_swapchain_images(device, handle) } {
             Ok(images) => images,
             Err(_) if physical_surface != original.surface => {
                 return unsafe {
@@ -2688,6 +2728,7 @@ unsafe fn create_swapchain_inner(
             }
             return result;
         };
+        eprintln!("TuxScaling evidence event=swapchain_post_create stage=overlay_ok");
         let template = virtual_eligible.then(|| {
             virtualization_plan
                 .as_ref()
@@ -2879,7 +2920,13 @@ unsafe fn create_swapchain_inner(
             }
         }
         result
-    }));
+    }))
+    .inspect_err(|payload| {
+        let message = panic_message(payload.as_ref());
+        eprintln!(
+            "TuxScaling evidence event=swapchain_post_create result=panic message={message}"
+        );
+    });
     if post_result.is_err() {
         let handle = unsafe { *swapchain };
         if physical_surface != original.surface {
@@ -2924,8 +2971,8 @@ mod tests {
         augment_instance_extensions, initial_physical_extent, logical_image_count,
         native_generation_failure_can_restore, physical_surface_for_swapchain,
         preflight_swapchain_virtualization, presenter_matches_generation,
-        temporal_enabled_for_logical_creation, translate_old_swapchain,
-        translate_recreation_create_info, virtual_swapchain_supported,
+        select_initial_native_target, temporal_enabled_for_logical_creation,
+        translate_old_swapchain, translate_recreation_create_info, virtual_swapchain_supported,
     };
     use crate::hooks::swapchain_create::SwapchainCompatibilityError;
     use crate::recovery::{
@@ -2943,6 +2990,30 @@ mod tests {
 
     fn extent(width: u32, height: u32) -> vk::Extent2D {
         vk::Extent2D { width, height }
+    }
+
+    fn native_aa_target() -> super::InitialOutputTarget {
+        super::InitialOutputTarget {
+            window: 42,
+            monitor: tuxscaling_display::Monitor::new(Rect::new(652, 1440, 2160, 1440)),
+        }
+    }
+
+    #[test]
+    fn equal_game_and_monitor_extents_keep_native_aa_target() {
+        let target = native_aa_target();
+        let game = extent(2160, 1440);
+        assert!(
+            select_initial_native_target(Some(target), game, false).is_some(),
+            "Native AA must virtualize when the game already matches the monitor"
+        );
+    }
+
+    #[test]
+    fn continuing_logical_recreation_does_not_retarget_native_output() {
+        let target = native_aa_target();
+        let game = extent(1280, 720);
+        assert!(select_initial_native_target(Some(target), game, true).is_none());
     }
 
     fn virtualization_capabilities() -> vk::SurfaceCapabilitiesKHR {

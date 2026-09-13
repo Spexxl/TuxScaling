@@ -444,6 +444,12 @@ unsafe fn acquire_next_image_inner(
             swapchain.as_raw(),
         );
     }
+    let independent_presenter = virtual_swapchain.as_ref().is_some_and(|(state, _)| {
+        state
+            .lock()
+            .map(|state| state.present_surface.is_some())
+            .unwrap_or(false)
+    });
     if let Some((state, _)) = virtual_swapchain {
         if acquired(result) {
             if let Some(logical_index) = reserved_logical
@@ -464,7 +470,7 @@ unsafe fn acquire_next_image_inner(
             cancel_reserved_image(&state, reserved_logical);
         }
     }
-    result
+    super::presentation::reported_logical_wsi_result(result, independent_presenter)
 }
 
 pub(super) unsafe extern "system" fn acquire_next_image_khr(
@@ -520,6 +526,12 @@ unsafe fn acquire_next_image2_inner(
     };
     let acquire: vk::PFN_vkAcquireNextImage2KHR = unsafe { std::mem::transmute(proc) };
     let result = unsafe { acquire(device, &modified, image_index) };
+    let independent_presenter = virtual_swapchain.as_ref().is_some_and(|(state, _)| {
+        state
+            .lock()
+            .map(|state| state.present_surface.is_some())
+            .unwrap_or(false)
+    });
     if let Some((state, _)) = virtual_swapchain {
         if acquired(result) {
             if let Some(logical_index) = reserved_logical
@@ -540,7 +552,7 @@ unsafe fn acquire_next_image2_inner(
             cancel_reserved_image(&state, reserved_logical);
         }
     }
-    result
+    super::presentation::reported_logical_wsi_result(result, independent_presenter)
 }
 
 pub(super) unsafe extern "system" fn acquire_next_image2_khr(
