@@ -2561,6 +2561,13 @@ impl SwapchainRuntime {
 }
 impl Drop for SwapchainRuntime {
     fn drop(&mut self) {
+        // The final submitted frame has no following prepare call to service
+        // its diagnostic fence.  Drain all completed readbacks before
+        // shutting capture down so the requested frame range is durable.
+        if self.diagnostic_capture.is_some() {
+            let _ = unsafe { self.device.device_wait_idle() };
+            unsafe { self.service_diagnostic_capture() };
+        }
         if let Some(capture) = &mut self.diagnostic_capture {
             capture.shutdown();
         }
