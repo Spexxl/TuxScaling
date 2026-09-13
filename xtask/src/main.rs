@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -445,6 +445,7 @@ struct VkcubeOptions {
     backend: BackendSelection,
     sharpening_enabled: bool,
     sharpness: f32,
+    control_sequence: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -464,10 +465,19 @@ enum VkcubeExit {
     UnexpectedExit,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ControlApplied {
+    setting: String,
+    value: String,
+    generation: Option<u64>,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct VkcubeEvidence {
     layer_startup: bool,
     native_published: bool,
+    native_publishes: u32,
+    presenter_publishes: u32,
     virtual_active: bool,
     virtual_zero: bool,
     fallback: bool,
@@ -477,6 +487,7 @@ struct VkcubeEvidence {
     reconstructed_presents: u32,
     logical: Option<WsiExtent>,
     physical: Option<WsiExtent>,
+    control_applied: Vec<ControlApplied>,
 }
 
 fn parse_vkcube_evidence(stdout: &str, stderr: &str) -> VkcubeEvidence {
@@ -498,13 +509,28 @@ fn parse_vkcube_evidence(stdout: &str, stderr: &str) -> VkcubeEvidence {
         match event {
             "native_generation_published" => {
                 evidence.native_published = true;
+                evidence.native_publishes = evidence.native_publishes.saturating_add(1);
                 evidence.logical = wsi_field(&lowercase, "logical").and_then(parse_wsi_extent);
                 evidence.physical = wsi_field(&lowercase, "physical").and_then(parse_wsi_extent);
             }
             "presenter_generation_published" => {
                 evidence.native_published = true;
+                evidence.presenter_publishes = evidence.presenter_publishes.saturating_add(1);
                 evidence.logical = wsi_field(&lowercase, "logical").and_then(parse_wsi_extent);
                 evidence.physical = wsi_field(&lowercase, "physical").and_then(parse_wsi_extent);
+            }
+            "control_applied" => {
+                if let (Some(setting), Some(value)) = (
+                    wsi_field(&lowercase, "setting").map(str::to_owned),
+                    wsi_field(&lowercase, "value").map(str::to_owned),
+                ) {
+                    evidence.control_applied.push(ControlApplied {
+                        setting,
+                        value,
+                        generation: wsi_field(&lowercase, "generation")
+                            .and_then(|value| value.parse().ok()),
+                    });
+                }
             }
             "virtual_swapchain_active" => {
                 evidence.virtual_active = true;
@@ -568,6 +594,34 @@ fn vkcube_output_is_valid(stdout: &str, stderr: &str, backend: BackendSelection)
         })
 }
 
+fn vkcube_control_sequence_is_valid(stdout: &str, stderr: &str) -> bool {
+    let evidence = parse_vkcube_evidence(stdout, stderr);
+    let required = [
+        ("upscaler", "off"),
+        ("upscaler", "fsr_3_1_4"),
+        ("guidance_mode", "zero"),
+        ("guidance_mode", "estimated"),
+        ("quality", "performance"),
+        ("quality", "balanced"),
+        ("sharpening_enabled", "false"),
+        ("sharpening_enabled", "true"),
+    ];
+    let generations = evidence
+        .control_applied
+        .iter()
+        .filter_map(|applied| applied.generation)
+        .collect::<BTreeSet<_>>();
+    evidence.native_publishes == 1
+        && evidence.presenter_publishes == 1
+        && generations.len() == 1
+        && required.iter().all(|(setting, value)| {
+            evidence
+                .control_applied
+                .iter()
+                .any(|applied| applied.setting == *setting && applied.value == *value)
+        })
+}
+
 impl VkcubeExit {
     const fn success(self) -> bool {
         matches!(self, Self::Success)
@@ -581,6 +635,7 @@ fn parse_vkcube_args(args: &[&str]) -> Result<VkcubeOptions, String> {
         backend: BackendSelection::Reference,
         sharpening_enabled: true,
         sharpness: 0.2,
+        control_sequence: false,
     };
     let mut backend_seen = false;
     let mut sharpening_seen = false;
@@ -617,6 +672,12 @@ fn parse_vkcube_args(args: &[&str]) -> Result<VkcubeOptions, String> {
             }
             "--disable-sharpening" => {
                 return Err("sharpening options may only be specified once".into());
+            }
+            "--control-sequence" if !options.control_sequence => {
+                options.control_sequence = true;
+            }
+            "--control-sequence" => {
+                return Err("--control-sequence may only be specified once".into());
             }
             "--sharpness" if !sharpening_seen => {
                 sharpening_seen = true;
@@ -717,10 +778,18 @@ fn configure_vkcube_command(root: &Path, options: VkcubeOptions) -> Command {
         .env("TUXSCALING_CONFIG", launch.config_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if options.control_sequence {
+        command.env("TUXSCALING_TEST_CONTROL_SEQUENCE", "1");
+    }
     command
 }
 
-fn wait_for_vkcube(mut child: Child, seconds: u64, backend: BackendSelection) -> VkcubeExit {
+fn wait_for_vkcube(
+    mut child: Child,
+    seconds: u64,
+    backend: BackendSelection,
+    control_sequence: bool,
+) -> VkcubeExit {
     let Some(mut stdout) = child.stdout.take() else {
         return VkcubeExit::UnexpectedExit;
     };
@@ -780,7 +849,10 @@ fn wait_for_vkcube(mut child: Child, seconds: u64, backend: BackendSelection) ->
     );
     let stdout_text = String::from_utf8_lossy(&stdout);
     let stderr_text = String::from_utf8_lossy(&stderr);
-    if classification.success() && !vkcube_output_is_valid(&stdout_text, &stderr_text, backend) {
+    if classification.success()
+        && (!vkcube_output_is_valid(&stdout_text, &stderr_text, backend)
+            || (control_sequence && !vkcube_control_sequence_is_valid(&stdout_text, &stderr_text)))
+    {
         VkcubeExit::MissingStartupEvidence
     } else {
         classification
@@ -813,7 +885,12 @@ fn run_vkcube(root: &Path, options: VkcubeOptions) -> VkcubeExit {
         return VkcubeExit::BuildFailure;
     }
     match configure_vkcube_command(root, options).spawn() {
-        Ok(child) => wait_for_vkcube(child, options.seconds, options.backend),
+        Ok(child) => wait_for_vkcube(
+            child,
+            options.seconds,
+            options.backend,
+            options.control_sequence,
+        ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => VkcubeExit::MissingExecutable,
         Err(_) => VkcubeExit::UnexpectedExit,
     }
@@ -3677,8 +3754,8 @@ mod tests {
         parse_public_x11_display, parse_visual_quality_args, parse_vkcube_args,
         parse_vkcube_evidence, parse_wsi_compatibility_args, quality_ablation_rows,
         quality_fixture_passes, quality_metric_lines, quality_preset_rows,
-        visual_quality_metrics_for_test, vkcube_launch, vkcube_output_is_valid,
-        wsi_compatibility_output_is_valid,
+        visual_quality_metrics_for_test, vkcube_control_sequence_is_valid, vkcube_launch,
+        vkcube_output_is_valid, wsi_compatibility_output_is_valid,
     };
     use std::path::Path;
 
@@ -3838,6 +3915,14 @@ mod tests {
         let maximum = parse_vkcube_args(&["--sharpness", "1.0"]).unwrap();
         assert!(maximum.sharpening_enabled);
         assert_eq!(maximum.sharpness, 1.0);
+    }
+
+    #[test]
+    fn vkcube_accepts_a_single_control_sequence_flag() {
+        let options = parse_vkcube_args(&["--control-sequence"]).unwrap();
+        assert!(options.control_sequence);
+        assert!(parse_vkcube_args(&["--control-sequence", "--control-sequence"]).is_err());
+        assert!(!parse_vkcube_args(&[]).unwrap().control_sequence);
     }
 
     #[test]
@@ -4002,6 +4087,58 @@ mod tests {
             "",
             BackendSelection::Fsr314
         ));
+    }
+
+    #[test]
+    fn vkcube_control_sequence_requires_all_toggles_on_one_generation() {
+        let positive = concat!(
+            "TuxScaling swapchain: format=B8G8R8A8_UNORM\n",
+            "TuxScaling evidence event=virtual_swapchain_active logical=1280x720 physical=2160x1440\n",
+            "TuxScaling evidence event=native_generation_published logical=1280x720 physical=2160x1440\n",
+            "TuxScaling evidence event=presenter_generation_published logical=1280x720 physical=2160x1440 generation=1\n",
+            "TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=1280x720 physical=2160x1440\n",
+            "TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=1280x720 physical=2160x1440\n",
+            "TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=1280x720 physical=2160x1440\n",
+            "TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=1\n",
+            "TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=2\n",
+            "TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=3\n",
+            "TuxScaling evidence event=overlay_submitted virtual=1\n",
+            "TuxScaling evidence event=overlay_submitted virtual=1\n",
+            "TuxScaling evidence event=overlay_submitted virtual=1\n",
+            "TuxScaling evidence event=control_applied generation=1 setting=upscaler value=Off\n",
+            "TuxScaling evidence event=control_applied generation=1 setting=upscaler value=FSR_3_1_4\n",
+            "TuxScaling evidence event=control_applied generation=1 setting=guidance_mode value=Zero\n",
+            "TuxScaling evidence event=control_applied generation=1 setting=guidance_mode value=Estimated\n",
+            "TuxScaling evidence event=control_applied generation=1 setting=quality value=Performance\n",
+            "TuxScaling evidence event=control_applied generation=1 setting=quality value=Balanced\n",
+            "TuxScaling evidence event=control_applied generation=1 setting=sharpening_enabled value=false\n",
+            "TuxScaling evidence event=control_applied generation=1 setting=sharpening_enabled value=true\n",
+        );
+        assert!(vkcube_output_is_valid(
+            positive,
+            "",
+            BackendSelection::Fsr314
+        ));
+        assert!(vkcube_control_sequence_is_valid(positive, ""));
+        assert!(!vkcube_control_sequence_is_valid(
+            &positive.replace(
+                "setting=quality value=Performance\n",
+                "setting=quality value=Ultra\n"
+            ),
+            ""
+        ));
+        assert!(!vkcube_control_sequence_is_valid(
+            &positive.replace(
+                "generation=1 setting=quality",
+                "generation=2 setting=quality"
+            ),
+            ""
+        ));
+        let republished = positive.replace(
+            "event=native_generation_published logical=1280x720 physical=2160x1440\n",
+            "event=native_generation_published logical=1280x720 physical=2160x1440\nevent=native_generation_published logical=1280x720 physical=2160x1440\n",
+        );
+        assert!(!vkcube_control_sequence_is_valid(&republished, ""));
     }
 
     #[test]

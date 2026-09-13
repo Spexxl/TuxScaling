@@ -566,6 +566,9 @@ pub fn render_diagnostics(
             }
         },
     );
+    if control_sequence_enabled() {
+        apply_control_sequence_tick(diagnostics);
+    }
     OverlayFrame {
         pixels_per_point: output.pixels_per_point,
         primitives: context.tessellate(output.shapes, output.pixels_per_point),
@@ -601,6 +604,95 @@ fn ablation_checkbox(ui: &mut egui::Ui, label: &str, active: bool, requested: &m
 
 pub fn upscaler_request(active: Upscaler, selected: Upscaler) -> Option<Upscaler> {
     (active != selected).then_some(selected)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ControlRequest {
+    pub upscaler: Option<Upscaler>,
+    pub quality: Option<MotionQuality>,
+    pub guidance_mode: Option<GuidanceMode>,
+    pub sharpening_enabled: Option<bool>,
+    pub sharpness: Option<f32>,
+}
+
+/// Overlay-equivalent requests used by the vkcube control-sequence gate.
+/// Each step fires on one frame so the runtime can apply it without
+/// recreating the presenter generation.
+pub fn control_sequence_request(frame_id: u64) -> Option<ControlRequest> {
+    match frame_id {
+        120 => Some(ControlRequest {
+            upscaler: Some(Upscaler::Off),
+            ..ControlRequest::default()
+        }),
+        180 => Some(ControlRequest {
+            upscaler: Some(Upscaler::Fsr314),
+            ..ControlRequest::default()
+        }),
+        240 => Some(ControlRequest {
+            guidance_mode: Some(GuidanceMode::Zero),
+            ..ControlRequest::default()
+        }),
+        300 => Some(ControlRequest {
+            guidance_mode: Some(GuidanceMode::Estimated),
+            ..ControlRequest::default()
+        }),
+        360 => Some(ControlRequest {
+            quality: Some(MotionQuality::Performance),
+            ..ControlRequest::default()
+        }),
+        420 => Some(ControlRequest {
+            quality: Some(MotionQuality::Balanced),
+            ..ControlRequest::default()
+        }),
+        480 => Some(ControlRequest {
+            sharpening_enabled: Some(false),
+            ..ControlRequest::default()
+        }),
+        540 => Some(ControlRequest {
+            sharpening_enabled: Some(true),
+            sharpness: Some(0.2),
+            ..ControlRequest::default()
+        }),
+        _ => None,
+    }
+}
+
+pub fn apply_control_sequence(diagnostics: &mut FrameDiagnostics) {
+    apply_control_request(diagnostics, control_sequence_request(diagnostics.frame_id));
+}
+
+fn apply_control_sequence_tick(diagnostics: &mut FrameDiagnostics) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TICK: AtomicU64 = AtomicU64::new(0);
+    apply_control_request(
+        diagnostics,
+        control_sequence_request(TICK.fetch_add(1, Ordering::Relaxed)),
+    );
+}
+
+fn apply_control_request(diagnostics: &mut FrameDiagnostics, request: Option<ControlRequest>) {
+    let Some(request) = request else {
+        return;
+    };
+    if let Some(upscaler) = request.upscaler {
+        diagnostics.requested_upscaler = Some(upscaler);
+    }
+    if let Some(quality) = request.quality {
+        diagnostics.requested_quality = Some(quality);
+    }
+    if let Some(mode) = request.guidance_mode {
+        diagnostics.requested_guidance_mode = Some(mode);
+    }
+    if let Some(enabled) = request.sharpening_enabled {
+        diagnostics.requested_sharpening_enabled = Some(enabled);
+    }
+    if let Some(sharpness) = request.sharpness {
+        diagnostics.requested_sharpness = Some(sharpness);
+    }
+}
+
+pub fn control_sequence_enabled() -> bool {
+    std::env::var_os("TUXSCALING_TEST_CONTROL_SEQUENCE").is_some_and(|value| value != "0")
 }
 
 fn format_upscaler(upscaler: Upscaler) -> &'static str {
@@ -916,5 +1008,64 @@ mod tests {
             Some(Upscaler::Off)
         );
         assert_eq!(super::format_upscaler(Upscaler::Off), "Off");
+    }
+
+    #[test]
+    fn control_sequence_requests_each_required_toggle_once() {
+        let steps: Vec<_> = (0..600)
+            .filter_map(super::control_sequence_request)
+            .collect();
+        assert_eq!(
+            steps
+                .iter()
+                .filter_map(|step| step.upscaler)
+                .collect::<Vec<_>>(),
+            [Upscaler::Off, Upscaler::Fsr314]
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter_map(|step| step.guidance_mode)
+                .collect::<Vec<_>>(),
+            [GuidanceMode::Zero, GuidanceMode::Estimated]
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter_map(|step| step.quality)
+                .collect::<Vec<_>>(),
+            [MotionQuality::Performance, MotionQuality::Balanced]
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter_map(|step| step.sharpening_enabled)
+                .collect::<Vec<_>>(),
+            [false, true]
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter_map(|step| step.sharpness)
+                .collect::<Vec<_>>(),
+            [0.2]
+        );
+        assert_eq!(steps.len(), 8);
+    }
+
+    #[test]
+    fn apply_control_sequence_writes_only_the_matching_frame_request() {
+        let mut diagnostics = FrameDiagnostics {
+            frame_id: 120,
+            active_upscaler: Upscaler::Fsr314,
+            ..Default::default()
+        };
+        super::apply_control_sequence(&mut diagnostics);
+        assert_eq!(diagnostics.requested_upscaler, Some(Upscaler::Off));
+        assert_eq!(diagnostics.requested_quality, None);
+        diagnostics.frame_id = 121;
+        diagnostics.requested_upscaler = None;
+        super::apply_control_sequence(&mut diagnostics);
+        assert_eq!(diagnostics.requested_upscaler, None);
     }
 }

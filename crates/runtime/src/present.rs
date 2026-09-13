@@ -241,6 +241,47 @@ fn guidance_mode_name(mode: GuidanceMode) -> &'static str {
     }
 }
 
+fn emit_control_sequence_evidence(generation: u64, frame: &OverlayFrame) {
+    if !tuxscaling_overlay::control_sequence_enabled() {
+        return;
+    }
+    let emit = |setting: &str, value: &str| {
+        eprintln!(
+            "TuxScaling evidence event=control_applied generation={generation} setting={setting} value={value}"
+        );
+    };
+    if let Some(upscaler) = frame.requested_upscaler {
+        emit(
+            "upscaler",
+            match upscaler {
+                Upscaler::Reference => "Reference",
+                Upscaler::Fsr314 => "FSR_3_1_4",
+                Upscaler::Off => "Off",
+            },
+        );
+    }
+    if let Some(quality) = frame.requested_quality {
+        emit(
+            "quality",
+            match quality {
+                tuxscaling_config::MotionQuality::Ultra => "Ultra",
+                tuxscaling_config::MotionQuality::High => "High",
+                tuxscaling_config::MotionQuality::Balanced => "Balanced",
+                tuxscaling_config::MotionQuality::Performance => "Performance",
+            },
+        );
+    }
+    if let Some(mode) = frame.requested_guidance_mode {
+        emit("guidance_mode", guidance_mode_name(mode));
+    }
+    if let Some(enabled) = frame.requested_sharpening_enabled {
+        emit("sharpening_enabled", if enabled { "true" } else { "false" });
+    }
+    if let Some(sharpness) = frame.requested_sharpness {
+        emit("sharpness", &format!("{sharpness}"));
+    }
+}
+
 fn config_motion_quality(quality: MotionQuality) -> tuxscaling_config::MotionQuality {
     match quality {
         MotionQuality::Ultra => tuxscaling_config::MotionQuality::Ultra,
@@ -1556,6 +1597,7 @@ impl SwapchainRuntime {
             self.requested_config.comparison_split = split;
             self.diagnostics.requested_comparison_split = Some(split);
         }
+        emit_control_sequence_evidence(self.generation_id, &frame);
         if let Some(mode) = frame.requested_jitter_mode
             && self.temporal.jitter.set_mode(mode)
         {
@@ -2410,6 +2452,7 @@ impl SwapchainRuntime {
             self.requested_config.comparison_split = split;
             self.diagnostics.requested_comparison_split = Some(split);
         }
+        emit_control_sequence_evidence(self.generation_id, &frame);
         unsafe {
             self.device
                 .reset_command_buffer(slot.command, vk::CommandBufferResetFlags::empty())?;
