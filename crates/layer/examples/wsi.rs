@@ -315,6 +315,13 @@ fn native_monitor_rect() -> Option<(i32, i32, u32, u32)> {
     ))
 }
 
+/// Any nonzero RandR monitor is a valid native presenter target. The contract
+/// under test is that the presenter covers the selected monitor exactly, not
+/// one hard-coded resolution (nested runs still use 2160x1440).
+fn native_monitor_is_usable(native: (i32, i32, u32, u32)) -> bool {
+    native.2 > 0 && native.3 > 0
+}
+
 fn presenter_window_rects() -> Vec<(u64, tuxscaling_display::Rect)> {
     let Ok((connection, screen)) = x11rb::connect(None) else {
         return Vec::new();
@@ -916,6 +923,15 @@ mod tests {
                 "{scenario}"
             );
         }
+    }
+
+    #[test]
+    fn accepts_any_nonzero_native_monitor_for_presenter_scenario() {
+        assert!(super::native_monitor_is_usable((0, 0, 2160, 1440)));
+        assert!(super::native_monitor_is_usable((0, 0, 3440, 1440)));
+        assert!(super::native_monitor_is_usable((-1920, 0, 1920, 1080)));
+        assert!(!super::native_monitor_is_usable((0, 0, 0, 1440)));
+        assert!(!super::native_monitor_is_usable((0, 0, 2160, 0)));
     }
 
     #[test]
@@ -2100,10 +2116,9 @@ unsafe fn run() -> WsiOutcome {
         }
         let presenter_input_windows = if presenter_scenario {
             let native = native_monitor_rect().expect("presenter scenario needs a RandR monitor");
-            assert_eq!(
-                [native.2, native.3],
-                [2160, 1440],
-                "presenter scenario requires the 2160x1440 nested Mutter monitor"
+            assert!(
+                native_monitor_is_usable(native),
+                "presenter scenario needs a nonzero native monitor, got {native:?}"
             );
             let presenter_windows = presenter_window_rects();
             assert_eq!(

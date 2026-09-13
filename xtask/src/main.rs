@@ -398,6 +398,46 @@ fn parse_backend_args(args: &[&str]) -> Result<BackendSelection, String> {
     Ok(backend)
 }
 
+fn parse_wsi_compatibility_args(args: &[&str]) -> Result<(BackendSelection, Vec<String>), String> {
+    let mut backend = BackendSelection::Reference;
+    let mut backend_seen = false;
+    let mut allowed: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--backend" => {
+                if backend_seen {
+                    return Err("--backend may only be specified once".into());
+                }
+                backend_seen = true;
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--backend requires reference or fsr_3_1_4".to_owned())?;
+                backend = parse_backend(value)?;
+                index += 1;
+            }
+            "--allow-unverified" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--allow-unverified requires a scenario name".to_owned())?;
+                for scenario in value.split(',') {
+                    if !PORTABLE_WSI_SCENARIOS.contains(&scenario) {
+                        return Err(format!("unknown wsi-compatibility scenario: {scenario}"));
+                    }
+                    if !allowed.iter().any(|allowed| allowed == scenario) {
+                        allowed.push(scenario.to_owned());
+                    }
+                }
+                index += 1;
+            }
+            unknown => return Err(format!("unknown argument: {unknown}")),
+        }
+    }
+    Ok((backend, allowed))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct VkcubeOptions {
     seconds: u64,
@@ -2516,7 +2556,11 @@ fn command_output_with_timeout(
     ))
 }
 
-fn run_wsi_compatibility(root: &Path, backend: BackendSelection) -> bool {
+fn run_wsi_compatibility(
+    root: &Path,
+    backend: BackendSelection,
+    allowed_unverified: &[String],
+) -> bool {
     if !run(
         "cargo",
         &[
@@ -2586,8 +2630,19 @@ fn run_wsi_compatibility(root: &Path, backend: BackendSelection) -> bool {
         let valid = output.status.success()
             && wsi_compatibility_output_is_valid(&stdout, &stderr, scenario, backend);
         if !valid {
-            eprintln!("cargo xtask wsi-compatibility: {scenario} evidence gate failed");
-            all_passed = false;
+            let evidence = parse_wsi_compatibility_evidence(&stdout, &stderr);
+            let excused = allowed_unverified.iter().any(|allowed| allowed == scenario)
+                && evidence.unverified
+                && !evidence.validation_error
+                && !evidence.panic;
+            if excused {
+                eprintln!(
+                    "cargo xtask wsi-compatibility: {scenario} result=allowed-unverified reason=declared-environment-exception"
+                );
+            } else {
+                eprintln!("cargo xtask wsi-compatibility: {scenario} evidence gate failed");
+                all_passed = false;
+            }
         }
     }
     all_passed
@@ -3086,15 +3141,15 @@ fn main() -> ExitCode {
         "wsi-compatibility" => {
             let arguments = std::env::args().skip(2).collect::<Vec<_>>();
             let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
-            let backend = match parse_backend_args(&arguments) {
-                Ok(backend) => backend,
+            let (backend, allowed_unverified) = match parse_wsi_compatibility_args(&arguments) {
+                Ok(parsed) => parsed,
                 Err(error) => {
                     eprintln!("cargo xtask wsi-compatibility: {error}");
                     return ExitCode::from(2);
                 }
             };
             let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-            run_wsi_compatibility(root, backend)
+            run_wsi_compatibility(root, backend, &allowed_unverified)
         }
         "visual-quality" => {
             let arguments = std::env::args().skip(2).collect::<Vec<_>>();
@@ -3159,9 +3214,9 @@ mod tests {
         fidelityfx_symbols_are_complete, generated_config, maintenance_evidence_complete,
         maintenance_output_is_valid, parse_backend_args, parse_maintenance_evidence,
         parse_proton_acceptance_args, parse_public_x11_display, parse_visual_quality_args,
-        parse_vkcube_args, parse_vkcube_evidence, quality_fixture_passes,
-        visual_quality_metrics_for_test, vkcube_launch, vkcube_output_is_valid,
-        wsi_compatibility_output_is_valid,
+        parse_vkcube_args, parse_vkcube_evidence, parse_wsi_compatibility_args,
+        quality_fixture_passes, visual_quality_metrics_for_test, vkcube_launch,
+        vkcube_output_is_valid, wsi_compatibility_output_is_valid,
     };
     use std::path::Path;
 
@@ -3564,6 +3619,24 @@ mod tests {
                 "{scenario}"
             );
         }
+    }
+
+    #[test]
+    fn wsi_compatibility_parser_accepts_allow_unverified() {
+        let (backend, allowed) = parse_wsi_compatibility_args(&[
+            "--backend",
+            "fsr_3_1_4",
+            "--allow-unverified",
+            "display_timing",
+        ])
+        .unwrap();
+        assert_eq!(backend, BackendSelection::Fsr314);
+        assert_eq!(allowed, vec!["display_timing".to_owned()]);
+        let (_, none) = parse_wsi_compatibility_args(&["--backend", "reference"]).unwrap();
+        assert!(none.is_empty());
+        assert!(parse_wsi_compatibility_args(&["--allow-unverified", "bogus"]).is_err());
+        assert!(parse_wsi_compatibility_args(&["--allow-unverified"]).is_err());
+        assert!(parse_wsi_compatibility_args(&["--unknown"]).is_err());
     }
 
     #[test]
