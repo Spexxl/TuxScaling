@@ -237,6 +237,7 @@ fn translate_old_swapchain(logical: vk::SwapchainKHR) -> Result<vk::SwapchainKHR
 struct ActiveLogicalSwapchain {
     game_surface: vk::SurfaceKHR,
     present_surface: Option<vk::SurfaceKHR>,
+    generation: u64,
     contract: LogicalSwapchainContract,
     negotiation: PresentationNegotiation,
 }
@@ -257,6 +258,7 @@ fn active_logical_swapchain(logical: vk::SwapchainKHR) -> Option<ActiveLogicalSw
                 .map(|contract| ActiveLogicalSwapchain {
                     game_surface: state.game_surface,
                     present_surface: state.present_surface,
+                    generation: state.generation,
                     contract,
                     negotiation: state.negotiation,
                 })
@@ -2020,6 +2022,9 @@ unsafe fn create_swapchain_inner(
         return vk::Result::ERROR_OUT_OF_DATE_KHR;
     }
     let old_logical = active_logical_swapchain(original.old_swapchain);
+    let successor_generation = old_logical
+        .as_ref()
+        .map_or(0, |old| old.generation.saturating_add(1));
     if old_logical
         .as_ref()
         .is_some_and(|old| old.game_surface != original.surface)
@@ -2712,8 +2717,12 @@ unsafe fn create_swapchain_inner(
             || negotiation.public_state(),
             |_| PresentationState::Virtualized,
         );
-        let physical_generation =
-            PhysicalGeneration::new(0, handle, info.extent, output_images.len());
+        let physical_generation = PhysicalGeneration::new(
+            successor_generation,
+            handle,
+            info.extent,
+            output_images.len(),
+        );
         let physical_generation = present_surface.map_or(physical_generation, |surface| {
             physical_generation.with_present_surface(surface)
         });
@@ -2744,6 +2753,14 @@ unsafe fn create_swapchain_inner(
                     )
                 };
             }
+            if !virtual_eligible {
+                eprintln!(
+                    "TuxScaling evidence event=direct_swapchain_created surface=0x{:x} extent={}x{} reason=virtualization_not_active",
+                    original.surface.as_raw(),
+                    info.extent.width,
+                    info.extent.height,
+                );
+            }
             return result;
         };
         let state = Arc::new(Mutex::new(SwapchainState {
@@ -2754,7 +2771,7 @@ unsafe fn create_swapchain_inner(
             physical_handle: handle,
             mapping: virtual_images
                 .as_ref()
-                .map(|images| Mapping::new(0, images.len())),
+                .map(|images| Mapping::new(successor_generation, images.len())),
             negotiation,
             overlay: Some(overlay),
             virtual_images,
@@ -2764,7 +2781,7 @@ unsafe fn create_swapchain_inner(
             input_route_reported: false,
             maintenance_present_reported: false,
             maintenance_release_reported: false,
-            generation: 0,
+            generation: successor_generation,
             template,
             contract: Some(contract),
             hdr_metadata: None,
@@ -2782,7 +2799,7 @@ unsafe fn create_swapchain_inner(
             retire_swapchain(original.old_swapchain);
         }
         eprintln!(
-            "TuxScaling evidence event=logical_swapchain_created game_surface=0x{:x} present_surface=0x{:x} physical_surface=0x{:x} logical_handle=0x{:x} physical_handle=0x{:x} logical={}x{} physical={}x{} virtual={} presenter_state={} virtualization_state={} fallback_reason=none mutable_format={} view_formats={} negotiation={}",
+            "TuxScaling evidence event=logical_swapchain_created game_surface=0x{:x} present_surface=0x{:x} physical_surface=0x{:x} logical_handle=0x{:x} physical_handle=0x{:x} logical={}x{} physical={}x{} generation={} virtual={} presenter_state={} virtualization_state={} fallback_reason=none mutable_format={} view_formats={} negotiation={}",
             original.surface.as_raw(),
             present_surface.map_or(0, |surface| surface.as_raw()),
             physical_surface.as_raw(),
@@ -2792,6 +2809,7 @@ unsafe fn create_swapchain_inner(
             original.image_extent.height,
             info.extent.width,
             info.extent.height,
+            successor_generation,
             u8::from(virtual_eligible),
             if present_surface.is_some() {
                 "active"
@@ -2837,21 +2855,23 @@ unsafe fn create_swapchain_inner(
             unsafe { *swapchain = logical_handle };
             publish_negotiation(original.surface, negotiation);
             eprintln!(
-                "TuxScaling evidence event=virtual_swapchain_active logical_handle=0x{:x} logical={}x{} physical={}x{} presenter_surface={}",
+                "TuxScaling evidence event=virtual_swapchain_active logical_handle=0x{:x} logical={}x{} physical={}x{} generation={} presenter_surface={}",
                 logical_handle.as_raw(),
                 original.image_extent.width,
                 original.image_extent.height,
                 info.extent.width,
                 info.extent.height,
+                successor_generation,
                 u8::from(present_surface.is_some()),
             );
             if let Some(presenter_surface) = present_surface {
                 eprintln!(
-                    "TuxScaling evidence event=presenter_generation_published logical={}x{} physical={}x{} presenter_surface=0x{:x}",
+                    "TuxScaling evidence event=presenter_generation_published logical={}x{} physical={}x{} generation={} presenter_surface=0x{:x}",
                     original.image_extent.width,
                     original.image_extent.height,
                     info.extent.width,
                     info.extent.height,
+                    successor_generation,
                     presenter_surface.as_raw(),
                 );
             }

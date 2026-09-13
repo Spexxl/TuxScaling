@@ -521,24 +521,52 @@ unsafe extern "system" fn wait_for_present_khr(
     present_id: u64,
     timeout: u64,
 ) -> vk::Result {
-    let physical = match resolve_swapchain_route(swapchain) {
-        Ok(SwapchainRoute::Direct(physical)) => physical,
-        Ok(SwapchainRoute::CurrentVirtual { state, .. }) => {
-            let route = state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .present_ids
-                .resolve(present_id);
-            let Some(route) = route else {
-                return vk::Result::ERROR_OUT_OF_DATE_KHR;
-            };
-            eprintln!(
-                "TuxScaling evidence event=present_wait translated=1 generation={}",
-                route.generation(),
-            );
-            route.physical()
+    // A successful logical recreation retires the predecessor from acquire
+    // and present routing, but the predecessor can still service an already
+    // submitted present ID until the application destroys that handle.
+    let retired_present = if is_retired_swapchain(swapchain) {
+        swapchains()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&swapchain)
+            .cloned()
+            .and_then(|state| {
+                state
+                    .lock()
+                    .ok()
+                    .and_then(|state| state.present_ids.resolve(present_id))
+            })
+    } else {
+        None
+    };
+    let physical = if let Some(route) = retired_present {
+        eprintln!(
+            "TuxScaling evidence event=present_wait translated=1 generation={} logical_handle=0x{:x} retired=1",
+            route.generation(),
+            swapchain.as_raw(),
+        );
+        route.physical()
+    } else {
+        match resolve_swapchain_route(swapchain) {
+            Ok(SwapchainRoute::Direct(physical)) => physical,
+            Ok(SwapchainRoute::CurrentVirtual { state, .. }) => {
+                let route = state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .present_ids
+                    .resolve(present_id);
+                let Some(route) = route else {
+                    return vk::Result::ERROR_OUT_OF_DATE_KHR;
+                };
+                eprintln!(
+                    "TuxScaling evidence event=present_wait translated=1 generation={} logical_handle=0x{:x} retired=0",
+                    route.generation(),
+                    swapchain.as_raw(),
+                );
+                route.physical()
+            }
+            Err(error) => return error,
         }
-        Err(error) => return error,
     };
     unsafe {
         downstream_result(

@@ -1025,7 +1025,8 @@ unsafe fn replace(
     maintenance: Option<&MaintenanceConfig>,
     mutable_formats: Option<MutableFormatPair>,
     direct_fallback: bool,
-) {
+    retain_old: bool,
+) -> Option<vk::SwapchainKHR> {
     unsafe {
         context.device.device_wait_idle().unwrap();
         let game_surface = chain.surface;
@@ -1155,7 +1156,7 @@ unsafe fn replace(
         for s in chain.ready.drain(..) {
             context.device.destroy_semaphore(s, None);
         }
-        context.swapchains.destroy_swapchain(chain.handle, None);
+        let old = chain.handle;
         chain.handle = new;
         chain.extent = extent;
         chain.images = context.swapchains.get_swapchain_images(new).unwrap();
@@ -1220,6 +1221,12 @@ unsafe fn replace(
             alternate: formats[1],
             color_space: selected_format.color_space,
         });
+        if retain_old {
+            Some(old)
+        } else {
+            context.swapchains.destroy_swapchain(old, None);
+            None
+        }
     }
 }
 
@@ -2038,6 +2045,7 @@ unsafe fn run() -> WsiOutcome {
                 maintenance.as_ref(),
                 mutable_formats,
                 incompatible_scenario,
+                false,
             );
         }
         let mutable_views_validated = if let Some(pair) = mutable_formats {
@@ -2139,6 +2147,8 @@ unsafe fn run() -> WsiOutcome {
         let mut maintenance_recreated = false;
         let mut present_wait_current = false;
         let mut present_wait_old = false;
+        let mut present_wait_recreated = false;
+        let mut old_present_ids = vec![None; chains.len()];
         let mut next_present_id = 1_u64;
         let mut hdr_before = false;
         let mut hdr_after = false;
@@ -2222,6 +2232,7 @@ unsafe fn run() -> WsiOutcome {
                 maintenance.as_ref(),
                 mutable_formats,
                 incompatible_scenario,
+                false,
             );
             maintenance_recreated = true;
         }
@@ -2274,6 +2285,55 @@ unsafe fn run() -> WsiOutcome {
                 std::env::var("TUXSCALING_TEST_SCENARIO").ok().as_deref()
                     == Some("promotion_failure")
                     && resizes > 0;
+            if present_wait_scenario && frame == 1 && !present_wait_recreated {
+                assert!(
+                    old_present_ids.iter().all(Option::is_some),
+                    "present wait scenario must submit an old generation before recreation"
+                );
+                let mut retired = Vec::with_capacity(chains.len());
+                for chain in &mut chains {
+                    let maintenance = chain.maintenance.clone();
+                    let old = replace(
+                        &replacement,
+                        chain,
+                        game_extent(),
+                        maintenance.as_ref(),
+                        mutable_formats,
+                        false,
+                        true,
+                    )
+                    .expect("present wait recreation must retain the old logical handle");
+                    retired.push(old);
+                }
+                for (old, present_id, chain) in retired
+                    .into_iter()
+                    .zip(old_present_ids.iter_mut())
+                    .zip(chains.iter())
+                    .map(|((old, present_id), chain)| {
+                        (
+                            old,
+                            present_id.take().expect("old present ID is recorded"),
+                            chain,
+                        )
+                    })
+                {
+                    let wait_result = present_wait
+                        .as_ref()
+                        .expect("present wait device is enabled")
+                        .wait_for_present(old, present_id, u64::MAX);
+                    assert!(
+                        wait_result.is_ok(),
+                        "old-generation present wait failed: {wait_result:?}"
+                    );
+                    present_wait_old = true;
+                    swapchains.destroy_swapchain(old, None);
+                    assert_ne!(
+                        old, chain.handle,
+                        "present wait recreation must publish a successor logical handle"
+                    );
+                }
+                present_wait_recreated = true;
+            }
             if resize_interval > 0
                 && frame > 0
                 && frame.is_multiple_of(resize_interval)
@@ -2303,6 +2363,7 @@ unsafe fn run() -> WsiOutcome {
                         maintenance.as_ref(),
                         mutable_formats,
                         incompatible_scenario,
+                        false,
                     );
                 }
                 resizes += 1;
@@ -2343,6 +2404,7 @@ unsafe fn run() -> WsiOutcome {
                             maintenance.as_ref(),
                             mutable_formats,
                             incompatible_scenario,
+                            false,
                         );
                         swapchains
                             .acquire_next_image(
@@ -2459,16 +2521,16 @@ unsafe fn run() -> WsiOutcome {
                 let result = present(queue0, &info);
                 assert!(result == vk::Result::SUCCESS || result == vk::Result::SUBOPTIMAL_KHR);
                 if let Some(present_ids) = present_ids {
-                    for (chain, present_id) in chains.iter().zip(present_ids) {
-                        let wait_result = present_wait
-                            .as_ref()
-                            .expect("present wait device is enabled")
-                            .wait_for_present(chain.handle, present_id, u64::MAX);
-                        assert!(wait_result.is_ok(), "present wait failed: {wait_result:?}");
-                        if frame == 0 {
-                            present_wait_old = true;
-                        } else {
+                    for (index, (chain, present_id)) in chains.iter().zip(present_ids).enumerate() {
+                        if present_wait_recreated {
+                            let wait_result = present_wait
+                                .as_ref()
+                                .expect("present wait device is enabled")
+                                .wait_for_present(chain.handle, present_id, u64::MAX);
+                            assert!(wait_result.is_ok(), "present wait failed: {wait_result:?}");
                             present_wait_current = true;
+                        } else {
+                            old_present_ids[index] = Some(present_id);
                         }
                     }
                 }
@@ -2506,15 +2568,15 @@ unsafe fn run() -> WsiOutcome {
                     let result = present(queue_handles[i], &info);
                     assert!(result == vk::Result::SUCCESS || result == vk::Result::SUBOPTIMAL_KHR);
                     if let Some([present_id]) = present_ids {
-                        let wait_result = present_wait
-                            .as_ref()
-                            .expect("present wait device is enabled")
-                            .wait_for_present(chains[i].handle, present_id, u64::MAX);
-                        assert!(wait_result.is_ok(), "present wait failed: {wait_result:?}");
-                        if frame == 0 {
-                            present_wait_old = true;
-                        } else {
+                        if present_wait_recreated {
+                            let wait_result = present_wait
+                                .as_ref()
+                                .expect("present wait device is enabled")
+                                .wait_for_present(chains[i].handle, present_id, u64::MAX);
+                            assert!(wait_result.is_ok(), "present wait failed: {wait_result:?}");
                             present_wait_current = true;
+                        } else {
+                            old_present_ids[i] = Some(present_id);
                         }
                     }
                 }
@@ -2554,6 +2616,10 @@ unsafe fn run() -> WsiOutcome {
         }
         if present_wait_scenario {
             assert!(
+                present_wait_recreated,
+                "present wait scenario did not recreate the logical swapchain"
+            );
+            assert!(
                 present_wait_old,
                 "present wait did not route an old generation"
             );
@@ -2579,7 +2645,7 @@ unsafe fn run() -> WsiOutcome {
                     "alternate_views=1 present_wait_current=0 present_wait_old=0 hdr_before=0 hdr_after=0 queries=none timing=none direct=0"
                 }
                 "present_wait_generation" => {
-                    "alternate_views=0 present_wait_current=1 present_wait_old=1 hdr_before=0 hdr_after=0 queries=none timing=none direct=0"
+                    "alternate_views=0 present_wait_current=1 present_wait_old=1 present_wait_recreated=1 hdr_before=0 hdr_after=0 queries=none timing=none direct=0"
                 }
                 "hdr_replacement" => {
                     "alternate_views=0 present_wait_current=0 present_wait_old=0 hdr_before=1 hdr_after=1 queries=none timing=none direct=0"

@@ -162,6 +162,7 @@ struct WsiCompatibilityEvidence {
     alternate_views: bool,
     present_wait_current: bool,
     present_wait_old: bool,
+    present_wait_recreated: bool,
     present_wait_generations: Vec<u64>,
     hdr_before: bool,
     hdr_after: bool,
@@ -277,6 +278,8 @@ fn parse_wsi_compatibility_evidence(stdout: &str, stderr: &str) -> WsiCompatibil
                 evidence.present_wait_current |=
                     wsi_positive_field(&lowercase, "present_wait_current");
                 evidence.present_wait_old |= wsi_positive_field(&lowercase, "present_wait_old");
+                evidence.present_wait_recreated |=
+                    wsi_positive_field(&lowercase, "present_wait_recreated");
                 evidence.hdr_before |= wsi_positive_field(&lowercase, "hdr_before");
                 evidence.hdr_after |= wsi_positive_field(&lowercase, "hdr_after");
                 let queries = wsi_field(&lowercase, "queries").unwrap_or_default();
@@ -343,6 +346,7 @@ fn wsi_compatibility_output_is_valid(
         "present_wait_generation" => {
             evidence.present_wait_current
                 && evidence.present_wait_old
+                && evidence.present_wait_recreated
                 && evidence.present_wait_generations.contains(&0)
                 && evidence
                     .present_wait_generations
@@ -3222,7 +3226,7 @@ mod tests {
                 "TuxScaling evidence event=present_wait translated=1 generation=1\n",
                 "TuxScaling evidence event=reconstructed_present backend=FSR_3_1_4 frame=1\n",
                 "TuxScaling evidence event=overlay_submitted scenario={scenario}\n",
-                "TuxScaling evidence event=wsi_scenario scenario={scenario} result=verified alternate_views=1 present_wait_current=1 present_wait_old=1 hdr_before=1 hdr_after=1 queries=status,counter,refresh timing=count,data direct=0 recreations_after_publish=0\n",
+                "TuxScaling evidence event=wsi_scenario scenario={scenario} result=verified alternate_views=1 present_wait_current=1 present_wait_old=1 present_wait_recreated=1 hdr_before=1 hdr_after=1 queries=status,counter,refresh timing=count,data direct=0 recreations_after_publish=0\n",
             ),
             scenario = scenario,
         )
