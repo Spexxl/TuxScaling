@@ -1144,6 +1144,7 @@ impl SwapchainRuntime {
         frame_id: u64,
         output_name: &'static str,
         source: Option<DiagnosticImage>,
+        include_temporal_signals: bool,
     ) {
         let output = DiagnosticImage::new(
             output_name,
@@ -1157,7 +1158,7 @@ impl SwapchainRuntime {
             images.push(source);
         }
         images.push(output);
-        if let Some(motion) = &self.temporal.motion {
+        if include_temporal_signals && let Some(motion) = &self.temporal.motion {
             images.push(DiagnosticImage::new(
                 "motion",
                 motion.vectors.handle,
@@ -1173,7 +1174,7 @@ impl SwapchainRuntime {
                 vk::ImageLayout::GENERAL,
             ));
         }
-        if let Some(guidance) = &self.temporal.guidance {
+        if include_temporal_signals && let Some(guidance) = &self.temporal.guidance {
             for (name, image) in [
                 ("disocclusion", &guidance.disocclusion),
                 ("reactive", &guidance.reactive),
@@ -1213,7 +1214,17 @@ impl SwapchainRuntime {
             source_layout,
         );
         unsafe {
-            self.record_diagnostic_frame(command, index, frame_id, "spatial_off", Some(source));
+            // The disabled path intentionally does not produce temporal
+            // signals. Capture only the source and spatial output, avoiding
+            // reads from resources that remain in their initial layout.
+            self.record_diagnostic_frame(
+                command,
+                index,
+                frame_id,
+                "spatial_off",
+                Some(source),
+                false,
+            );
         }
     }
 
@@ -2051,6 +2062,7 @@ impl SwapchainRuntime {
                 diagnostic_frame_id,
                 "reconstructed",
                 diagnostic_source,
+                true,
             );
             if backend_recorded
                 && self.temporal.config.comparison_enabled
@@ -2477,6 +2489,7 @@ impl SwapchainRuntime {
                 self.temporal.history.frame_id.saturating_add(1),
                 "spatial_off",
                 fallback_source,
+                true,
             );
             self.overlay
                 .as_mut()
