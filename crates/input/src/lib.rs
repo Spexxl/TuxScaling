@@ -479,6 +479,19 @@ impl X11Input {
         self.last_root = None;
     }
 
+    pub fn update_route(&mut self, route: InputRoute) -> bool {
+        let event_window = if route.event_window == 0 {
+            self.event_window
+        } else {
+            route.event_window as c_ulong
+        };
+        if event_window != self.event_window {
+            return false;
+        }
+        self.route = route;
+        true
+    }
+
     pub fn cursor_owner(&self) -> CursorOwner {
         if self.overlay_open {
             CursorOwner::Overlay

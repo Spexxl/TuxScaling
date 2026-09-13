@@ -1,10 +1,42 @@
 #![allow(clippy::missing_safety_doc)]
 use ash::vk;
 use egui_ash_renderer::{Options, Renderer};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tuxscaling_input::{InputRoute, PointerViewport, X11Input};
 use tuxscaling_overlay::{FrameDiagnostics, OverlayFrame};
 
 pub const CRATE_NAME: &str = "tuxscaling-overlay-vulkan";
+
+type SharedInput = Arc<Mutex<X11Input>>;
+
+static INPUTS: OnceLock<Mutex<HashMap<u64, Weak<Mutex<X11Input>>>>> = OnceLock::new();
+
+fn shared_input(route: InputRouteConfig) -> Option<SharedInput> {
+    let registry = INPUTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry.lock().unwrap_or_else(|error| error.into_inner());
+    registry.retain(|_, input| input.strong_count() > 0);
+    if let Some(input) = registry.get(&route.event_window).and_then(Weak::upgrade) {
+        if !input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .update_route(route.route())
+        {
+            eprintln!(
+                "TuxScaling input: shared route window mismatch event_window={}",
+                route.event_window
+            );
+            return None;
+        }
+        return Some(input);
+    }
+    let input = X11Input::connect(route.route())
+        .map_err(|error| eprintln!("TuxScaling input: {error}"))
+        .ok()?;
+    let input = Arc::new(Mutex::new(input));
+    registry.insert(route.event_window, Arc::downgrade(&input));
+    Some(input)
+}
 
 #[derive(Clone, Copy)]
 pub struct SwapchainInfo {
@@ -109,7 +141,7 @@ pub struct OverlayRenderer {
     info: SwapchainInfo,
     render_pass: vk::RenderPass,
     slots: Vec<Slot>,
-    input: Option<X11Input>,
+    input: Option<SharedInput>,
     visible: bool,
     context: egui::Context,
 }
@@ -135,11 +167,7 @@ impl OverlayRenderer {
             info,
             render_pass: vk::RenderPass::null(),
             slots: Vec::new(),
-            input: input_route.and_then(|route| {
-                X11Input::connect(route.route())
-                    .map_err(|error| eprintln!("TuxScaling input: {error}"))
-                    .ok()
-            }),
+            input: input_route.and_then(shared_input),
             visible: false,
             context: egui::Context::default(),
         };
@@ -232,10 +260,12 @@ impl OverlayRenderer {
             .free_textures(&slot.free)
             .map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?;
         slot.free.clear();
-        let input = self
-            .input
-            .as_mut()
-            .map_or_else(Default::default, |input| input.poll());
+        let input = self.input.as_ref().map_or_else(Default::default, |input| {
+            input
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .poll()
+        });
         if input.toggle_overlay {
             self.visible = !self.visible;
         }
