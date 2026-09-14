@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-use crate::{BackendEnvironment, BackendError, BackendImage};
+use crate::{
+    BackendEnvironment, BackendError, BackendImage, BackendInputDiagnostics, BackendInputState,
+};
 use ash::vk;
 use std::io::Cursor;
 use tuxscaling_temporal::{FrameExtent, GuidanceView, MotionDirection, MotionUnits, SignalState};
@@ -27,6 +29,26 @@ impl FsrInputPolicy {
                 && guidance.confidence.state == SignalState::Estimated
                 && matches!(guidance.direction, MotionDirection::CurrentToPrevious)
                 && matches!(guidance.units, MotionUnits::SourcePixels),
+        }
+    }
+
+    pub(crate) fn diagnostics(self) -> BackendInputDiagnostics {
+        BackendInputDiagnostics {
+            motion: if self.use_estimated_motion {
+                BackendInputState::Estimated
+            } else {
+                BackendInputState::Neutral
+            },
+            confidence: if self.use_estimated_motion {
+                BackendInputState::Estimated
+            } else {
+                BackendInputState::Neutral
+            },
+            depth: BackendInputState::SuppressedIncompatible,
+            exposure: BackendInputState::SuppressedIncompatible,
+            reactive: BackendInputState::Neutral,
+            composition: BackendInputState::Neutral,
+            jitter: BackendInputState::Neutral,
         }
     }
 }

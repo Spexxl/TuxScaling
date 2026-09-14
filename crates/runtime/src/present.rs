@@ -13,7 +13,8 @@ use tuxscaling_temporal::{
     DepthSemantics, FrameExtent, GuidanceAblations, GuidanceReset, JitterSample, SignalState,
 };
 use tuxscaling_upscaler::{
-    BackendError, BackendFrame, BackendImage, OutputSharpening, ResolutionPlan, content_viewport,
+    BackendError, BackendFrame, BackendImage, BackendInputDiagnostics, BackendInputState,
+    OutputSharpening, ResolutionPlan, content_viewport,
 };
 use tuxscaling_vulkan::{compute_memory_barrier, image_barrier, transfer_memory_barrier};
 
@@ -355,6 +356,29 @@ fn signal_name(state: SignalState) -> &'static str {
         SignalState::ConstantFallback => "ConstantFallback",
         SignalState::Unavailable => "Unavailable",
     }
+}
+
+fn backend_input_state_name(state: BackendInputState) -> &'static str {
+    match state {
+        BackendInputState::Estimated => "Estimated",
+        BackendInputState::Neutral => "Neutral",
+        BackendInputState::SuppressedIncompatible => "SuppressedIncompatible",
+        BackendInputState::Fallback => "Fallback",
+        BackendInputState::NotReported => "NotReported",
+    }
+}
+
+fn update_backend_input_diagnostics(
+    diagnostics: &mut FrameDiagnostics,
+    input: BackendInputDiagnostics,
+) {
+    diagnostics.fsr_motion_state = backend_input_state_name(input.motion).into();
+    diagnostics.fsr_confidence_state = backend_input_state_name(input.confidence).into();
+    diagnostics.fsr_depth_state = backend_input_state_name(input.depth).into();
+    diagnostics.fsr_exposure_state = backend_input_state_name(input.exposure).into();
+    diagnostics.fsr_reactive_state = backend_input_state_name(input.reactive).into();
+    diagnostics.fsr_composition_state = backend_input_state_name(input.composition).into();
+    diagnostics.fsr_jitter_state = backend_input_state_name(input.jitter).into();
 }
 
 fn depth_semantics_name(semantics: DepthSemantics) -> &'static str {
@@ -2043,6 +2067,12 @@ impl SwapchainRuntime {
                         backend_failed = true;
                     },
                 );
+                if self.temporal.active_upscaler == Upscaler::Fsr314 {
+                    update_backend_input_diagnostics(
+                        &mut self.diagnostics,
+                        upscaler.input_diagnostics(),
+                    );
+                }
                 self.diagnostics.reconstruction_cpu_ms =
                     cpu_start.elapsed().as_secs_f32() * 1_000.0;
                 if let Err(error) = result {

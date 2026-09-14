@@ -17,6 +17,27 @@ pub enum BackendId {
     Fsr314,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BackendInputState {
+    Estimated,
+    Neutral,
+    SuppressedIncompatible,
+    Fallback,
+    #[default]
+    NotReported,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackendInputDiagnostics {
+    pub motion: BackendInputState,
+    pub confidence: BackendInputState,
+    pub depth: BackendInputState,
+    pub exposure: BackendInputState,
+    pub reactive: BackendInputState,
+    pub composition: BackendInputState,
+    pub jitter: BackendInputState,
+}
+
 impl BackendId {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -774,6 +795,10 @@ impl ResolutionPlan {
 pub trait UpscalerBackend: Send {
     fn id(&self) -> BackendId;
     fn capabilities(&self) -> BackendCapabilities;
+
+    fn input_diagnostics(&self) -> BackendInputDiagnostics {
+        BackendInputDiagnostics::default()
+    }
     fn configure(&mut self, config: BackendConfig) -> Result<(), BackendError>;
     /// Records backend commands into the supplied command buffer only.
     ///

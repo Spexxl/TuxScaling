@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     BackendCapabilities, BackendColorEncoding, BackendConfig, BackendEnvironment, BackendError,
-    BackendFrame, BackendId, BackendImage, UpscalerBackend,
+    BackendFrame, BackendId, BackendImage, BackendInputDiagnostics, UpscalerBackend,
 };
 use ash::vk;
 use ash::vk::Handle;
@@ -42,6 +42,7 @@ pub struct Fsr314Upscaler {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     config: BackendConfig,
+    input_diagnostics: BackendInputDiagnostics,
 }
 
 impl Fsr314Upscaler {
@@ -334,6 +335,7 @@ impl Fsr314Upscaler {
             pipeline_layout,
             pipeline,
             config,
+            input_diagnostics: BackendInputDiagnostics::default(),
         })
     }
 
@@ -431,6 +433,10 @@ impl UpscalerBackend for Fsr314Upscaler {
         Self::capabilities_static()
     }
 
+    fn input_diagnostics(&self) -> BackendInputDiagnostics {
+        self.input_diagnostics
+    }
+
     fn configure(&mut self, config: BackendConfig) -> Result<(), BackendError> {
         config.validate(self.capabilities())?;
         if config.game_extent != self.config.game_extent
@@ -450,6 +456,8 @@ impl UpscalerBackend for Fsr314Upscaler {
         frame.validate(self.config, self.capabilities())?;
         let slot = frame.slot % self.outputs.len();
         let guidance = frame.guidance;
+        self.input_diagnostics =
+            super::input::FsrInputPolicy::from_guidance(guidance).diagnostics();
         let inputs = self.input.outputs(slot);
         unsafe {
             self.input

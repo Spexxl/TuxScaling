@@ -74,6 +74,13 @@ pub struct FrameDiagnostics {
     pub depth_state: String,
     pub composition_state: String,
     pub jitter_state: String,
+    pub fsr_motion_state: String,
+    pub fsr_confidence_state: String,
+    pub fsr_depth_state: String,
+    pub fsr_exposure_state: String,
+    pub fsr_reactive_state: String,
+    pub fsr_composition_state: String,
+    pub fsr_jitter_state: String,
     pub depth_semantics: String,
     pub capture_cpu_ms: f32,
     pub motion_cpu_ms: f32,
@@ -515,6 +522,21 @@ pub fn render_diagnostics(
                         diagnostics.composition_state,
                         diagnostics.jitter_state
                     ));
+                    if diagnostics.active_upscaler == Upscaler::Fsr314 {
+                        ui.label(format!(
+                            "FSR inputs: motion {} | confidence {} | depth {} | exposure {}",
+                            diagnostics.fsr_motion_state,
+                            diagnostics.fsr_confidence_state,
+                            diagnostics.fsr_depth_state,
+                            diagnostics.fsr_exposure_state
+                        ));
+                        ui.label(format!(
+                            "FSR inputs: reactive {} | composition {} | jitter {}",
+                            diagnostics.fsr_reactive_state,
+                            diagnostics.fsr_composition_state,
+                            diagnostics.fsr_jitter_state
+                        ));
+                    }
                     ui.label("Motion: current -> previous, pixels");
                     ui.label("Hue: direction | Brightness: magnitude");
                     ui.label(format!(
