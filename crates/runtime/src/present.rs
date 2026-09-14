@@ -1,6 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 use crate::diagnostic_capture::{
-    DiagnosticCapture, DiagnosticCaptureConfig, DiagnosticFrameMetadata, DiagnosticImage,
+    DiagnosticCapture, DiagnosticCaptureConfig, DiagnosticFrameMetadata, DiagnosticFsrInputs,
+    DiagnosticImage,
 };
 use ash::vk;
 use std::{collections::VecDeque, mem, time::Instant};
@@ -379,6 +380,18 @@ fn update_backend_input_diagnostics(
     diagnostics.fsr_reactive_state = backend_input_state_name(input.reactive).into();
     diagnostics.fsr_composition_state = backend_input_state_name(input.composition).into();
     diagnostics.fsr_jitter_state = backend_input_state_name(input.jitter).into();
+}
+
+fn fallback_backend_input_diagnostics() -> BackendInputDiagnostics {
+    BackendInputDiagnostics {
+        motion: BackendInputState::Fallback,
+        confidence: BackendInputState::Fallback,
+        depth: BackendInputState::Fallback,
+        exposure: BackendInputState::Fallback,
+        reactive: BackendInputState::Fallback,
+        composition: BackendInputState::Fallback,
+        jitter: BackendInputState::Fallback,
+    }
 }
 
 fn depth_semantics_name(semantics: DepthSemantics) -> &'static str {
@@ -865,6 +878,13 @@ impl SwapchainRuntime {
                 active_comparison_split: config.comparison_split,
                 jitter_mode: config.jitter_mode,
                 debug_view: config.debug_view,
+                fsr_motion_state: "NotReported".into(),
+                fsr_confidence_state: "NotReported".into(),
+                fsr_depth_state: "NotReported".into(),
+                fsr_exposure_state: "NotReported".into(),
+                fsr_reactive_state: "NotReported".into(),
+                fsr_composition_state: "NotReported".into(),
+                fsr_jitter_state: "NotReported".into(),
                 reset_reason: reset_name(GuidanceReset::Initialize).into(),
                 guidance_scale: config.guidance_scale,
                 presentation_mode: if !capture_enabled {
@@ -1179,6 +1199,15 @@ impl SwapchainRuntime {
             ablations: self.temporal.guidance_ablations,
             sharpening_enabled: self.temporal.config.sharpening_enabled,
             sharpness: self.temporal.config.sharpness,
+            fsr_inputs: DiagnosticFsrInputs {
+                motion: self.diagnostics.fsr_motion_state.clone(),
+                confidence: self.diagnostics.fsr_confidence_state.clone(),
+                depth: self.diagnostics.fsr_depth_state.clone(),
+                exposure: self.diagnostics.fsr_exposure_state.clone(),
+                reactive: self.diagnostics.fsr_reactive_state.clone(),
+                composition: self.diagnostics.fsr_composition_state.clone(),
+                jitter: self.diagnostics.fsr_jitter_state.clone(),
+            },
             history_age: self.temporal.history_age,
             gpu_timings_ms: [
                 self.diagnostics.capture_ms,
@@ -1452,6 +1481,7 @@ impl SwapchainRuntime {
         ];
         self.diagnostics.upscaler = self.temporal.active_upscaler;
         self.diagnostics.active_upscaler = self.temporal.active_upscaler;
+        update_backend_input_diagnostics(&mut self.diagnostics, BackendInputDiagnostics::default());
         self.diagnostics.state = "Guidance scale changed; history reset".into();
         unsafe { self.resize_diagnostic_capture() };
         Ok(())
@@ -1714,6 +1744,10 @@ impl SwapchainRuntime {
                 self.temporal.disable_upscaler();
                 self.diagnostics.upscaler = Upscaler::Off;
                 self.diagnostics.active_upscaler = Upscaler::Off;
+                update_backend_input_diagnostics(
+                    &mut self.diagnostics,
+                    BackendInputDiagnostics::default(),
+                );
             }
             if self.temporal.active_upscaler == Upscaler::Off {
                 self.diagnostics.state = "Upscaler disabled; direct presentation".into();
@@ -1982,6 +2016,10 @@ impl SwapchainRuntime {
                     Ok(true) => {
                         self.diagnostics.active_upscaler = self.temporal.active_upscaler;
                         self.diagnostics.upscaler = self.temporal.active_upscaler;
+                        update_backend_input_diagnostics(
+                            &mut self.diagnostics,
+                            BackendInputDiagnostics::default(),
+                        );
                         self.diagnostics.state = "Upscaler changed; history reset".into();
                     }
                     Ok(false) => {}
@@ -2068,10 +2106,17 @@ impl SwapchainRuntime {
                     },
                 );
                 if self.temporal.active_upscaler == Upscaler::Fsr314 {
-                    update_backend_input_diagnostics(
-                        &mut self.diagnostics,
-                        upscaler.input_diagnostics(),
-                    );
+                    if result.is_ok() {
+                        update_backend_input_diagnostics(
+                            &mut self.diagnostics,
+                            upscaler.input_diagnostics(),
+                        );
+                    } else {
+                        update_backend_input_diagnostics(
+                            &mut self.diagnostics,
+                            fallback_backend_input_diagnostics(),
+                        );
+                    }
                 }
                 self.diagnostics.reconstruction_cpu_ms =
                     cpu_start.elapsed().as_secs_f32() * 1_000.0;
@@ -2741,10 +2786,13 @@ impl Drop for SwapchainRuntime {
 mod tests {
     use super::{
         GPU_PHASES, GpuTimingWindow, SwapchainImages, backend_debug_view, debug_mode_id,
-        record_secondary_transaction, submitted_fences,
+        fallback_backend_input_diagnostics, record_secondary_transaction, submitted_fences,
+        update_backend_input_diagnostics,
     };
     use ash::vk;
     use ash::vk::Handle;
+    use tuxscaling_overlay::FrameDiagnostics;
+    use tuxscaling_upscaler::{BackendInputDiagnostics, BackendInputState};
 
     #[test]
     fn submitted_fences_include_every_in_flight_slot_before_backend_teardown() {
@@ -2810,6 +2858,22 @@ mod tests {
         assert_eq!(backend_debug_view(6), 1);
         assert_eq!(backend_debug_view(10), 5);
         assert_eq!(backend_debug_view(4), 0);
+    }
+
+    #[test]
+    fn backend_input_diagnostics_distinguish_neutral_and_failed_dispatch() {
+        let mut diagnostics = FrameDiagnostics::default();
+        update_backend_input_diagnostics(&mut diagnostics, BackendInputDiagnostics::default());
+        assert_eq!(diagnostics.fsr_motion_state, "NotReported");
+        assert_eq!(diagnostics.fsr_depth_state, "NotReported");
+
+        update_backend_input_diagnostics(&mut diagnostics, fallback_backend_input_diagnostics());
+        assert_eq!(diagnostics.fsr_motion_state, "Fallback");
+        assert_eq!(diagnostics.fsr_depth_state, "Fallback");
+        assert_eq!(
+            super::backend_input_state_name(BackendInputState::SuppressedIncompatible),
+            "SuppressedIncompatible"
+        );
     }
 
     #[test]

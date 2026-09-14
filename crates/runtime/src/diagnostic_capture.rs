@@ -275,6 +275,31 @@ impl DiagnosticImage {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct DiagnosticFsrInputs {
+    pub(crate) motion: String,
+    pub(crate) confidence: String,
+    pub(crate) depth: String,
+    pub(crate) exposure: String,
+    pub(crate) reactive: String,
+    pub(crate) composition: String,
+    pub(crate) jitter: String,
+}
+
+impl Default for DiagnosticFsrInputs {
+    fn default() -> Self {
+        Self {
+            motion: "NotReported".into(),
+            confidence: "NotReported".into(),
+            depth: "NotReported".into(),
+            exposure: "NotReported".into(),
+            reactive: "NotReported".into(),
+            composition: "NotReported".into(),
+            jitter: "NotReported".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct DiagnosticFrameMetadata {
     pub(crate) frame_id: u64,
     pub(crate) generation_id: u64,
@@ -288,6 +313,7 @@ pub(crate) struct DiagnosticFrameMetadata {
     pub(crate) ablations: GuidanceAblations,
     pub(crate) sharpening_enabled: bool,
     pub(crate) sharpness: f32,
+    pub(crate) fsr_inputs: DiagnosticFsrInputs,
     pub(crate) history_age: u64,
     pub(crate) gpu_timings_ms: [f32; 15],
 }
@@ -752,6 +778,7 @@ fn metadata_json(pending: &PendingCapture, frame_prefix: &str) -> String {
             "  \"guidance_mode\":{},\n",
             "  \"ablations\":{{\"motion\":{},\"relative_depth\":{},\"reactive\":{},\"composition\":{},\"exposure\":{},\"confidence_disocclusion\":{},\"post_capture_jitter\":{}}},\n",
             "  \"sharpening\":{{\"enabled\":{},\"sharpness\":{:.6}}},\n",
+            "  \"fsr_inputs\":{{\"motion\":{},\"confidence\":{},\"depth\":{},\"exposure\":{},\"reactive\":{},\"composition\":{},\"jitter\":{}}},\n",
             "  \"history_age\":{},\n",
             "  \"gpu_timings_ms\":[{}],\n",
             "  \"resources\":[{}]\n",
@@ -781,6 +808,13 @@ fn metadata_json(pending: &PendingCapture, frame_prefix: &str) -> String {
         metadata.ablations.post_capture_jitter,
         metadata.sharpening_enabled,
         metadata.sharpness,
+        json_string(&metadata.fsr_inputs.motion),
+        json_string(&metadata.fsr_inputs.confidence),
+        json_string(&metadata.fsr_inputs.depth),
+        json_string(&metadata.fsr_inputs.exposure),
+        json_string(&metadata.fsr_inputs.reactive),
+        json_string(&metadata.fsr_inputs.composition),
+        json_string(&metadata.fsr_inputs.jitter),
         metadata.history_age,
         timings,
         resources,
@@ -808,7 +842,8 @@ fn write_atomic(root: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
 mod tests {
     use super::{
         CaptureState, CapturedResource, DiagnosticCaptureConfig, DiagnosticFrameMetadata,
-        PendingCapture, SlotState, image_size, metadata_json, resource_layouts,
+        DiagnosticFsrInputs, PendingCapture, SlotState, image_size, metadata_json,
+        resource_layouts,
     };
     use ash::vk;
     use tuxscaling_temporal::GuidanceAblations;
@@ -955,6 +990,15 @@ mod tests {
                 },
                 sharpening_enabled: true,
                 sharpness: 0.2,
+                fsr_inputs: DiagnosticFsrInputs {
+                    motion: "Estimated".into(),
+                    confidence: "Estimated".into(),
+                    depth: "SuppressedIncompatible".into(),
+                    exposure: "SuppressedIncompatible".into(),
+                    reactive: "Neutral".into(),
+                    composition: "Neutral".into(),
+                    jitter: "Neutral".into(),
+                },
                 history_age: 4,
                 gpu_timings_ms: [0.0; 15],
             },
@@ -973,6 +1017,8 @@ mod tests {
         assert!(json.contains("\"backend\":\"FSR 3.1.4\""));
         assert!(json.contains("\"relative_depth\":true"));
         assert!(json.contains("\"sharpness\":0.200000"));
+        assert!(json.contains("\"fsr_inputs\":{\"motion\":\"Estimated\""));
+        assert!(json.contains("\"depth\":\"SuppressedIncompatible\""));
         assert!(json.contains("frame-00000007-source.bin"));
     }
 }
