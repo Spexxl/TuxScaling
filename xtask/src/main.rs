@@ -1281,6 +1281,7 @@ fn read_capture_series(
             selected.len()
         ));
     }
+    let mut stable_estimated_motion_seen = false;
     for manifest in &selected {
         if manifest.game_extent != [options.input.0, options.input.1]
             || manifest.output_extent != [options.output.0, options.output.1]
@@ -1325,12 +1326,24 @@ fn read_capture_series(
             ));
         }
         if expected_backend == "FSR 3.1.4"
-            && !fsr_input_contract_is_safe(&manifest.guidance_mode, &manifest.fsr_inputs)
+            && !fsr_input_contract_is_safe_for_frame(
+                &manifest.guidance_mode,
+                &manifest.fsr_inputs,
+                manifest.history_age,
+                &manifest.reset_reason,
+            )
         {
             return Err(format!(
                 "frame {} reports an unsafe FSR input contract",
                 manifest.frame_id
             ));
+        }
+        if expected_backend == "FSR 3.1.4"
+            && manifest.guidance_mode == "Estimated"
+            && manifest.fsr_inputs.motion == "Estimated"
+            && manifest.fsr_inputs.confidence == "Estimated"
+        {
+            stable_estimated_motion_seen = true;
         }
         if manifest.reset_reason == "ProviderFailure" {
             return Err(format!(
@@ -1339,12 +1352,35 @@ fn read_capture_series(
             ));
         }
     }
+    if expected_backend == "FSR 3.1.4"
+        && selected
+            .iter()
+            .any(|manifest| manifest.guidance_mode == "Estimated")
+        && !stable_estimated_motion_seen
+    {
+        return Err("FSR Estimated capture contains no stable estimated-motion frame".into());
+    }
     Ok(selected)
 }
 
+#[cfg(test)]
 fn fsr_input_contract_is_safe(guidance_mode: &str, inputs: &CaptureFsrInputs) -> bool {
+    fsr_input_contract_is_safe_for_frame(guidance_mode, inputs, u64::MAX, "None")
+}
+
+fn fsr_input_contract_is_safe_for_frame(
+    guidance_mode: &str,
+    inputs: &CaptureFsrInputs,
+    history_age: u64,
+    reset_reason: &str,
+) -> bool {
+    let motion_is_estimated = inputs.motion == "Estimated" && inputs.confidence == "Estimated";
+    let motion_is_neutral = inputs.motion == "Neutral" && inputs.confidence == "Neutral";
     let (motion, confidence) = match guidance_mode {
-        "Estimated" => ("Estimated", "Estimated"),
+        "Estimated" if motion_is_estimated => ("Estimated", "Estimated"),
+        "Estimated" if motion_is_neutral && (history_age <= 1 || reset_reason != "None") => {
+            ("Neutral", "Neutral")
+        }
         "Zero" => ("Neutral", "Neutral"),
         _ => return false,
     };
@@ -4068,13 +4104,13 @@ mod tests {
         ProtonAcceptanceOptions, ProtonLauncherProbe, QualityEvidenceSuiteReport, VkcubeExit,
         benchmark_cases, benchmark_output_is_operationally_valid, classify_vkcube_exit,
         classify_vkcube_output, fidelityfx_elf_architecture_is_valid,
-        fidelityfx_symbols_are_complete, fsr_input_contract_is_safe, generated_config,
-        guidance_comparison_gate_passed, maintenance_evidence_complete,
-        maintenance_output_is_valid, parse_backend_args, parse_maintenance_evidence,
-        parse_preset_medians, parse_proton_acceptance_args, parse_public_x11_display,
-        parse_visual_quality_args, parse_vkcube_args, parse_vkcube_evidence,
-        parse_wsi_compatibility_args, proton_launchers_on_path, quality_ablation_rows,
-        quality_fixture_passes, quality_metric_lines, quality_preset_rows,
+        fidelityfx_symbols_are_complete, fsr_input_contract_is_safe,
+        fsr_input_contract_is_safe_for_frame, generated_config, guidance_comparison_gate_passed,
+        maintenance_evidence_complete, maintenance_output_is_valid, parse_backend_args,
+        parse_maintenance_evidence, parse_preset_medians, parse_proton_acceptance_args,
+        parse_public_x11_display, parse_visual_quality_args, parse_vkcube_args,
+        parse_vkcube_evidence, parse_wsi_compatibility_args, proton_launchers_on_path,
+        quality_ablation_rows, quality_fixture_passes, quality_metric_lines, quality_preset_rows,
         visual_quality_metrics_for_test, vkcube_control_sequence_is_valid, vkcube_launch_in,
         vkcube_output_is_valid, wsi_compatibility_output_is_valid, x11_display_is_available_with,
     };
@@ -4611,6 +4647,48 @@ mod tests {
         assert!(fsr_input_contract_is_safe("Zero", &zero));
         assert!(!fsr_input_contract_is_safe("Zero", &safe));
         assert!(!fsr_input_contract_is_safe("Unknown", &safe));
+    }
+
+    #[test]
+    fn visual_quality_accepts_only_initial_neutral_fsr_motion_before_stable_history() {
+        let estimated = CaptureFsrInputs {
+            motion: "Estimated".into(),
+            confidence: "Estimated".into(),
+            depth: "SuppressedIncompatible".into(),
+            exposure: "SuppressedIncompatible".into(),
+            reactive: "Neutral".into(),
+            composition: "Neutral".into(),
+            jitter: "Neutral".into(),
+        };
+        let neutral = CaptureFsrInputs {
+            motion: "Neutral".into(),
+            confidence: "Neutral".into(),
+            ..estimated.clone()
+        };
+        assert!(fsr_input_contract_is_safe_for_frame(
+            "Estimated",
+            &neutral,
+            1,
+            "None",
+        ));
+        assert!(fsr_input_contract_is_safe_for_frame(
+            "Estimated",
+            &neutral,
+            8,
+            "SceneCut",
+        ));
+        assert!(!fsr_input_contract_is_safe_for_frame(
+            "Estimated",
+            &neutral,
+            8,
+            "None",
+        ));
+        assert!(fsr_input_contract_is_safe_for_frame(
+            "Estimated",
+            &estimated,
+            8,
+            "None",
+        ));
     }
 
     #[test]
