@@ -511,6 +511,49 @@ fn backend_image(
 
 #[cfg(test)]
 mod tests {
+    use ash::vk::Handle;
+    use tuxscaling_temporal::{
+        DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset,
+        GuidanceResolution, GuidanceResource, GuidanceScalar, GuidanceView, JitterSample,
+        MotionDirection, MotionUnits, SignalState,
+    };
+
+    fn resource(
+        metadata: GuidanceMetadata,
+        format: ash::vk::Format,
+        state: SignalState,
+        image_id: u64,
+    ) -> GuidanceResource {
+        GuidanceResource {
+            image: ash::vk::Image::from_raw(image_id),
+            view: ash::vk::ImageView::from_raw(image_id),
+            format,
+            metadata,
+            state,
+        }
+    }
+
+    fn guidance(metadata: GuidanceMetadata, state: SignalState) -> GuidanceView {
+        let extent = metadata.extent;
+        GuidanceView {
+            motion: resource(metadata, ash::vk::Format::R16G16_SFLOAT, state, 1),
+            confidence: resource(metadata, ash::vk::Format::R8_UNORM, state, 2),
+            disocclusion: resource(metadata, ash::vk::Format::R8_UNORM, state, 3),
+            reactive: resource(metadata, ash::vk::Format::R8_UNORM, state, 4),
+            exposure: resource(metadata, ash::vk::Format::R32_SFLOAT, state, 5),
+            depth: resource(metadata, ash::vk::Format::R32_SFLOAT, state, 6),
+            transparency_composition: resource(metadata, ash::vk::Format::R8_UNORM, state, 7),
+            pre_exposure: GuidanceScalar::constant_fallback(1.0),
+            timing: FrameTiming::default(),
+            jitter: JitterSample::default(),
+            depth_semantics: DepthSemantics::FlatFallback,
+            direction: MotionDirection::CurrentToPrevious,
+            units: MotionUnits::SourcePixels,
+            resolution: GuidanceResolution::new(extent, extent),
+            requires_history_reset: false,
+        }
+    }
+
     #[test]
     fn shader_uses_the_fsr_safe_guidance_contract() {
         let shader = include_str!("../../../../shaders/upscaler/fidelityfx_input.comp");
@@ -527,5 +570,58 @@ mod tests {
         }
         assert!(!shader.contains("disocclusion * (1.0 - confidence)"));
         assert!(!shader.contains("max(composition, disocclusion)"));
+    }
+
+    #[test]
+    fn estimated_motion_is_forwarded_only_when_the_contract_is_qualified() {
+        let extent = FrameExtent {
+            width: 128,
+            height: 96,
+        };
+        let estimated = guidance(
+            GuidanceMetadata {
+                frame_id: 7,
+                extent,
+                valid_region: tuxscaling_temporal::ValidRegion::full(extent),
+                reset: GuidanceReset::None,
+                valid: true,
+                is_zero: false,
+                requires_history_reset: false,
+            },
+            SignalState::Estimated,
+        );
+        let policy = super::FsrInputPolicy::from_guidance(estimated);
+        assert!(policy.use_estimated_motion);
+        let diagnostics = policy.diagnostics();
+        assert_eq!(diagnostics.motion, super::BackendInputState::Estimated);
+        assert_eq!(diagnostics.confidence, super::BackendInputState::Estimated);
+        assert_eq!(
+            diagnostics.depth,
+            super::BackendInputState::SuppressedIncompatible
+        );
+        assert_eq!(
+            diagnostics.exposure,
+            super::BackendInputState::SuppressedIncompatible
+        );
+        assert_eq!(diagnostics.reactive, super::BackendInputState::Neutral);
+        assert_eq!(diagnostics.composition, super::BackendInputState::Neutral);
+        assert_eq!(diagnostics.jitter, super::BackendInputState::Neutral);
+    }
+
+    #[test]
+    fn zero_or_fallback_guidance_never_enables_estimated_motion() {
+        let extent = FrameExtent {
+            width: 128,
+            height: 96,
+        };
+        let zero = guidance(
+            GuidanceMetadata::zero(11, extent, GuidanceReset::ProviderFailure),
+            SignalState::ConstantFallback,
+        );
+        let policy = super::FsrInputPolicy::from_guidance(zero);
+        assert!(!policy.use_estimated_motion);
+        let diagnostics = policy.diagnostics();
+        assert_eq!(diagnostics.motion, super::BackendInputState::Neutral);
+        assert_eq!(diagnostics.confidence, super::BackendInputState::Neutral);
     }
 }
