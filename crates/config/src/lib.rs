@@ -131,7 +131,7 @@ impl Default for Config {
             jitter_mode: JitterMode::Off,
             guidance_mode: GuidanceMode::Estimated,
             sharpening_enabled: true,
-            sharpness: 0.2,
+            sharpness: 0.3,
             comparison_enabled: false,
             comparison_split: 0.5,
             motion_quality: MotionQuality::Balanced,
@@ -315,7 +315,7 @@ mod tests {
         assert_eq!(config.motion_quality, MotionQuality::Balanced);
         assert_eq!(config.guidance_mode, GuidanceMode::Estimated);
         assert!(config.sharpening_enabled);
-        assert_eq!(config.sharpness, 0.2);
+        assert_eq!(config.sharpness, 0.3);
     }
 
     #[test]

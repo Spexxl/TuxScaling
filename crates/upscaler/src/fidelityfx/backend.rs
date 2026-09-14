@@ -533,7 +533,7 @@ impl UpscalerBackend for Fsr314Upscaler {
             output_height: content_extent(self.config).height,
             reset: u32::from(frame.reset_history || frame.guidance.requires_history_reset),
             enable_sharpening: u32::from(frame.output_sharpening.enabled),
-            sharpness: frame.output_sharpening.sharpness,
+            sharpness: frame.output_sharpening.effective_sharpness(),
         };
         unsafe { self.native.dispatch(&dispatch)? };
         if !output_was_initialized {

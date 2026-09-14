@@ -638,7 +638,7 @@ fn parse_vkcube_args(args: &[&str]) -> Result<VkcubeOptions, String> {
         release: false,
         backend: BackendSelection::Reference,
         sharpening_enabled: true,
-        sharpness: 0.2,
+        sharpness: 0.3,
         control_sequence: false,
     };
     let mut backend_seen = false;
@@ -2158,7 +2158,7 @@ fn run_visual_quality(root: &Path, options: &VisualQualityOptions) -> bool {
             Some("balanced"),
             BackendSelection::Fsr314,
             true,
-            0.2,
+            0.3,
         ),
     )
     .is_err()
@@ -2891,7 +2891,7 @@ fn generated_config_with_backend(
         quality,
         backend,
         true,
-        0.2,
+        0.3,
     )
 }
 
@@ -4365,7 +4365,7 @@ mod tests {
 
         assert!(source.contains("guidance_scale = 1"));
         assert!(source.contains("sharpening_enabled = true"));
-        assert!(source.contains("sharpness = 0.2"));
+        assert!(source.contains("sharpness = 0.3"));
         assert!(!source.contains("processing_scale"));
         assert!(!source.contains("render_scale"));
     }

@@ -177,7 +177,7 @@ pub struct OutputSharpening {
 }
 
 impl OutputSharpening {
-    pub const RECOMMENDED_SHARPNESS: f32 = 0.2;
+    pub const RECOMMENDED_SHARPNESS: f32 = 0.3;
 
     pub const fn new(enabled: bool, sharpness: f32) -> Self {
         Self { enabled, sharpness }
@@ -185,6 +185,14 @@ impl OutputSharpening {
 
     pub const fn disabled() -> Self {
         Self::new(false, 0.0)
+    }
+
+    pub fn effective_sharpness(self) -> f32 {
+        if self.enabled {
+            self.sharpness.sqrt()
+        } else {
+            0.0
+        }
     }
 
     pub fn validate(self) -> Result<(), BackendError> {
@@ -1220,7 +1228,7 @@ mod tests {
             OutputSharpening::default(),
             OutputSharpening {
                 enabled: true,
-                sharpness: 0.2,
+                sharpness: 0.3,
             }
         );
         assert!(OutputSharpening::default().validate().is_ok());
@@ -1234,5 +1242,19 @@ mod tests {
         assert!(OutputSharpening::new(true, -0.01).validate().is_err());
         assert!(OutputSharpening::new(true, 1.01).validate().is_err());
         assert!(OutputSharpening::new(true, f32::NAN).validate().is_err());
+    }
+
+    #[test]
+    fn output_sharpening_uses_a_monotonic_perceptual_response() {
+        let values = [0.0, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
+            .map(|value| OutputSharpening::new(true, value).effective_sharpness());
+        assert_eq!(values[0], 0.0);
+        assert_eq!(values[6], 1.0);
+        assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            (OutputSharpening::new(true, 0.3).effective_sharpness() - 0.3_f32.sqrt()).abs()
+                < f32::EPSILON
+        );
+        assert_eq!(OutputSharpening::disabled().effective_sharpness(), 0.0);
     }
 }

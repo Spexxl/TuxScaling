@@ -167,6 +167,31 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     })
 }
 
+fn luminance_edge_energy(pixels: &[[f32; 4]], extent: vk::Extent2D) -> f32 {
+    let luminance = |pixel: &[f32; 4]| {
+        0.2126_f32.mul_add(pixel[0], 0.7152_f32.mul_add(pixel[1], 0.0722 * pixel[2]))
+    };
+    let mut total = 0.0;
+    let mut count = 0_u32;
+    for y in 0..extent.height {
+        for x in 0..extent.width {
+            let index = (y * extent.width + x) as usize;
+            if x + 1 < extent.width {
+                total +=
+                    (luminance(&pixels[index]) - luminance(&pixels[(index + 1) as usize])).abs();
+                count += 1;
+            }
+            if y + 1 < extent.height {
+                total += (luminance(&pixels[index])
+                    - luminance(&pixels[index + extent.width as usize]))
+                .abs();
+                count += 1;
+            }
+        }
+    }
+    total / count.max(1) as f32
+}
+
 fn psnr(actual: &[[f32; 4]], expected: &[[f32; 4]]) -> f32 {
     let mse = image_mse(actual, expected).max(f32::MIN_POSITIVE);
     10.0 * (1.0 / mse).log10()
@@ -576,6 +601,7 @@ fn fsr314_upscale_beats_bilinear_on_deterministic_static_fixture() {
     assert!(flicker <= 0.002);
 
     let mut sharpening_hashes = Vec::new();
+    let mut sharpening_energy = Vec::new();
     for sharpening in [
         tuxscaling_upscaler::OutputSharpening::disabled(),
         tuxscaling_upscaler::OutputSharpening::new(true, 0.2),
@@ -626,6 +652,7 @@ fn fsr314_upscale_beats_bilinear_on_deterministic_static_fixture() {
                 .all(|value| value.is_finite())
         );
         sharpening_hashes.push(hash_bytes(&steady_bytes));
+        sharpening_energy.push(luminance_edge_energy(&rgba8_pixels(&steady_bytes), OUTPUT));
     }
     sharpening_hashes.sort_unstable();
     sharpening_hashes.dedup();
@@ -633,5 +660,9 @@ fn fsr314_upscale_beats_bilinear_on_deterministic_static_fixture() {
         sharpening_hashes.len(),
         3,
         "output sharpening variants must produce distinct hashes"
+    );
+    assert!(
+        sharpening_energy.windows(2).all(|pair| pair[0] <= pair[1]),
+        "sharpening response must be monotonic: {sharpening_energy:?}"
     );
 }

@@ -89,7 +89,7 @@ output_resolution = "native"
 guidance_scale = 1.0
 guidance_mode = "estimated"
 sharpening_enabled = true
-sharpness = 0.2
+sharpness = 0.3
 debug_view = "original"
 upscaler = "reference"
 ```
