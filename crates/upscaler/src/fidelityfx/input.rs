@@ -27,6 +27,18 @@ impl FsrInputPolicy {
             use_estimated_motion: !guidance.motion.metadata.is_zero
                 && guidance.motion.state == SignalState::Estimated
                 && guidance.confidence.state == SignalState::Estimated
+                && !guidance.requires_history_reset
+                && !guidance.confidence.metadata.is_zero
+                && !guidance.motion.metadata.requires_history_reset
+                && !guidance.confidence.metadata.requires_history_reset
+                && matches!(
+                    guidance.motion.metadata.reset,
+                    tuxscaling_temporal::GuidanceReset::None
+                )
+                && matches!(
+                    guidance.confidence.metadata.reset,
+                    tuxscaling_temporal::GuidanceReset::None
+                )
                 && matches!(guidance.direction, MotionDirection::CurrentToPrevious)
                 && matches!(guidance.units, MotionUnits::SourcePixels),
         }
@@ -606,6 +618,18 @@ mod tests {
         assert_eq!(diagnostics.reactive, super::BackendInputState::Neutral);
         assert_eq!(diagnostics.composition, super::BackendInputState::Neutral);
         assert_eq!(diagnostics.jitter, super::BackendInputState::Neutral);
+
+        let mut resetting = estimated;
+        resetting.requires_history_reset = true;
+        assert!(!super::FsrInputPolicy::from_guidance(resetting).use_estimated_motion);
+
+        let mut metadata_reset = estimated;
+        metadata_reset.motion.metadata.requires_history_reset = true;
+        assert!(!super::FsrInputPolicy::from_guidance(metadata_reset).use_estimated_motion);
+
+        let mut zero_confidence = estimated;
+        zero_confidence.confidence.metadata.is_zero = true;
+        assert!(!super::FsrInputPolicy::from_guidance(zero_confidence).use_estimated_motion);
     }
 
     #[test]
