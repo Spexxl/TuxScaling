@@ -66,6 +66,12 @@ active backend. A failed load, context creation, dispatch, or secondary
 recording leaves presentation alive and falls back without submitting the
 partial secondary command buffer.
 
+The output-sharpening slider is a perceptual strength control in the range
+`0.0..=1.0`, enabled by default at `0.3`. The runtime maps that control through
+an explicit square-root response before passing it to FSR so useful changes are
+visible below the maximum without changing the temporal input contract. The
+checkbox disables output sharpening independently of temporal reconstruction.
+
 Install `libtuxscaling_fidelityfx_vk.so` beside the TuxScaling Vulkan layer,
 or point the loader at an explicit path:
 
@@ -95,11 +101,30 @@ particles, occlusion/disocclusion, noise, scene cuts, and pause/resume. It
 reports FSR, bilinear, and Reference PSNR/SSIM plus motion-compensated
 temporal flicker, and fails unless FSR improves the aggregate bilinear result.
 
-FSR currently receives zero camera jitter and synthetic flat/relative depth
-derived from estimated color guidance. These are explicit limitations:
-TuxScaling does not intercept native game jitter or native motion/depth
-semantics, so output-quality comparisons must not be described as native FSR
-integration.
+### FSR input contract
+
+The adapter deliberately forwards only guidance that satisfies the canonical
+contract. Estimated motion and confidence are used when the frame is valid,
+non-zero, measured in source/game pixels, directed `CurrentToPrevious`, and not
+marked for a history reset. Every other case uses neutral motion and confidence;
+the runtime resets temporal history whenever the guidance metadata requires it.
+
+The remaining FSR inputs are explicit compatibility fallbacks until native
+semantics can be obtained safely:
+
+- depth is a flat zero image, with the inverted/infinite depth creation flags;
+- exposure is a persistent 1x1 image containing unity and `preExposure = 1.0`;
+- reactive and transparency/composition masks are zero images;
+- camera jitter is always zero.
+
+These values are not estimates of engine depth, exposure, reactive regions, or
+jitter. The overlay and diagnostic capture metadata expose the per-input states
+(`Estimated`, `Neutral`, or `SuppressedIncompatible`) so a quality report can
+reject an unsafe adapter contract instead of silently treating it as native
+data. The `visual-quality` command captures FSR with Estimated guidance, FSR
+with Zero guidance, and an Off spatial baseline, then reports both comparisons
+and fails when Estimated guidance regresses against Zero beyond the documented
+deterministic tolerance.
 
 ## Upgrade checklist
 

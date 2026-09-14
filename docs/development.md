@@ -34,6 +34,12 @@ cargo xtask fidelityfx-check
 
 Pass `--backend fsr_3_1_4` to `gpu-check` or `smoke` to exercise the experimental FidelityFX path. The FSR GPU check includes the adapter, lifecycle, deterministic captured-sequence quality, and static quality gates. `Reference` remains the default.
 
+The FSR adapter accepts only qualified estimated motion and confidence. It
+uses neutral reactive/composition masks, a unity exposure image, flat inverted
+infinite depth, and zero jitter; see [fidelityfx.md](fidelityfx.md) for the
+compatibility rationale. Capture manifests record these decisions under
+`fsr_inputs` so visual-quality runs can validate them.
+
 The debug WSI harness sets `TUXSCALING_TEST_FORCE_VIRTUAL=1` so it can validate small logical game images against the discovered monitor output without depending on a window manager fullscreen transition. Release builds ignore this test-only override.
 
 The harness accepts `TUXSCALING_TEST_SCENARIO=upscale|windowed_promote|already_borderless|native_aa|aspect|resize|monitor_origin|promotion_failure|temporal_failure|guidance_resolve|maintenance1`. These scenarios cover ordinary window promotion, already-borderless ownership, equal-extent Native AA, centered aspect-fit bars, swapchain recreation, negative monitor origins, promotion failure, temporal failure, and revision-1 swapchain-maintenance compatibility. `TUXSCALING_TEST_FORCE_RESIZE_FAILURE=1` verifies the direct-mode transaction fallback. Every other frame uses `vkAcquireNextImage2KHR` so both acquisition entry points stay covered. Scenario runs snapshot and verify X11 geometry and fullscreen state after cleanup.
@@ -109,6 +115,13 @@ For nested visual-quality captures:
 ```bash
 cargo xtask visual-quality --display nested-xwayland --input 1280x720 --output 2160x1440 --warmup 180 --frames 120
 ```
+
+The visual-quality command runs three synchronized captures: FSR with
+Estimated guidance, FSR with Zero guidance, and the Off spatial baseline. It
+requires identical source frames and safe FSR input metadata, emits
+`estimated-zero-side-by-side.png` and `estimated-zero-diff.png`, and applies a
+deterministic Estimated-versus-Zero temporal gate. The gate is a quality
+regression check, not a claim that the captured Off output is ground truth.
 
 Proton/R.E.P.O. acceptance is opt-in and never infers a game command. Probe the host without launching anything:
 
