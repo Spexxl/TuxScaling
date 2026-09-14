@@ -1138,6 +1138,7 @@ struct CaptureManifest {
     guidance_mode: String,
     ablations: CaptureAblations,
     sharpening: CaptureSharpening,
+    fsr_inputs: CaptureFsrInputs,
     history_age: u64,
     gpu_timings_ms: Vec<f32>,
     resources: Vec<CaptureResource>,
@@ -1158,6 +1159,17 @@ struct CaptureAblations {
 struct CaptureSharpening {
     enabled: bool,
     sharpness: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CaptureFsrInputs {
+    motion: String,
+    confidence: String,
+    depth: String,
+    exposure: String,
+    reactive: String,
+    composition: String,
+    jitter: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1312,6 +1324,14 @@ fn read_capture_series(
                 manifest.frame_id
             ));
         }
+        if expected_backend == "FSR 3.1.4"
+            && !fsr_input_contract_is_safe(&manifest.guidance_mode, &manifest.fsr_inputs)
+        {
+            return Err(format!(
+                "frame {} reports an unsafe FSR input contract",
+                manifest.frame_id
+            ));
+        }
         if manifest.reset_reason == "ProviderFailure" {
             return Err(format!(
                 "frame {} reports active provider fallback",
@@ -1320,6 +1340,40 @@ fn read_capture_series(
         }
     }
     Ok(selected)
+}
+
+fn fsr_input_contract_is_safe(guidance_mode: &str, inputs: &CaptureFsrInputs) -> bool {
+    let (motion, confidence) = match guidance_mode {
+        "Estimated" => ("Estimated", "Estimated"),
+        "Zero" => ("Neutral", "Neutral"),
+        _ => return false,
+    };
+    inputs.motion == motion
+        && inputs.confidence == confidence
+        && inputs.depth == "SuppressedIncompatible"
+        && inputs.exposure == "SuppressedIncompatible"
+        && inputs.reactive == "Neutral"
+        && inputs.composition == "Neutral"
+        && inputs.jitter == "Neutral"
+}
+
+fn guidance_comparison_gate_passed(
+    estimated_psnr: f32,
+    zero_psnr: f32,
+    estimated_ssim: f32,
+    zero_ssim: f32,
+    estimated_flicker: f32,
+    zero_flicker: f32,
+) -> bool {
+    estimated_psnr.is_finite()
+        && zero_psnr.is_finite()
+        && estimated_ssim.is_finite()
+        && zero_ssim.is_finite()
+        && estimated_flicker.is_finite()
+        && zero_flicker.is_finite()
+        && estimated_flicker <= zero_flicker + 0.002
+        && estimated_psnr + 0.25 >= zero_psnr
+        && estimated_ssim + 0.005 >= zero_ssim
 }
 
 fn scene_category(frame_id: u64) -> &'static str {
@@ -1364,6 +1418,21 @@ struct PresetReport {
     timing_status: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct GuidanceComparisonReport {
+    frames: usize,
+    source_frames_match: bool,
+    estimated_psnr_db: f32,
+    zero_psnr_db: f32,
+    estimated_ssim: f32,
+    zero_ssim: f32,
+    estimated_flicker_mse: f32,
+    zero_flicker_mse: f32,
+    estimated_zero_mse: f32,
+    temporal_gate_passed: bool,
+    status: String,
+}
+
 #[derive(Debug, Serialize)]
 struct DiagnosticReport {
     guidance_mode: String,
@@ -1387,6 +1456,7 @@ struct VisualQualityReport {
     fsr_backend: String,
     off_backend: String,
     categories: Vec<CategoryReport>,
+    guidance_comparison: GuidanceComparisonReport,
     ablations: Vec<AblationReport>,
     presets: Vec<PresetReport>,
     diagnostics: DiagnosticReport,
@@ -1785,42 +1855,63 @@ fn category_gate_passed(psnr: f32, ssim: f32, flicker: f32, ghost: f32, shimmer:
     psnr >= 10.0 && ssim >= 0.75 && flicker <= 0.10 && ghost <= 0.50 && shimmer <= 0.50
 }
 
+#[allow(clippy::too_many_arguments)]
 fn visual_quality_report(
     options: &VisualQualityOptions,
     fsr_directory: &Path,
+    zero_directory: &Path,
     off_directory: &Path,
     fsr: &[CaptureManifest],
+    zero: &[CaptureManifest],
     off: &[CaptureManifest],
     report_dir: &Path,
     evidence: Option<&CollectedQualityEvidence>,
 ) -> Result<VisualQualityReport, String> {
-    if fsr.len() != off.len() || fsr.is_empty() {
-        return Err("FSR and Off capture series have different or empty lengths".into());
+    if fsr.len() != zero.len() || fsr.len() != off.len() || fsr.is_empty() {
+        return Err("FSR, Zero, and Off capture series have different or empty lengths".into());
     }
     let width = options.output.0;
     let height = options.output.1;
     let mut categories = BTreeMap::new();
     let (mut previous, _) = read_capture_resource(off_directory, &off[0], "spatial_off")?;
+    let (mut previous_zero, _) = read_capture_resource(zero_directory, &zero[0], "reconstructed")?;
     let mut source_frames_match = true;
     let mut all_finite = true;
-    for (fsr_manifest, off_manifest) in fsr.iter().zip(off.iter()) {
-        if fsr_manifest.frame_id != off_manifest.frame_id {
+    let mut estimated_psnr_total = 0.0;
+    let mut zero_psnr_total = 0.0;
+    let mut estimated_ssim_total = 0.0;
+    let mut zero_ssim_total = 0.0;
+    let mut estimated_flicker_total = 0.0;
+    let mut zero_flicker_total = 0.0;
+    let mut estimated_zero_mse_total = 0.0;
+    for ((fsr_manifest, zero_manifest), off_manifest) in fsr.iter().zip(zero.iter()).zip(off.iter())
+    {
+        if fsr_manifest.frame_id != zero_manifest.frame_id
+            || fsr_manifest.frame_id != off_manifest.frame_id
+        {
             source_frames_match = false;
             break;
         }
         let (fsr_source, _) = read_capture_resource(fsr_directory, fsr_manifest, "source")?;
         let (fsr_output, fsr_output_extent) =
             read_capture_resource(fsr_directory, fsr_manifest, "reconstructed")?;
+        let (zero_source, _) = read_capture_resource(zero_directory, zero_manifest, "source")?;
+        let (zero_output, zero_output_extent) =
+            read_capture_resource(zero_directory, zero_manifest, "reconstructed")?;
         let (off_source, _) = read_capture_resource(off_directory, off_manifest, "source")?;
         let (off_output, off_output_extent) =
             read_capture_resource(off_directory, off_manifest, "spatial_off")?;
         source_frames_match &= fsr_source.len() == off_source.len()
-            && image_mse(&fsr_source, &off_source) <= f32::EPSILON;
+            && fsr_source.len() == zero_source.len()
+            && image_mse(&fsr_source, &off_source) <= f32::EPSILON
+            && image_mse(&fsr_source, &zero_source) <= f32::EPSILON;
         if !source_frames_match {
             break;
         }
         if fsr_output_extent != [width, height]
+            || zero_output_extent != [width, height]
             || off_output_extent != [width, height]
+            || fsr_output.len() != zero_output.len()
             || fsr_output.len() != off_output.len()
             || fsr_output.len() != width as usize * height as usize
         {
@@ -1830,22 +1921,40 @@ fn visual_quality_report(
             ));
         }
         let metrics = visual_quality_metrics(&off_output, &fsr_output, &previous);
+        let zero_metrics = visual_quality_metrics(&off_output, &zero_output, &previous_zero);
+        let estimated_zero_mse = image_mse(&fsr_output, &zero_output);
         all_finite &= metrics.mse.is_finite()
             && metrics.psnr.is_finite()
             && metrics.ssim.is_finite()
             && metrics.flicker_mse.is_finite()
             && metrics.ghost_trail.is_finite()
             && metrics.shimmer.is_finite()
-            && finite_image(&metrics.difference_map);
+            && finite_image(&metrics.difference_map)
+            && zero_metrics.mse.is_finite()
+            && zero_metrics.psnr.is_finite()
+            && zero_metrics.ssim.is_finite()
+            && zero_metrics.flicker_mse.is_finite()
+            && zero_metrics.ghost_trail.is_finite()
+            && zero_metrics.shimmer.is_finite()
+            && finite_image(&zero_metrics.difference_map)
+            && estimated_zero_mse.is_finite();
+        estimated_psnr_total += metrics.psnr;
+        zero_psnr_total += zero_metrics.psnr;
+        estimated_ssim_total += metrics.ssim;
+        zero_ssim_total += zero_metrics.ssim;
+        estimated_flicker_total += metrics.flicker_mse;
+        zero_flicker_total += zero_metrics.flicker_mse;
+        estimated_zero_mse_total += estimated_zero_mse;
         update_category(
             &mut categories,
             scene_category(fsr_manifest.frame_id),
             &metrics,
         );
         previous = fsr_output;
+        previous_zero = zero_output;
     }
     if !source_frames_match {
-        return Err("FSR and Off captures do not share identical source frames".into());
+        return Err("FSR, Zero, and Off captures do not share identical source frames".into());
     }
     if !all_finite {
         return Err("visual-quality metrics contain non-finite values".into());
@@ -1856,9 +1965,15 @@ fn visual_quality_report(
     let guidance_resources = validate_diagnostic_resources(fsr_directory, first_fsr)?;
     let (first_fsr_output, first_fsr_output_extent) =
         read_capture_resource(fsr_directory, first_fsr, "reconstructed")?;
+    let first_zero = &zero[0];
+    let (first_zero_output, first_zero_output_extent) =
+        read_capture_resource(zero_directory, first_zero, "reconstructed")?;
     let (first_off_output, first_off_output_extent) =
         read_capture_resource(off_directory, first_off, "spatial_off")?;
-    if first_fsr_output_extent != [width, height] || first_off_output_extent != [width, height] {
+    if first_fsr_output_extent != [width, height]
+        || first_zero_output_extent != [width, height]
+        || first_off_output_extent != [width, height]
+    {
         return Err("first visual-quality output extent is invalid".into());
     }
     write_png(
@@ -1870,6 +1985,12 @@ fn visual_quality_report(
     write_png(
         &report_dir.join("off.png"),
         &first_off_output,
+        width,
+        height,
+    )?;
+    write_png(
+        &report_dir.join("zero.png"),
+        &first_zero_output,
         width,
         height,
     )?;
@@ -1898,6 +2019,18 @@ fn visual_quality_report(
         width,
         height,
     )?;
+    write_png(
+        &report_dir.join("estimated-zero-side-by-side.png"),
+        &side_by_side(&first_zero_output, &first_fsr_output, width, height),
+        width.saturating_mul(2),
+        height,
+    )?;
+    write_png(
+        &report_dir.join("estimated-zero-diff.png"),
+        &amplified_difference(&first_zero_output, &first_fsr_output, 8.0),
+        width,
+        height,
+    )?;
 
     let categories = categories
         .into_iter()
@@ -1922,6 +2055,39 @@ fn visual_quality_report(
         )
         .collect::<Vec<_>>();
     let category_gates_passed = categories.iter().all(|category| category.gate_passed);
+    let frame_count = fsr.len() as f32;
+    let estimated_psnr = estimated_psnr_total / frame_count;
+    let zero_psnr = zero_psnr_total / frame_count;
+    let estimated_ssim = estimated_ssim_total / frame_count;
+    let zero_ssim = zero_ssim_total / frame_count;
+    let estimated_flicker = estimated_flicker_total / frame_count;
+    let zero_flicker = zero_flicker_total / frame_count;
+    let estimated_zero_mse = estimated_zero_mse_total / frame_count;
+    let temporal_gate_passed = guidance_comparison_gate_passed(
+        estimated_psnr,
+        zero_psnr,
+        estimated_ssim,
+        zero_ssim,
+        estimated_flicker,
+        zero_flicker,
+    );
+    let guidance_comparison = GuidanceComparisonReport {
+        frames: fsr.len(),
+        source_frames_match,
+        estimated_psnr_db: estimated_psnr,
+        zero_psnr_db: zero_psnr,
+        estimated_ssim,
+        zero_ssim,
+        estimated_flicker_mse: estimated_flicker,
+        zero_flicker_mse: zero_flicker,
+        estimated_zero_mse,
+        temporal_gate_passed,
+        status: if temporal_gate_passed {
+            "Estimated guidance is no worse than Zero within the deterministic tolerance; values are measured against the captured Off baseline".into()
+        } else {
+            "Estimated guidance regressed against Zero; keep the captured evidence and investigate estimator quality before enabling a stronger policy".into()
+        },
+    };
     let ablations = match evidence {
         Some(evidence) => quality_ablation_rows(evidence),
         None => [
@@ -1983,11 +2149,14 @@ fn visual_quality_report(
     };
     let artifacts = [
         "fsr.png",
+        "zero.png",
         "off.png",
         "side-by-side.png",
         "wipe.png",
         "magnified.png",
         "amplified-diff.png",
+        "estimated-zero-side-by-side.png",
+        "estimated-zero-diff.png",
     ]
     .into_iter()
     .map(String::from)
@@ -2012,15 +2181,15 @@ fn visual_quality_report(
         fsr_backend: first_fsr.backend.clone(),
         off_backend: first_off.backend.clone(),
         categories,
+        guidance_comparison,
         ablations,
         presets,
         diagnostics,
         artifacts,
-        gate: if category_gates_passed {
-            "passed: captures, extents, history, validation, finite metrics, source-frame identity, and category thresholds are valid; values are an Off-baseline comparison, not a ground-truth claim".into()
+        gate: if category_gates_passed && temporal_gate_passed {
+            "passed: captures, extents, history, validation, finite metrics, source-frame identity, category thresholds, and Estimated-versus-Zero guidance checks are valid; values are an Off-baseline comparison, not a ground-truth claim".into()
         } else {
-            "failed: one or more category thresholds did not pass against the captured Off baseline"
-                .into()
+            "failed: one or more category thresholds or Estimated-versus-Zero guidance checks did not pass".into()
         },
     })
 }
@@ -2054,6 +2223,21 @@ fn write_visual_quality_markdown(report: &VisualQualityReport, path: &Path) -> R
             category.status
         ));
     }
+    let comparison = &report.guidance_comparison;
+    markdown.push_str(&format!(
+        "\n## Guidance comparison\n\n- Frames: `{}`\n- Source frames match across Estimated, Zero, and Off: `{}`\n- Estimated PSNR (dB): `{:.6}`\n- Zero PSNR (dB): `{:.6}`\n- Estimated SSIM: `{:.6}`\n- Zero SSIM: `{:.6}`\n- Estimated flicker MSE: `{:.6}`\n- Zero flicker MSE: `{:.6}`\n- Estimated-versus-Zero output MSE: `{:.6}`\n- Temporal gate: `{}`\n- Status: {}\n",
+        comparison.frames,
+        comparison.source_frames_match,
+        comparison.estimated_psnr_db,
+        comparison.zero_psnr_db,
+        comparison.estimated_ssim,
+        comparison.zero_ssim,
+        comparison.estimated_flicker_mse,
+        comparison.zero_flicker_mse,
+        comparison.estimated_zero_mse,
+        comparison.temporal_gate_passed,
+        comparison.status
+    ));
     markdown.push_str(
         "\n## Ablation matrix\n\n| Signal | Estimated | Fallback | Status |\n|---|---|---|---|\n",
     );
@@ -2098,8 +2282,12 @@ fn run_visual_quality(root: &Path, options: &VisualQualityOptions) -> bool {
         .map_or(0, |value| value.as_secs());
     let report_dir = root.join(format!("target/visual-quality/{timestamp}"));
     let fsr_capture = report_dir.join("capture-fsr");
+    let zero_capture = report_dir.join("capture-zero");
     let off_capture = report_dir.join("capture-off");
-    if fs::create_dir_all(&fsr_capture).is_err() || fs::create_dir_all(&off_capture).is_err() {
+    if fs::create_dir_all(&fsr_capture).is_err()
+        || fs::create_dir_all(&zero_capture).is_err()
+        || fs::create_dir_all(&off_capture).is_err()
+    {
         eprintln!(
             "cargo xtask visual-quality: unable to create {}",
             report_dir.display()
@@ -2149,19 +2337,23 @@ fn run_visual_quality(root: &Path, options: &VisualQualityOptions) -> bool {
         }
     };
     let fsr_config = report_dir.join("fsr.toml");
+    let zero_config = report_dir.join("zero.toml");
     let off_config = report_dir.join("off.toml");
+    let fsr_config_source = generated_config_with_backend_and_sharpening(
+        "native",
+        1.0,
+        Some("balanced"),
+        BackendSelection::Fsr314,
+        true,
+        0.3,
+    );
+    let zero_config_source = format!("guidance_mode = \"zero\"\n{fsr_config_source}");
     if fs::write(
         &fsr_config,
-        generated_config_with_backend_and_sharpening(
-            "native",
-            1.0,
-            Some("balanced"),
-            BackendSelection::Fsr314,
-            true,
-            0.3,
-        ),
+        fsr_config_source,
     )
     .is_err()
+        || fs::write(&zero_config, zero_config_source).is_err()
         || fs::write(
             &off_config,
             "output_resolution = \"native\"\nguidance_scale = 1.0\nmotion_quality = \"balanced\"\nsharpening_enabled = false\nsharpness = 0.0\nupscaler = \"off\"\n",
@@ -2191,6 +2383,20 @@ fn run_visual_quality(root: &Path, options: &VisualQualityOptions) -> bool {
         eprintln!("cargo xtask visual-quality: FSR capture failed: {error}");
         return false;
     }
+    let zero_result = run_visual_capture(
+        root,
+        &binary,
+        &zero_config,
+        &zero_capture,
+        &guard,
+        options,
+        &libraries,
+        &report_dir.join("zero-run.log"),
+    );
+    if let Err(error) = zero_result {
+        eprintln!("cargo xtask visual-quality: Zero capture failed: {error}");
+        return false;
+    }
     let off_result = run_visual_capture(
         root,
         &binary,
@@ -2212,6 +2418,13 @@ fn run_visual_quality(root: &Path, options: &VisualQualityOptions) -> bool {
             return false;
         }
     };
+    let zero = match read_capture_series(&zero_capture, options, "FSR 3.1.4") {
+        Ok(frames) => frames,
+        Err(error) => {
+            eprintln!("cargo xtask visual-quality: invalid Zero capture: {error}");
+            return false;
+        }
+    };
     let off = match read_capture_series(&off_capture, options, "Off") {
         Ok(frames) => frames,
         Err(error) => {
@@ -2222,8 +2435,10 @@ fn run_visual_quality(root: &Path, options: &VisualQualityOptions) -> bool {
     let report = match visual_quality_report(
         options,
         &fsr_capture,
+        &zero_capture,
         &off_capture,
         &fsr,
+        &zero,
         &off,
         &report_dir,
         evidence.as_ref(),
@@ -3849,11 +4064,12 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        BENCHMARK_SAMPLE_COUNT, BackendSelection, CollectedQualityEvidence,
+        BENCHMARK_SAMPLE_COUNT, BackendSelection, CaptureFsrInputs, CollectedQualityEvidence,
         ProtonAcceptanceOptions, ProtonLauncherProbe, QualityEvidenceSuiteReport, VkcubeExit,
         benchmark_cases, benchmark_output_is_operationally_valid, classify_vkcube_exit,
         classify_vkcube_output, fidelityfx_elf_architecture_is_valid,
-        fidelityfx_symbols_are_complete, generated_config, maintenance_evidence_complete,
+        fidelityfx_symbols_are_complete, fsr_input_contract_is_safe, generated_config,
+        guidance_comparison_gate_passed, maintenance_evidence_complete,
         maintenance_output_is_valid, parse_backend_args, parse_maintenance_evidence,
         parse_preset_medians, parse_proton_acceptance_args, parse_public_x11_display,
         parse_visual_quality_args, parse_vkcube_args, parse_vkcube_evidence,
@@ -4368,6 +4584,60 @@ mod tests {
         assert!(source.contains("sharpness = 0.3"));
         assert!(!source.contains("processing_scale"));
         assert!(!source.contains("render_scale"));
+    }
+
+    #[test]
+    fn visual_quality_requires_the_safe_fsr_input_contract() {
+        let safe = CaptureFsrInputs {
+            motion: "Estimated".into(),
+            confidence: "Estimated".into(),
+            depth: "SuppressedIncompatible".into(),
+            exposure: "SuppressedIncompatible".into(),
+            reactive: "Neutral".into(),
+            composition: "Neutral".into(),
+            jitter: "Neutral".into(),
+        };
+        assert!(fsr_input_contract_is_safe("Estimated", &safe));
+
+        let mut unsafe_depth = safe.clone();
+        unsafe_depth.depth = "Estimated".into();
+        assert!(!fsr_input_contract_is_safe("Estimated", &unsafe_depth));
+
+        let zero = CaptureFsrInputs {
+            motion: "Neutral".into(),
+            confidence: "Neutral".into(),
+            ..safe.clone()
+        };
+        assert!(fsr_input_contract_is_safe("Zero", &zero));
+        assert!(!fsr_input_contract_is_safe("Zero", &safe));
+        assert!(!fsr_input_contract_is_safe("Unknown", &safe));
+    }
+
+    #[test]
+    fn guidance_comparison_gate_uses_finite_quality_tolerances() {
+        assert!(guidance_comparison_gate_passed(
+            20.0, 20.0, 0.90, 0.90, 0.01, 0.01
+        ));
+        assert!(guidance_comparison_gate_passed(
+            19.75, 20.0, 0.895, 0.90, 0.012, 0.01
+        ));
+        assert!(!guidance_comparison_gate_passed(
+            19.74, 20.0, 0.90, 0.90, 0.01, 0.01
+        ));
+        assert!(!guidance_comparison_gate_passed(
+            20.0, 20.0, 0.894, 0.90, 0.01, 0.01
+        ));
+        assert!(!guidance_comparison_gate_passed(
+            20.0, 20.0, 0.90, 0.90, 0.0121, 0.01
+        ));
+        assert!(!guidance_comparison_gate_passed(
+            f32::NAN,
+            20.0,
+            0.90,
+            0.90,
+            0.01,
+            0.01,
+        ));
     }
 
     #[test]

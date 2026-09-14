@@ -177,8 +177,7 @@ fn luminance_edge_energy(pixels: &[[f32; 4]], extent: vk::Extent2D) -> f32 {
         for x in 0..extent.width {
             let index = (y * extent.width + x) as usize;
             if x + 1 < extent.width {
-                total +=
-                    (luminance(&pixels[index]) - luminance(&pixels[(index + 1) as usize])).abs();
+                total += (luminance(&pixels[index]) - luminance(&pixels[index + 1])).abs();
                 count += 1;
             }
             if y + 1 < extent.height {

@@ -301,6 +301,9 @@ fn fsr314_captured_sequence_quality_suite() {
     let mut bilinear_flicker_total = 0.0;
     let mut reference_psnr_total = 0.0;
     let mut reference_ssim_total = 0.0;
+    let mut zero_psnr_total = 0.0;
+    let mut zero_ssim_total = 0.0;
+    let mut zero_flicker_total = 0.0;
 
     for (case_index, (name, factory)) in captured_sequence_catalog().into_iter().enumerate() {
         let fixture = factory(INPUT.width, INPUT.height);
@@ -319,6 +322,17 @@ fn fsr314_captured_sequence_quality_suite() {
                 &second_source_bytes,
             )
         };
+        let zero = unsafe {
+            run_fsr_variant(
+                &gpu,
+                &environment,
+                &fixture,
+                &source_bytes,
+                &second_source_bytes,
+                true,
+                GuidanceAblations::NONE,
+            )
+        };
         let reference = unsafe { run_reference_case(&gpu, &fixture, &source_bytes) };
         let fsr_psnr = psnr(&fsr_first, &expected);
         let bilinear_psnr = psnr(&bilinear_frame, &expected);
@@ -327,6 +341,9 @@ fn fsr314_captured_sequence_quality_suite() {
         let reference_psnr = psnr(&reference, &expected);
         let reference_ssim = ssim(&reference, &expected);
         let flicker = temporal_error(&fsr_first, &fsr_second, &expected, &second_expected);
+        let zero_psnr = psnr(&zero.first, &expected);
+        let zero_ssim = ssim(&zero.first, &expected);
+        let zero_flicker = temporal_error(&zero.first, &zero.second, &expected, &second_expected);
         let bilinear_flicker = temporal_error(
             &bilinear_frame,
             &second_bilinear,
@@ -334,7 +351,7 @@ fn fsr314_captured_sequence_quality_suite() {
             &second_expected,
         );
         eprintln!(
-            "FSR sequence fixture: name={name} psnr={fsr_psnr:.3}dB bilinear={bilinear_psnr:.3}dB reference={reference_psnr:.3}dB ssim={fsr_ssim:.5} bilinear_ssim={bilinear_ssim:.5} reference_ssim={reference_ssim:.5} flicker_mse={flicker:.6} bilinear_flicker_mse={bilinear_flicker:.6}"
+            "FSR sequence fixture: name={name} estimated_psnr={fsr_psnr:.3}dB zero_psnr={zero_psnr:.3}dB bilinear={bilinear_psnr:.3}dB reference={reference_psnr:.3}dB estimated_ssim={fsr_ssim:.5} zero_ssim={zero_ssim:.5} bilinear_ssim={bilinear_ssim:.5} reference_ssim={reference_ssim:.5} estimated_flicker_mse={flicker:.6} zero_flicker_mse={zero_flicker:.6} bilinear_flicker_mse={bilinear_flicker:.6}"
         );
         assert!(
             fsr_first
@@ -344,6 +361,9 @@ fn fsr314_captured_sequence_quality_suite() {
         assert!(fsr_psnr.is_finite());
         assert!(fsr_ssim.is_finite());
         assert!(flicker.is_finite());
+        assert!(zero_psnr.is_finite());
+        assert!(zero_ssim.is_finite());
+        assert!(zero_flicker.is_finite());
         fsr_psnr_total += fsr_psnr;
         bilinear_psnr_total += bilinear_psnr;
         fsr_ssim_total += fsr_ssim;
@@ -352,6 +372,9 @@ fn fsr314_captured_sequence_quality_suite() {
         reference_ssim_total += reference_ssim;
         flicker_total += flicker;
         bilinear_flicker_total += bilinear_flicker;
+        zero_psnr_total += zero_psnr;
+        zero_ssim_total += zero_ssim;
+        zero_flicker_total += zero_flicker;
     }
 
     let count = captured_sequence_catalog().len() as f32;
@@ -363,12 +386,18 @@ fn fsr314_captured_sequence_quality_suite() {
     let reference_ssim = reference_ssim_total / count;
     let flicker = flicker_total / count;
     let bilinear_flicker = bilinear_flicker_total / count;
+    let zero_psnr = zero_psnr_total / count;
+    let zero_ssim = zero_ssim_total / count;
+    let zero_flicker = zero_flicker_total / count;
     eprintln!(
-        "FSR sequence aggregate: psnr={fsr_psnr:.3}dB bilinear={bilinear_psnr:.3}dB reference={reference_psnr:.3}dB ssim={fsr_ssim:.5} bilinear_ssim={bilinear_ssim:.5} reference_ssim={reference_ssim:.5} flicker_mse={flicker:.6} bilinear_flicker_mse={bilinear_flicker:.6}"
+        "FSR sequence aggregate: estimated_psnr={fsr_psnr:.3}dB zero_psnr={zero_psnr:.3}dB bilinear={bilinear_psnr:.3}dB reference={reference_psnr:.3}dB estimated_ssim={fsr_ssim:.5} zero_ssim={zero_ssim:.5} bilinear_ssim={bilinear_ssim:.5} reference_ssim={reference_ssim:.5} estimated_flicker_mse={flicker:.6} zero_flicker_mse={zero_flicker:.6} bilinear_flicker_mse={bilinear_flicker:.6}"
     );
     assert!(fsr_psnr > bilinear_psnr);
     assert!(fsr_ssim > bilinear_ssim);
     assert!(flicker < bilinear_flicker);
+    assert!(fsr_psnr + 0.25 >= zero_psnr);
+    assert!(fsr_ssim + 0.005 >= zero_ssim);
+    assert!(flicker <= zero_flicker + 0.002);
     if fsr_psnr + 0.25 < reference_psnr || fsr_ssim + 0.005 < reference_ssim {
         eprintln!("FSR remains experimental: reference regression allowance would be exceeded");
     }
