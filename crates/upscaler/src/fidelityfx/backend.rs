@@ -1,8 +1,8 @@
 use super::{
-    FsrInputAdapter, NativeContext, TUX_FFX_CREATE_DEBUG_CHECKING, TUX_FFX_CREATE_DEPTH_INVERTED,
-    TUX_FFX_CREATE_NON_LINEAR_COLORSPACE, TUX_FFX_IMAGE_STATE_COMPUTE_READ,
-    TUX_FFX_IMAGE_STATE_UNORDERED_ACCESS, TUX_FFX_IMAGE_USAGE_READ_ONLY, TUX_FFX_IMAGE_USAGE_UAV,
-    TuxFfxCreateInfo, TuxFfxDispatchInfo,
+    FsrInputAdapter, NativeContext, TUX_FFX_CREATE_DEBUG_CHECKING, TUX_FFX_CREATE_DEPTH_INFINITE,
+    TUX_FFX_CREATE_DEPTH_INVERTED, TUX_FFX_CREATE_NON_LINEAR_COLORSPACE,
+    TUX_FFX_IMAGE_STATE_COMPUTE_READ, TUX_FFX_IMAGE_STATE_UNORDERED_ACCESS,
+    TUX_FFX_IMAGE_USAGE_READ_ONLY, TUX_FFX_IMAGE_USAGE_UAV, TuxFfxCreateInfo, TuxFfxDispatchInfo,
 };
 use crate::{
     BackendCapabilities, BackendColorEncoding, BackendConfig, BackendEnvironment, BackendError,
@@ -204,6 +204,7 @@ impl Fsr314Upscaler {
             max_output_width: content_extent.width,
             max_output_height: content_extent.height,
             flags: TUX_FFX_CREATE_DEPTH_INVERTED
+                | TUX_FFX_CREATE_DEPTH_INFINITE
                 | TUX_FFX_CREATE_NON_LINEAR_COLORSPACE
                 | TUX_FFX_CREATE_DEBUG_CHECKING,
             vulkan_api_version: environment.vulkan_api_version,
@@ -449,19 +450,7 @@ impl UpscalerBackend for Fsr314Upscaler {
         frame.validate(self.config, self.capabilities())?;
         let slot = frame.slot % self.outputs.len();
         let guidance = frame.guidance;
-        let inputs = self.input.outputs(
-            slot,
-            BackendImage {
-                image: guidance.exposure.image,
-                view: guidance.exposure.view,
-                format: guidance.exposure.format,
-                extent: vk::Extent2D {
-                    width: 1,
-                    height: 1,
-                },
-                layout: vk::ImageLayout::GENERAL,
-            },
-        );
+        let inputs = self.input.outputs(slot);
         unsafe {
             self.input
                 .record(frame.command_buffer, slot, frame.frame_id, guidance)?;
@@ -520,14 +509,14 @@ impl UpscalerBackend for Fsr314Upscaler {
                     TUX_FFX_IMAGE_STATE_UNORDERED_ACCESS
                 },
             ),
-            jitter_x: frame.guidance.jitter.current[0],
-            jitter_y: frame.guidance.jitter.current[1],
+            jitter_x: 0.0,
+            jitter_y: 0.0,
             motion_scale_x: 1.0,
             motion_scale_y: 1.0,
             frame_time_ms: frame.guidance.timing.validated.as_secs_f32() * 1_000.0,
             pre_exposure: 1.0,
-            camera_near: 0.1,
-            camera_far: 1_000.0,
+            camera_near: 1.0,
+            camera_far: f32::MAX,
             camera_fov_y: 60.0_f32.to_radians(),
             view_space_to_meters: 1.0,
             render_width: self.config.game_extent.width,

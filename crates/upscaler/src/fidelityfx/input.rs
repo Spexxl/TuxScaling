@@ -3,7 +3,7 @@
 use crate::{BackendEnvironment, BackendError, BackendImage};
 use ash::vk;
 use std::io::Cursor;
-use tuxscaling_temporal::{DepthSemantics, FrameExtent, GuidanceView};
+use tuxscaling_temporal::{FrameExtent, GuidanceView, MotionDirection, MotionUnits, SignalState};
 use tuxscaling_vulkan::{Image, compute_memory_barrier, image_barrier};
 
 pub(crate) struct FsrInputs {
@@ -12,6 +12,23 @@ pub(crate) struct FsrInputs {
     pub reactive: BackendImage,
     pub composition: BackendImage,
     pub exposure: BackendImage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FsrInputPolicy {
+    pub use_estimated_motion: bool,
+}
+
+impl FsrInputPolicy {
+    pub(crate) fn from_guidance(guidance: GuidanceView) -> Self {
+        Self {
+            use_estimated_motion: !guidance.motion.metadata.is_zero
+                && guidance.motion.state == SignalState::Estimated
+                && guidance.confidence.state == SignalState::Estimated
+                && matches!(guidance.direction, MotionDirection::CurrentToPrevious)
+                && matches!(guidance.units, MotionUnits::SourcePixels),
+        }
+    }
 }
 
 struct InputSlot {
@@ -64,6 +81,8 @@ pub(crate) struct FsrInputAdapter {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     initialized: Vec<bool>,
+    unity_exposure: Image,
+    exposure_initialized: bool,
 }
 
 impl FsrInputAdapter {
@@ -130,6 +149,22 @@ impl FsrInputAdapter {
                 composition,
             });
         }
+
+        let unity_exposure = unsafe {
+            Image::new(
+                &environment.device,
+                &environment.memory,
+                vk::Extent2D {
+                    width: 1,
+                    height: 1,
+                },
+                vk::Format::R32_SFLOAT,
+                vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::STORAGE
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+            )
+        }
+        .map_err(|error| BackendError::Internal(format!("unity exposure image: {error:?}")))?;
 
         let device = environment.device.clone();
         let sampler = unsafe {
@@ -244,11 +279,24 @@ impl FsrInputAdapter {
             pipeline_layout,
             pipeline,
             initialized: vec![false; image_count],
+            unity_exposure,
+            exposure_initialized: false,
         })
     }
 
-    pub(crate) fn outputs(&self, slot: usize, exposure: BackendImage) -> FsrInputs {
-        self.slots[slot % self.slots.len()].outputs(self.extent, exposure)
+    pub(crate) fn outputs(&self, slot: usize) -> FsrInputs {
+        self.slots[slot % self.slots.len()].outputs(
+            self.extent,
+            backend_image(
+                self.unity_exposure.handle,
+                self.unity_exposure.view,
+                vk::Format::R32_SFLOAT,
+                vk::Extent2D {
+                    width: 1,
+                    height: 1,
+                },
+            ),
+        )
     }
 
     pub(crate) unsafe fn record(
@@ -266,6 +314,37 @@ impl FsrInputAdapter {
             return Err(BackendError::InvalidMetadata("FidelityFX guidance view"));
         }
         let slot = slot % self.slots.len();
+        if !self.exposure_initialized {
+            unsafe {
+                image_barrier(
+                    &self.device,
+                    command,
+                    self.unity_exposure.handle,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                );
+                self.device.cmd_clear_color_image(
+                    command,
+                    self.unity_exposure.handle,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearColorValue {
+                        float32: [1.0, 0.0, 0.0, 0.0],
+                    },
+                    &[vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1)],
+                );
+                image_barrier(
+                    &self.device,
+                    command,
+                    self.unity_exposure.handle,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::GENERAL,
+                );
+            }
+            self.exposure_initialized = true;
+        }
         let outputs = &self.slots[slot];
         let input_images = [
             guidance.motion,
@@ -348,10 +427,7 @@ impl FsrInputAdapter {
             let params = [
                 self.extent.width,
                 self.extent.height,
-                u32::from(matches!(
-                    guidance.depth_semantics,
-                    DepthSemantics::RelativeNearIsOne
-                )),
+                u32::from(FsrInputPolicy::from_guidance(guidance).use_estimated_motion),
             ];
             self.device.cmd_push_constants(
                 command,
@@ -414,19 +490,20 @@ fn backend_image(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn shader_uses_the_canonical_guidance_sanitization_rules() {
+    fn shader_uses_the_fsr_safe_guidance_contract() {
         let shader = include_str!("../../../../shaders/upscaler/fidelityfx_input.comp");
         for expression in [
-            "confidence > 0.05",
-            "disocclusion * (1.0 - confidence)",
-            "max(composition, disocclusion)",
-            "clamp(texelFetch(depth_image, pixel, 0).r, 0.0, 1.0)",
-            "fsr_depth_value = params.relative_depth != 0u",
+            "params.use_estimated_motion != 0u",
+            "float fsr_depth_value = 0.0",
+            "float fsr_reactive_value = 0.0",
+            "float fsr_composition_value = 0.0",
         ] {
             assert!(
                 shader.contains(expression),
-                "missing adapter rule: {expression}"
+                "missing FSR-safe adapter rule: {expression}"
             );
         }
+        assert!(!shader.contains("disocclusion * (1.0 - confidence)"));
+        assert!(!shader.contains("max(composition, disocclusion)"));
     }
 }

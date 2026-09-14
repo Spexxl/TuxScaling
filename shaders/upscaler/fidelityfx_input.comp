@@ -15,7 +15,7 @@ layout(r8, set = 0, binding = 9) uniform image2D fsr_composition;
 layout(push_constant) uniform Params {
     uint width;
     uint height;
-    uint relative_depth;
+    uint use_estimated_motion;
 } params;
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -32,12 +32,12 @@ void main() {
     float reactive = texelFetch(reactive_image, pixel, 0).r;
     float composition = texelFetch(composition_image, pixel, 0).r;
 
-    vec2 sanitized_motion = confidence > 0.05 ? motion : vec2(0.0);
-    float fsr_reactive_value = max(reactive, disocclusion * (1.0 - confidence));
-    float fsr_composition_value = max(composition, disocclusion);
-    float fsr_depth_value = params.relative_depth != 0u
-        ? clamp(texelFetch(depth_image, pixel, 0).r, 0.0, 1.0)
-        : 1.0;
+    vec2 sanitized_motion = params.use_estimated_motion != 0u && confidence > 0.05
+        ? motion
+        : vec2(0.0);
+    float fsr_reactive_value = 0.0;
+    float fsr_composition_value = 0.0;
+    float fsr_depth_value = 0.0;
 
     imageStore(fsr_motion, pixel, vec4(sanitized_motion, 0.0, 1.0));
     imageStore(fsr_depth, pixel, vec4(fsr_depth_value, 0.0, 0.0, 1.0));
