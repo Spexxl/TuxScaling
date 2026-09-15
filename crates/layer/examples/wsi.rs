@@ -291,6 +291,20 @@ fn starts_borderless() -> bool {
     )
 }
 
+fn uses_independent_presenter(scenario: Option<&str>) -> bool {
+    matches!(
+        scenario,
+        Some(
+            "upscale"
+                | "windowed_promote"
+                | "mutable_format"
+                | "present_wait_generation"
+                | "hdr_replacement"
+                | "display_timing"
+        )
+    )
+}
+
 fn uses_negative_monitor_origin() -> bool {
     matches!(
         std::env::var("TUXSCALING_TEST_SCENARIO").as_deref(),
@@ -935,6 +949,12 @@ mod tests {
     }
 
     #[test]
+    fn windowed_promotion_uses_the_independent_presenter_contract() {
+        assert!(super::uses_independent_presenter(Some("windowed_promote")));
+        assert!(!super::uses_independent_presenter(Some("native_aa")));
+    }
+
+    #[test]
     fn maintenance_scenario_preserves_the_1280x720_game_extent() {
         assert_eq!(
             super::game_extent_for(Some("maintenance1")),
@@ -1493,16 +1513,7 @@ unsafe fn run() -> WsiOutcome {
         let scenario_active = scenario.is_some();
         let scenario_name = scenario.as_deref().unwrap_or("default");
         let maintenance_scenario = scenario.as_deref() == Some("maintenance1");
-        let presenter_scenario = matches!(
-            scenario.as_deref(),
-            Some(
-                "upscale"
-                    | "mutable_format"
-                    | "present_wait_generation"
-                    | "hdr_replacement"
-                    | "display_timing"
-            )
-        );
+        let presenter_scenario = uses_independent_presenter(scenario.as_deref());
         let mutable_scenario = scenario.as_deref() == Some("mutable_format");
         let present_wait_scenario = scenario.as_deref() == Some("present_wait_generation");
         let hdr_scenario = scenario.as_deref() == Some("hdr_replacement");
