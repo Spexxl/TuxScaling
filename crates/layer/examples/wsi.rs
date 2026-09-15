@@ -2713,8 +2713,8 @@ unsafe fn run() -> WsiOutcome {
                 windows.len(),
             );
         }
-        if scenario_name == "promotion_failure" && resizes > 0 {
-            // This scenario injects one synthetic application resize while
+        if resizes > 0 {
+            // Resize scenarios inject synthetic application geometry while
             // the presenter remains independent. Restore that test mutation
             // before teardown so the final assertion covers only layer-owned
             // geometry changes.
