@@ -69,6 +69,54 @@ fn select_frame_images(
     Ok((game_image, output_image))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendColorSource {
+    StableCapture,
+    JitteredGuidance,
+}
+
+fn backend_color_source_kind(
+    jitter: JitterSample,
+    source_extent: vk::Extent2D,
+    guidance_extent: vk::Extent2D,
+) -> BackendColorSource {
+    if jitter.signal_state() == SignalState::Estimated && source_extent == guidance_extent {
+        BackendColorSource::JitteredGuidance
+    } else {
+        BackendColorSource::StableCapture
+    }
+}
+
+fn effective_post_capture_jitter(
+    requested: JitterSample,
+    source_extent: vk::Extent2D,
+    guidance_extent: vk::Extent2D,
+) -> JitterSample {
+    match backend_color_source_kind(requested, source_extent, guidance_extent) {
+        BackendColorSource::JitteredGuidance => requested,
+        BackendColorSource::StableCapture => {
+            if requested.signal_state() == SignalState::Estimated {
+                JitterSample::default()
+            } else {
+                requested
+            }
+        }
+    }
+}
+
+fn effective_post_capture_jitter_for_frame(
+    requested: JitterSample,
+    source_extent: vk::Extent2D,
+    guidance_extent: vk::Extent2D,
+    history_valid: bool,
+) -> JitterSample {
+    if history_valid {
+        effective_post_capture_jitter(requested, source_extent, guidance_extent)
+    } else {
+        JitterSample::default()
+    }
+}
+
 pub struct SwapchainRuntimeCreateInfo {
     pub info: SwapchainInfo,
     pub images: SwapchainImages,
@@ -1686,11 +1734,24 @@ impl SwapchainRuntime {
             self.diagnostics.debug_view = view;
             self.diagnostics.mode = mode_name(self.mode).into();
         }
-        let requested_jitter = self.temporal.jitter.sample();
+        let history_valid = self.temporal.history.valid(self.temporal.pending_time);
+        let requested_jitter = if history_valid {
+            self.temporal.jitter.sample()
+        } else {
+            self.temporal.jitter.reset();
+            JitterSample::default()
+        };
         let zero_guidance = self.temporal.config.guidance_mode == GuidanceMode::Zero;
         let ablations = self.temporal.guidance_ablations;
-        let jitter = if zero_guidance || ablations.post_capture_jitter {
+        let mut jitter = if zero_guidance || ablations.post_capture_jitter {
             JitterSample::default()
+        } else if let Some(capture) = &self.temporal.capture {
+            effective_post_capture_jitter_for_frame(
+                requested_jitter,
+                capture.source.color.extent,
+                capture.guidance.current.extent,
+                history_valid,
+            )
         } else {
             requested_jitter
         };
@@ -1698,9 +1759,10 @@ impl SwapchainRuntime {
             self.temporal
                 .reset_history_preserving_jitter(GuidanceReset::PresetChanged);
             self.diagnostics.state = "Jitter phase restarted; history reset".into();
+            jitter = JitterSample::default();
         }
-        self.diagnostics.jitter_mode = self.temporal.jitter.mode();
         let valid = self.temporal.history.valid(self.temporal.pending_time);
+        self.diagnostics.jitter_mode = self.temporal.jitter.mode();
         self.diagnostics.history_valid = valid;
         self.diagnostics.history_age = self.temporal.history_age;
         self.diagnostics.reset_reason = reset_name(if valid {
@@ -1998,12 +2060,24 @@ impl SwapchainRuntime {
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 );
             }
-            let backend_source = self.temporal.capture.as_ref().map(|capture| BackendImage {
-                image: capture.source.color.handle,
-                view: capture.source.color.view,
-                format: capture.source.color.format,
-                extent: capture.source.color.extent,
-                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            let backend_source = self.temporal.capture.as_ref().map(|capture| {
+                let source = match guidance_view.map(|view| {
+                    backend_color_source_kind(
+                        view.jitter,
+                        capture.source.color.extent,
+                        capture.guidance.current.extent,
+                    )
+                }) {
+                    Some(BackendColorSource::JitteredGuidance) => &capture.guidance.current,
+                    _ => &capture.source.color,
+                };
+                BackendImage {
+                    image: source.handle,
+                    view: source.view,
+                    format: source.format,
+                    extent: source.extent,
+                    layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                }
             });
             let mut backend_failed = false;
             let mut backend_recorded = false;
@@ -2798,6 +2872,7 @@ mod tests {
     use ash::vk;
     use ash::vk::Handle;
     use tuxscaling_overlay::FrameDiagnostics;
+    use tuxscaling_temporal::JitterSample;
     use tuxscaling_upscaler::{BackendInputDiagnostics, BackendInputState};
 
     #[test]
@@ -3004,6 +3079,58 @@ mod tests {
         assert_eq!(
             disabled_decision(Upscaler::Reference, None),
             DisabledDecision::Normal
+        );
+    }
+
+    #[test]
+    fn selects_a_coherent_temporal_color_source_for_post_capture_jitter() {
+        let extent = vk::Extent2D {
+            width: 1280,
+            height: 720,
+        };
+        let jitter = JitterSample {
+            current: [0.25, -0.125],
+            previous: [-0.125, 0.166_666_67],
+            phase: 1,
+        };
+
+        assert_eq!(
+            super::backend_color_source_kind(jitter, extent, extent),
+            super::BackendColorSource::JitteredGuidance
+        );
+        assert_eq!(
+            super::backend_color_source_kind(
+                jitter,
+                extent,
+                vk::Extent2D {
+                    width: 960,
+                    height: 540,
+                }
+            ),
+            super::BackendColorSource::StableCapture
+        );
+        assert_eq!(
+            super::effective_post_capture_jitter(
+                jitter,
+                extent,
+                vk::Extent2D {
+                    width: 960,
+                    height: 540,
+                }
+            ),
+            JitterSample::default()
+        );
+        assert_eq!(
+            super::effective_post_capture_jitter_for_frame(jitter, extent, extent, false),
+            JitterSample::default()
+        );
+        assert_eq!(
+            super::effective_post_capture_jitter_for_frame(jitter, extent, extent, true),
+            jitter
+        );
+        assert_eq!(
+            super::backend_color_source_kind(JitterSample::default(), extent, extent),
+            super::BackendColorSource::StableCapture
         );
     }
 }

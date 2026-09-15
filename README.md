@@ -13,11 +13,11 @@ The repository captures supported swapchains, estimates optical flow and tempora
 - Rust owns the runtime, Vulkan layer, frame pipeline, synthetic temporal inputs, configuration, diagnostics, and egui interface.
 - Native C or C++ code is isolated behind a small C ABI for optional SDK adapters.
 - Inputs are always estimated from captured color frames; game-native temporal inputs are not intercepted.
-- Guidance includes source-pixel current-to-previous motion, confidence, temporal reactive and disocclusion masks, log-luminance exposure, and a flat depth fallback. Jitter is always zero.
+- Guidance includes source-pixel current-to-previous motion, confidence, temporal reactive and disocclusion masks, log-luminance exposure, and a flat depth fallback. Jitter is disabled in the stable default; the optional Halton mode is explicitly experimental.
 - The default `Balanced` preset is fixed for the session. `Ultra`, `High`, and `Performance` trade optical-flow work for precision; the overlay applies changes at a frame boundary and reports per-pass GPU timings.
 - The reference backend uses an optional 50–100% internal guidance scale (default 100%), neighborhood clamping, confidence-weighted accumulation, and history reset on first frame, long pause, presentation failure, resize, or preset change.
 - `Reference` is the default upscaler. `FSR 3.1.4` is selectable through `upscaler = "fsr_3_1_4"` or the egui overlay; its native Linux companion library is loaded only when the FidelityFX feature is enabled and failures fall back to the reference/spatial path.
-- FSR consumes estimated full-game-resolution guidance, dispatches zero jitter, and records through the runtime's single-submit secondary command buffer path. It does not change the game's internal resolution or provide frame generation.
+- FSR consumes estimated full-game-resolution guidance and records through the runtime's single-submit secondary command buffer path. With experimental Halton jitter at matching input/guidance resolution, the jittered color and guidance images are paired and the FSR jitter-cancellation contract is enabled; the default path remains zero-jitter. It does not change the game's internal resolution or provide frame generation.
 - X11/XWayland input is optional at runtime. `Insert` toggles the overlay and pointer/keyboard grabs are released on close and destruction. Native Wayland remains configuration-only in this milestone.
 - The injected runtime uses `ash` directly and does not use `wgpu`, `vulkano`, `eframe`, or `winit`.
 - The initial milestone does not include Windows, DirectX, OpenGL, frame generation, a standalone GUI, or a required FSR 4 runtime.

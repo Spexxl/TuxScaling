@@ -15,7 +15,7 @@ Vulkan present
   -> downstream presentation
 ```
 
-Inputs are always estimated from captured color frames. The stable guidance package exposes motion in current-to-previous source pixels, confidence, disocclusion, reactive, exposure, relative depth, and transparency/composition signals. Each resource carries its extent, valid region, frame ID, signal state, and conservative fallback; stable jitter is intentionally unavailable. TuxScaling does not intercept native DLSS, FSR, or XeSS calls and does not consume game-provided motion vectors, depth, exposure, camera matrices, or UI masks.
+Inputs are always estimated from captured color frames. The stable guidance package exposes motion in current-to-previous source pixels, confidence, disocclusion, reactive, exposure, relative depth, and transparency/composition signals. Each resource carries its extent, valid region, frame ID, signal state, and conservative fallback; stable jitter is disabled by default. An explicitly experimental Halton mode pairs a post-capture jittered color image with its guidance only when both use the game's input extent. TuxScaling does not intercept native DLSS, FSR, or XeSS calls and does not consume game-provided motion vectors, depth, exposure, camera matrices, or UI masks.
 
 ## Workspace boundaries
 

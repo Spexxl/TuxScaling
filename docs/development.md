@@ -35,8 +35,10 @@ cargo xtask fidelityfx-check
 Pass `--backend fsr_3_1_4` to `gpu-check` or `smoke` to exercise the experimental FidelityFX path. The FSR GPU check includes the adapter, lifecycle, deterministic captured-sequence quality, and static quality gates. `Reference` remains the default.
 
 The FSR adapter accepts only qualified estimated motion and confidence. It
-uses neutral reactive/composition masks, a unity exposure image, flat inverted
-infinite depth, and zero jitter; see [fidelityfx.md](fidelityfx.md) for the
+uses neutral reactive/composition masks, a unity exposure image, and flat
+inverted infinite depth; jitter is zero in the stable default and the
+experimental Halton path is paired with the jittered color image only at a
+matching input/guidance extent. See [fidelityfx.md](fidelityfx.md) for the
 compatibility rationale. Capture manifests record these decisions under
 `fsr_inputs` so visual-quality runs can validate them.
 

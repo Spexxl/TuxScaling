@@ -1,8 +1,9 @@
 use super::{
     FsrInputAdapter, NativeContext, TUX_FFX_CREATE_DEBUG_CHECKING, TUX_FFX_CREATE_DEPTH_INFINITE,
-    TUX_FFX_CREATE_DEPTH_INVERTED, TUX_FFX_CREATE_NON_LINEAR_COLORSPACE,
-    TUX_FFX_IMAGE_STATE_COMPUTE_READ, TUX_FFX_IMAGE_STATE_UNORDERED_ACCESS,
-    TUX_FFX_IMAGE_USAGE_READ_ONLY, TUX_FFX_IMAGE_USAGE_UAV, TuxFfxCreateInfo, TuxFfxDispatchInfo,
+    TUX_FFX_CREATE_DEPTH_INVERTED, TUX_FFX_CREATE_MOTION_VECTORS_JITTER_CANCELLATION,
+    TUX_FFX_CREATE_NON_LINEAR_COLORSPACE, TUX_FFX_IMAGE_STATE_COMPUTE_READ,
+    TUX_FFX_IMAGE_STATE_UNORDERED_ACCESS, TUX_FFX_IMAGE_USAGE_READ_ONLY, TUX_FFX_IMAGE_USAGE_UAV,
+    TuxFfxCreateInfo, TuxFfxDispatchInfo,
 };
 use crate::{
     BackendCapabilities, BackendColorEncoding, BackendConfig, BackendEnvironment, BackendError,
@@ -11,7 +12,7 @@ use crate::{
 use ash::vk;
 use ash::vk::Handle;
 use std::io::Cursor;
-use tuxscaling_temporal::{FrameExtent, GuidanceView};
+use tuxscaling_temporal::{FrameExtent, GuidanceView, JitterSample};
 use tuxscaling_vulkan::{Image, image_barrier};
 
 const FSR_COLOR_FORMATS: &[vk::Format] = &[
@@ -206,6 +207,7 @@ impl Fsr314Upscaler {
             max_output_height: content_extent.height,
             flags: TUX_FFX_CREATE_DEPTH_INVERTED
                 | TUX_FFX_CREATE_DEPTH_INFINITE
+                | TUX_FFX_CREATE_MOTION_VECTORS_JITTER_CANCELLATION
                 | TUX_FFX_CREATE_NON_LINEAR_COLORSPACE
                 | TUX_FFX_CREATE_DEBUG_CHECKING,
             vulkan_api_version: environment.vulkan_api_version,
@@ -476,6 +478,7 @@ impl UpscalerBackend for Fsr314Upscaler {
                 );
             }
         }
+        let jitter_offset = fsr_jitter_offset(guidance.jitter);
         let dispatch = TuxFfxDispatchInfo {
             command_buffer: frame.command_buffer.as_raw(),
             color: image_info(
@@ -517,8 +520,8 @@ impl UpscalerBackend for Fsr314Upscaler {
                     TUX_FFX_IMAGE_STATE_UNORDERED_ACCESS
                 },
             ),
-            jitter_x: 0.0,
-            jitter_y: 0.0,
+            jitter_x: jitter_offset[0],
+            jitter_y: jitter_offset[1],
             motion_scale_x: 1.0,
             motion_scale_y: 1.0,
             frame_time_ms: frame.guidance.timing.validated.as_secs_f32() * 1_000.0,
@@ -603,5 +606,31 @@ fn content_extent(config: BackendConfig) -> vk::Extent2D {
             .max(1),
         height: ((config.output_extent.height as f32 * config.viewport.size[1]).round() as u32)
             .max(1),
+    }
+}
+
+fn fsr_jitter_offset(jitter: JitterSample) -> [f32; 2] {
+    if jitter.signal_state() == tuxscaling_temporal::SignalState::Estimated {
+        [-jitter.current[0], -jitter.current[1]]
+    } else {
+        [0.0, 0.0]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fsr_jitter_offset;
+    use tuxscaling_temporal::JitterSample;
+
+    #[test]
+    fn fsr_jitter_offset_preserves_pixel_units_and_expected_sign() {
+        let jitter = JitterSample {
+            current: [0.25, -0.125],
+            previous: [-0.125, 0.166_666_67],
+            phase: 1,
+        };
+
+        assert_eq!(fsr_jitter_offset(jitter), [-0.25, 0.125]);
+        assert_eq!(fsr_jitter_offset(JitterSample::default()), [0.0, 0.0]);
     }
 }

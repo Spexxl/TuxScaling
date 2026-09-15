@@ -115,7 +115,11 @@ semantics can be obtained safely:
 - depth is a flat zero image, with the inverted/infinite depth creation flags;
 - exposure is a persistent 1x1 image containing unity and `preExposure = 1.0`;
 - reactive and transparency/composition masks are zero images;
-- camera jitter is always zero.
+- camera jitter is zero in the stable default. The experimental Halton mode is
+  forwarded only when the captured color and guidance images share the game
+  input extent; in that mode FSR receives the paired jittered color and the
+  matching jitter-cancellation flag. Post-capture jitter remains an estimate,
+  not native engine projection jitter.
 
 These values are not estimates of engine depth, exposure, reactive regions, or
 jitter. The overlay and diagnostic capture metadata expose the per-input states

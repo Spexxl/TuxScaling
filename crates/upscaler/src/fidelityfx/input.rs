@@ -19,6 +19,7 @@ pub(crate) struct FsrInputs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FsrInputPolicy {
     pub use_estimated_motion: bool,
+    pub use_estimated_jitter: bool,
 }
 
 impl FsrInputPolicy {
@@ -41,6 +42,7 @@ impl FsrInputPolicy {
                 )
                 && matches!(guidance.direction, MotionDirection::CurrentToPrevious)
                 && matches!(guidance.units, MotionUnits::SourcePixels),
+            use_estimated_jitter: guidance.jitter.signal_state() == SignalState::Estimated,
         }
     }
 
@@ -60,7 +62,11 @@ impl FsrInputPolicy {
             exposure: BackendInputState::SuppressedIncompatible,
             reactive: BackendInputState::Neutral,
             composition: BackendInputState::Neutral,
-            jitter: BackendInputState::Neutral,
+            jitter: if self.use_estimated_jitter {
+                BackendInputState::Estimated
+            } else {
+                BackendInputState::Neutral
+            },
         }
     }
 }
@@ -647,5 +653,31 @@ mod tests {
         let diagnostics = policy.diagnostics();
         assert_eq!(diagnostics.motion, super::BackendInputState::Neutral);
         assert_eq!(diagnostics.confidence, super::BackendInputState::Neutral);
+    }
+
+    #[test]
+    fn coherent_jitter_is_reported_as_an_estimated_fsr_input() {
+        let extent = FrameExtent {
+            width: 128,
+            height: 96,
+        };
+        let metadata = GuidanceMetadata {
+            frame_id: 12,
+            extent,
+            valid_region: tuxscaling_temporal::ValidRegion::full(extent),
+            reset: GuidanceReset::None,
+            valid: true,
+            is_zero: false,
+            requires_history_reset: false,
+        };
+        let mut estimated = guidance(metadata, SignalState::Estimated);
+        estimated.jitter = JitterSample {
+            current: [0.25, -0.125],
+            previous: [-0.125, 0.166_666_67],
+            phase: 1,
+        };
+
+        let diagnostics = super::FsrInputPolicy::from_guidance(estimated).diagnostics();
+        assert_eq!(diagnostics.jitter, super::BackendInputState::Estimated);
     }
 }

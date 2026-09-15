@@ -468,7 +468,9 @@ pub fn render_diagnostics(
                                         }
                                     }
                                 });
-                            ui.small("Experimental jitter resamples captured color and feeds temporal backends.");
+                            ui.small(
+                                "Experimental jitter pairs post-capture color and guidance at the input extent; it is not engine projection jitter.",
+                            );
                             let mut debug_view = diagnostics.debug_view;
                             egui::ComboBox::from_label("Debug view")
                                 .selected_text(debug_view_label(debug_view))

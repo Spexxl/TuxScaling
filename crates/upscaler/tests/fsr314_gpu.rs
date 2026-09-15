@@ -34,7 +34,7 @@ fn resource(image: &Image, format: vk::Format, metadata: GuidanceMetadata) -> Gu
 }
 
 #[test]
-fn fsr314_shader_contract_uses_zero_jitter_and_fixed_camera_domain() {
+fn fsr314_output_shader_contract_uses_a_fixed_camera_domain() {
     let shader = include_str!("../../../shaders/upscaler/fidelityfx_output.comp");
     assert!(shader.contains("viewport_offset"));
     assert!(shader.contains("imageStore(output_image"));
