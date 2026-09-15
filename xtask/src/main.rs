@@ -1019,48 +1019,93 @@ struct VisualQualityMetrics {
     difference_map: Vec<[f32; 4]>,
 }
 
+fn luma_value(pixel: [f32; 4]) -> f32 {
+    pixel[0] * 0.2126 + pixel[1] * 0.7152 + pixel[2] * 0.0722
+}
+
 fn image_mse(reference: &[[f32; 4]], estimate: &[[f32; 4]]) -> f32 {
     let count = reference.len().min(estimate.len());
     if count == 0 {
         return 0.0;
     }
-    reference
-        .iter()
-        .zip(estimate.iter())
-        .take(count)
-        .flat_map(|(reference, estimate)| reference.iter().zip(estimate.iter()))
-        .map(|(reference, estimate)| (reference - estimate).powi(2))
-        .sum::<f32>()
-        / (count * 4) as f32
-}
-
-fn luma_value(pixel: [f32; 4]) -> f32 {
-    pixel[0] * 0.2126 + pixel[1] * 0.7152 + pixel[2] * 0.0722
-}
-
-fn global_ssim(reference: &[[f32; 4]], estimate: &[[f32; 4]]) -> f32 {
-    let count = reference.len().min(estimate.len());
-    if count == 0 {
-        return 0.0;
+    let mut sum = 0.0_f32;
+    for index in 0..count {
+        for (reference_value, estimate_value) in reference[index].iter().zip(estimate[index]) {
+            sum += (reference_value - estimate_value).powi(2);
+        }
     }
-    let reference_mean = reference
-        .iter()
-        .take(count)
-        .map(|pixel| luma_value(*pixel))
-        .sum::<f32>()
-        / count as f32;
-    let estimate_mean = estimate
-        .iter()
-        .take(count)
-        .map(|pixel| luma_value(*pixel))
-        .sum::<f32>()
-        / count as f32;
+    sum / (count * 4) as f32
+}
+
+fn visual_quality_metrics(
+    reference: &[[f32; 4]],
+    estimate: &[[f32; 4]],
+    previous_estimate: &[[f32; 4]],
+) -> VisualQualityMetrics {
+    let count = reference.len().min(estimate.len());
+    let previous_count = estimate.len().min(previous_estimate.len());
+    if count == 0 {
+        return VisualQualityMetrics {
+            mse: 0.0,
+            psnr: 120.0,
+            ssim: 0.0,
+            flicker_mse: 0.0,
+            ghost_trail: 0.0,
+            shimmer: 0.0,
+            difference_map: Vec::new(),
+        };
+    }
+
+    let mut mse_sum = 0.0_f32;
+    let mut flicker_sum = 0.0_f32;
+    let mut ghost_sum = 0.0_f32;
+    let mut shimmer_sum = 0.0_f32;
+    let mut reference_luma_sum = 0.0_f32;
+    let mut estimate_luma_sum = 0.0_f32;
+    let mut difference_map = Vec::with_capacity(count);
+    for index in 0..count.max(previous_count) {
+        if index < count {
+            let reference_pixel = reference[index];
+            let estimate_pixel = estimate[index];
+            for (reference_value, estimate_value) in reference_pixel.iter().zip(estimate_pixel) {
+                mse_sum += (reference_value - estimate_value).powi(2);
+            }
+            reference_luma_sum += luma_value(reference_pixel);
+            estimate_luma_sum += luma_value(estimate_pixel);
+            for (reference_value, estimate_value) in
+                reference_pixel[..3].iter().zip(estimate_pixel[..3].iter())
+            {
+                ghost_sum += (reference_value - estimate_value).abs();
+            }
+            difference_map.push([
+                (reference_pixel[0] - estimate_pixel[0]).abs(),
+                (reference_pixel[1] - estimate_pixel[1]).abs(),
+                (reference_pixel[2] - estimate_pixel[2]).abs(),
+                1.0,
+            ]);
+        }
+        if index < previous_count {
+            let estimate_pixel = estimate[index];
+            let previous_pixel = previous_estimate[index];
+            for (estimate_value, previous_value) in estimate_pixel.iter().zip(previous_pixel) {
+                flicker_sum += (estimate_value - previous_value).powi(2);
+            }
+            for (estimate_value, previous_value) in
+                estimate_pixel[..3].iter().zip(previous_pixel[..3].iter())
+            {
+                shimmer_sum += (estimate_value - previous_value).abs();
+            }
+        }
+    }
+
+    let reference_mean = reference_luma_sum / count as f32;
+    let estimate_mean = estimate_luma_sum / count as f32;
     let mut reference_variance = 0.0;
     let mut estimate_variance = 0.0;
     let mut covariance = 0.0;
-    for (reference, estimate) in reference.iter().zip(estimate.iter()).take(count) {
-        let reference_delta = luma_value(*reference) - reference_mean;
-        let estimate_delta = luma_value(*estimate) - estimate_mean;
+    for index in 0..count {
+        let reference_delta = luma_value(reference[index]) - reference_mean;
+        let estimate_delta = luma_value(estimate[index]) - estimate_mean;
         reference_variance += reference_delta * reference_delta;
         estimate_variance += estimate_delta * estimate_delta;
         covariance += reference_delta * estimate_delta;
@@ -1071,53 +1116,22 @@ fn global_ssim(reference: &[[f32; 4]], estimate: &[[f32; 4]]) -> f32 {
     covariance /= denominator;
     let c1 = 0.01_f32.powi(2);
     let c2 = 0.03_f32.powi(2);
-    ((2.0 * reference_mean * estimate_mean + c1) * (2.0 * covariance + c2))
+    let ssim = ((2.0 * reference_mean * estimate_mean + c1) * (2.0 * covariance + c2))
         / ((reference_mean.powi(2) + estimate_mean.powi(2) + c1)
-            * (reference_variance + estimate_variance + c2))
-}
-
-fn visual_quality_metrics(
-    reference: &[[f32; 4]],
-    estimate: &[[f32; 4]],
-    previous_estimate: &[[f32; 4]],
-) -> VisualQualityMetrics {
-    let mse = image_mse(reference, estimate);
+            * (reference_variance + estimate_variance + c2));
+    let mse = mse_sum / (count * 4) as f32;
     let psnr = if mse <= f32::EPSILON {
         120.0
     } else {
         10.0 * (1.0 / mse).log10()
     };
-    let difference_map = reference
-        .iter()
-        .zip(estimate.iter())
-        .map(|(reference, estimate)| {
-            [
-                (reference[0] - estimate[0]).abs(),
-                (reference[1] - estimate[1]).abs(),
-                (reference[2] - estimate[2]).abs(),
-                1.0,
-            ]
-        })
-        .collect();
-    let flicker_mse = image_mse(estimate, previous_estimate);
-    let ghost_trail = reference
-        .iter()
-        .zip(estimate.iter())
-        .flat_map(|(reference, estimate)| reference[..3].iter().zip(estimate[..3].iter()))
-        .map(|(reference, estimate)| (reference - estimate).abs())
-        .sum::<f32>()
-        / (reference.len().min(estimate.len()).max(1) * 3) as f32;
-    let shimmer = estimate
-        .iter()
-        .zip(previous_estimate.iter())
-        .flat_map(|(estimate, previous)| estimate[..3].iter().zip(previous[..3].iter()))
-        .map(|(estimate, previous)| (estimate - previous).abs())
-        .sum::<f32>()
-        / (estimate.len().min(previous_estimate.len()).max(1) * 3) as f32;
+    let flicker_mse = flicker_sum / (previous_count.max(1) * 4) as f32;
+    let ghost_trail = ghost_sum / (count.max(1) * 3) as f32;
+    let shimmer = shimmer_sum / (previous_count.max(1) * 3) as f32;
     VisualQualityMetrics {
         mse,
         psnr,
-        ssim: global_ssim(reference, estimate),
+        ssim,
         flicker_mse,
         ghost_trail,
         shimmer,
@@ -1937,10 +1951,7 @@ fn visual_quality_report(
         let (off_source, _) = read_capture_resource(off_directory, off_manifest, "source")?;
         let (off_output, off_output_extent) =
             read_capture_resource(off_directory, off_manifest, "spatial_off")?;
-        source_frames_match &= fsr_source.len() == off_source.len()
-            && fsr_source.len() == zero_source.len()
-            && image_mse(&fsr_source, &off_source) <= f32::EPSILON
-            && image_mse(&fsr_source, &zero_source) <= f32::EPSILON;
+        source_frames_match &= fsr_source == off_source && fsr_source == zero_source;
         if !source_frames_match {
             break;
         }
