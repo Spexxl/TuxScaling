@@ -2776,6 +2776,214 @@ fn proton_acceptance_gate_commands() -> Vec<(&'static str, Vec<&'static str>)> {
     ]
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProtonSessionEvidence {
+    logical_extent: Option<WsiExtent>,
+    physical_extent: Option<WsiExtent>,
+    presenter_published: bool,
+    virtual_active: bool,
+    fsr_dispatches: u32,
+    reconstructed_presents: u32,
+    overlay_visible: bool,
+    overlay_hidden: bool,
+    software_cursor_visible: bool,
+    input_route_active: bool,
+    failure: bool,
+}
+
+fn proton_session_log_text(stdout: &str, stderr: &str) -> String {
+    format!("{stdout}\n{stderr}").to_ascii_lowercase()
+}
+
+fn proton_session_event_has(line: &str, event: &str) -> bool {
+    line.split_whitespace()
+        .any(|token| token == format!("event={event}"))
+}
+
+fn proton_session_event_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+    line.split_whitespace().find_map(|token| {
+        token
+            .strip_prefix(field)
+            .and_then(|value| value.strip_prefix('='))
+    })
+}
+
+fn proton_session_extent(line: &str, field: &str) -> Option<WsiExtent> {
+    proton_session_event_field(line, field).and_then(parse_wsi_extent)
+}
+
+fn parse_proton_session_evidence(stdout: &str, stderr: &str) -> ProtonSessionEvidence {
+    let output = proton_session_log_text(stdout, stderr);
+    let mut evidence = ProtonSessionEvidence::default();
+    for line in output.lines() {
+        if proton_session_event_has(line, "logical_swapchain_created") {
+            let virtual_active = proton_session_event_field(line, "virtual") == Some("1");
+            let logical = proton_session_extent(line, "logical");
+            let physical = proton_session_extent(line, "physical");
+            evidence.virtual_active |= virtual_active;
+            if virtual_active && logical.is_some() && physical.is_some() && logical != physical {
+                evidence.logical_extent = logical;
+                evidence.physical_extent = physical;
+            } else {
+                evidence.logical_extent = evidence.logical_extent.or(logical);
+                evidence.physical_extent = evidence.physical_extent.or(physical);
+            }
+        }
+        if proton_session_event_has(line, "presenter_generation_published") {
+            evidence.presenter_published = true;
+            evidence.logical_extent = evidence
+                .logical_extent
+                .or_else(|| proton_session_extent(line, "logical"));
+            evidence.physical_extent = evidence
+                .physical_extent
+                .or_else(|| proton_session_extent(line, "physical"));
+        }
+        if proton_session_event_has(line, "fsr_dispatch")
+            && proton_session_event_field(line, "backend") == Some("fsr_3_1_4")
+        {
+            evidence.fsr_dispatches = evidence.fsr_dispatches.saturating_add(1);
+        }
+        if proton_session_event_has(line, "reconstructed_present")
+            && (proton_session_event_field(line, "backend") == Some("fsr_3_1_4")
+                || line.contains("backend=fsr 3.1.4"))
+        {
+            evidence.reconstructed_presents = evidence.reconstructed_presents.saturating_add(1);
+        }
+        if proton_session_event_has(line, "overlay_toggled") {
+            match proton_session_event_field(line, "visible") {
+                Some("1") => evidence.overlay_visible = true,
+                Some("0") => evidence.overlay_hidden = true,
+                _ => {}
+            }
+        }
+        if proton_session_event_has(line, "software_cursor")
+            && proton_session_event_field(line, "visible") == Some("1")
+        {
+            evidence.software_cursor_visible = true;
+        }
+        if proton_session_event_has(line, "input_route_active") {
+            evidence.input_route_active = true;
+        }
+    }
+    evidence.failure = [
+        "validation error",
+        "vuid-",
+        "panic",
+        "event=presenter_fallback_to_direct",
+        "event=presenter_fallback ",
+    ]
+    .iter()
+    .any(|marker| output.contains(marker));
+    evidence
+}
+
+fn proton_session_evidence_is_valid(
+    evidence: &ProtonSessionEvidence,
+    capture_count: usize,
+) -> bool {
+    let Some(logical) = evidence.logical_extent else {
+        return false;
+    };
+    let Some(physical) = evidence.physical_extent else {
+        return false;
+    };
+    evidence.presenter_published
+        && evidence.virtual_active
+        && logical
+            == WsiExtent {
+                width: 1280,
+                height: 720,
+            }
+        && physical != logical
+        && physical.width >= logical.width
+        && physical.height >= logical.height
+        && evidence.fsr_dispatches >= 3
+        && evidence.reconstructed_presents >= 3
+        && evidence.overlay_visible
+        && evidence.overlay_hidden
+        && evidence.software_cursor_visible
+        && evidence.input_route_active
+        && capture_count >= 3
+        && !evidence.failure
+}
+
+fn proton_capture_files_are_valid(root: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+    let mut valid_frames = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file()
+            || path.extension().and_then(|extension| extension.to_str()) != Some("json")
+            || !path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.starts_with("frame-"))
+        {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let extent = |name: &str| {
+            value
+                .get(name)
+                .and_then(serde_json::Value::as_array)
+                .and_then(|values| {
+                    (values.len() == 2).then(|| {
+                        [
+                            values[0]
+                                .as_u64()
+                                .and_then(|value| u32::try_from(value).ok()),
+                            values[1]
+                                .as_u64()
+                                .and_then(|value| u32::try_from(value).ok()),
+                        ]
+                    })
+                })
+        };
+        let Some([Some(game_width), Some(game_height)]) = extent("game_extent") else {
+            continue;
+        };
+        let Some([Some(output_width), Some(output_height)]) = extent("output_extent") else {
+            continue;
+        };
+        let resources = value
+            .get("resources")
+            .and_then(serde_json::Value::as_array)
+            .filter(|resources| !resources.is_empty());
+        let Some(resources) = resources else {
+            continue;
+        };
+        let resources_complete = resources.iter().all(|resource| {
+            resource
+                .get("file")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|file| root.join(file).is_file())
+        });
+        if value
+            .get("frame_id")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+            || value.get("backend").and_then(serde_json::Value::as_str) != Some("FSR 3.1.4")
+            || game_width != 1280
+            || game_height != 720
+            || output_width < game_width
+            || output_height < game_height
+            || [output_width, output_height] == [game_width, game_height]
+            || !resources_complete
+        {
+            continue;
+        }
+        valid_frames += 1;
+    }
+    valid_frames >= 3
+}
+
 fn run_proton_acceptance(root: &Path, options: &ProtonAcceptanceOptions) -> bool {
     let checks = [
         (
@@ -2879,7 +3087,44 @@ fn run_proton_acceptance(root: &Path, options: &ProtonAcceptanceOptions) -> bool
         options.evidence_dir.join("proton-session-status.txt"),
         format!("status={status}\nrestarts=0\n"),
     );
-    status.success()
+    let session_log =
+        fs::read_to_string(options.evidence_dir.join("proton-session.log")).unwrap_or_default();
+    let evidence = parse_proton_session_evidence(&session_log, "");
+    let capture_dir = options.evidence_dir.join("capture");
+    let capture_count = fs::read_dir(&capture_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    let path = entry.path();
+                    path.is_file()
+                        && path.extension().and_then(|extension| extension.to_str()) == Some("json")
+                        && path
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .is_some_and(|stem| stem.starts_with("frame-"))
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let evidence_valid = proton_session_evidence_is_valid(&evidence, capture_count);
+    let captures_valid = proton_capture_files_are_valid(&capture_dir);
+    let _ = fs::write(
+        options.evidence_dir.join("proton-session-evidence.txt"),
+        format!(
+            "evidence={evidence:?}\ncapture_count={capture_count}\ncaptures_valid={captures_valid}\n"
+        ),
+    );
+    if !status.success() {
+        return false;
+    }
+    if !evidence_valid || !captures_valid {
+        eprintln!(
+            "cargo xtask proton-acceptance: session evidence incomplete (evidence_valid={evidence_valid}, captures_valid={captures_valid})"
+        );
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -4135,14 +4380,16 @@ mod tests {
         fsr_input_contract_is_safe_for_frame, generated_config, guidance_comparison_gate_passed,
         maintenance_evidence_complete, maintenance_output_is_valid, parse_backend_args,
         parse_maintenance_evidence, parse_preset_medians, parse_proton_acceptance_args,
-        parse_public_x11_display, parse_visual_quality_args, parse_vkcube_args,
-        parse_vkcube_evidence, parse_wsi_compatibility_args, proton_acceptance_gate_commands,
-        proton_launchers_on_path, quality_ablation_rows, quality_fixture_passes,
+        parse_proton_session_evidence, parse_public_x11_display, parse_visual_quality_args,
+        parse_vkcube_args, parse_vkcube_evidence, parse_wsi_compatibility_args,
+        proton_acceptance_gate_commands, proton_capture_files_are_valid, proton_launchers_on_path,
+        proton_session_evidence_is_valid, quality_ablation_rows, quality_fixture_passes,
         quality_metric_lines, quality_preset_rows, visual_quality_metrics_for_test,
         vkcube_control_sequence_is_valid, vkcube_launch_in, vkcube_output_is_valid,
         wsi_compatibility_output_is_valid, x11_display_is_available_with,
     };
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn proton_acceptance_requires_an_evidence_directory_and_explicit_command() {
@@ -4303,6 +4550,60 @@ mod tests {
                 "--control-sequence"
             ]
         );
+    }
+
+    #[test]
+    fn proton_session_evidence_requires_one_complete_interactive_run() {
+        let complete = concat!(
+            "TuxScaling evidence event=logical_swapchain_created logical=1280x720 physical=2160x1440 virtual=1\n",
+            "TuxScaling evidence event=presenter_generation_published logical=1280x720 physical=2160x1440 generation=0\n",
+            "TuxScaling evidence event=input_route_active mode=absolute\n",
+            "TuxScaling evidence event=software_cursor visible=1\n",
+            "TuxScaling evidence event=overlay_toggled visible=1 owner=Overlay\n",
+            "TuxScaling evidence event=overlay_toggled visible=0 owner=Native\n",
+            "TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=1280x720 physical=2160x1440\n",
+            "TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=1280x720 physical=2160x1440\n",
+            "TuxScaling evidence event=fsr_dispatch backend=FSR_3_1_4 logical=1280x720 physical=2160x1440\n",
+            "TuxScaling evidence event=reconstructed_present backend=FSR 3.1.4 frame=1\n",
+            "TuxScaling evidence event=reconstructed_present backend=FSR 3.1.4 frame=2\n",
+            "TuxScaling evidence event=reconstructed_present backend=FSR 3.1.4 frame=3\n",
+        );
+        let evidence = parse_proton_session_evidence(complete, "");
+        assert!(proton_session_evidence_is_valid(&evidence, 3));
+
+        let mut incomplete = complete.replace("visible=1 owner=Overlay", "visible=0 owner=Native");
+        incomplete.push_str(
+            "TuxScaling evidence event=presenter_fallback_to_direct reason=presenter_lost\n",
+        );
+        let evidence = parse_proton_session_evidence(&incomplete, "");
+        assert!(!proton_session_evidence_is_valid(&evidence, 3));
+    }
+
+    #[test]
+    fn proton_capture_validation_requires_complete_fsr_frames() {
+        let root = std::env::temp_dir().join(format!(
+            "tuxscaling-proton-capture-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |value| value.as_nanos())
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for frame in 0..3 {
+            let prefix = format!("frame-{frame:08}");
+            std::fs::write(root.join(format!("{prefix}-source.bin")), [0_u8]).unwrap();
+            std::fs::write(
+                root.join(format!("{prefix}.json")),
+                format!(
+                    "{{\"frame_id\":{frame},\"backend\":\"FSR 3.1.4\",\"game_extent\":[1280,720],\"output_extent\":[2160,1440],\"resources\":[{{\"file\":\"{prefix}-source.bin\"}}]}}"
+                ),
+            )
+            .unwrap();
+        }
+        assert!(proton_capture_files_are_valid(&root));
+        std::fs::remove_file(root.join("frame-00000001-source.bin")).unwrap();
+        assert!(!proton_capture_files_are_valid(&root));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
