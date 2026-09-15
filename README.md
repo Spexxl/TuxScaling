@@ -6,7 +6,7 @@ The project targets native Vulkan applications games translated to Vulkan throug
 
 ## Current status
 
-The repository captures supported swapchains, estimates optical flow and temporal guidance on the GPU, optionally resamples the captured game image, runs a vendor-neutral reference reconstruction or the experimental AMD FidelityFX FSR 3.1.4 Super Resolution backend, and renders an egui diagnostic overlay. On fullscreen X11/XWayland, the layer can present a lower-resolution game swapchain through a monitor-sized output swapchain. The reference backend remains the default until the FSR quality gates pass.
+The repository captures supported swapchains, estimates optical flow and temporal guidance on the GPU, optionally resamples the captured game image, runs a vendor-neutral reference reconstruction or the experimental AMD FidelityFX FSR 3.1.4 Super Resolution backend, and renders an egui diagnostic overlay. On X11/XWayland, native or fixed output uses a layer-owned presenter window and monitor-sized output swapchain while preserving the game's logical window and swapchain extent. The `swapchain` output mode remains direct. The reference backend remains the default until the FSR quality gates pass.
 
 ## Design boundaries
 

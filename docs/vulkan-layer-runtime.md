@@ -4,9 +4,9 @@
 
 The Vulkan layer injects work immediately before presentation while preserving the application's Vulkan device, queues, and swapchains. The layer must fail open: if TuxScaling cannot process a present, the original call is forwarded unchanged.
 
-The runtime captures supported swapchains, computes estimated optical flow and frame guidance, optionally resolves reduced guidance back to the game extent, dispatches the reference reconstruction through the common backend contract when the format supports storage images, and renders the Egui diagnostic panel over `vkcube` on RADV. In fullscreen X11/XWayland virtual-output mode, game-owned layer images remain at the requested game extent while the real swapchain images use the configured output extent. Unsupported formats and allocation failures bypass reconstruction while preserving presentation. If temporal recording fails after virtualization has started, the runtime attempts a spatial bilinear blit into the real output before presenting.
+The runtime captures supported swapchains, computes estimated optical flow and frame guidance, optionally resolves reduced guidance back to the game extent, dispatches the reference reconstruction through the common backend contract when the format supports storage images, and renders the Egui diagnostic panel over `vkcube` on RADV. In X11/XWayland native-output mode, a layer-owned presenter window and Vulkan surface own the physical output swapchain; game-owned logical images and the original game window remain at the requested extent. Unsupported formats and allocation failures bypass reconstruction while preserving presentation. If temporal recording fails after virtualization has started, the runtime attempts a spatial bilinear blit into the real output before presenting.
 
-The overlay displays `Virtual upscale`, `Native AA`, `Windowed 1:1`, or a direct fallback reason alongside game, guidance, and output extents. It also reports the window mode and selected monitor, for example `Promoted borderless` and `1920x1080 at 0,0`. The logical surface capabilities saved before a resize are restored to the application, while internal layer queries continue to use downstream physical capabilities. Present IDs and Google present timing structures survive incremental-present rectangle remapping.
+The overlay displays `Virtual upscale`, `Native AA`, `Windowed 1:1`, or a direct fallback reason alongside game, guidance, and output extents. It also reports the presenter state, application window mode, and selected monitor, for example `Presenter window` and `1920x1080 at 0,0`. The logical surface capabilities saved before a resize are restored to the application, while internal layer queries continue to use downstream physical capabilities. Present IDs and Google present timing structures survive incremental-present rectangle remapping.
 
 ## Ownership
 
@@ -45,7 +45,7 @@ Layer-owned objects must be destroyed before their downstream owner:
 3. Destroy remaining device-owned resources before `vkDestroyDevice` reaches the next layer.
 4. Remove instance state before `vkDestroyInstance` reaches the next layer.
 
-Swapchain recreation creates a new overlay state. A successful replacement retains the surface's one `BorderlessLease`; failed creation, capability validation, virtual-image allocation, or runtime initialization restores it exactly once before direct fallback. Old state is released through the normal destroy path and never reused for a new format or extent.
+Swapchain recreation creates a new overlay state. A successful replacement retains the surface's presenter ownership; failed creation, capability validation, virtual-image allocation, or runtime initialization releases any newly created presenter and returns to direct presentation. The legacy `BorderlessLease` is used only by compatibility fallback paths and is restored exactly once. Old state is released through the normal destroy path and never reused for a new format or extent.
 
 ## Failure and ABI policy
 
