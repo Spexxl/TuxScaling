@@ -297,6 +297,13 @@ fn uses_independent_presenter(scenario: Option<&str>) -> bool {
         Some(
             "upscale"
                 | "windowed_promote"
+                | "already_borderless"
+                | "aspect"
+                | "resize"
+                | "monitor_origin"
+                | "promotion_failure"
+                | "temporal_failure"
+                | "guidance_resolve"
                 | "mutable_format"
                 | "present_wait_generation"
                 | "hdr_replacement"
@@ -951,6 +958,8 @@ mod tests {
     #[test]
     fn windowed_promotion_uses_the_independent_presenter_contract() {
         assert!(super::uses_independent_presenter(Some("windowed_promote")));
+        assert!(super::uses_independent_presenter(Some("guidance_resolve")));
+        assert!(super::uses_independent_presenter(Some("aspect")));
         assert!(!super::uses_independent_presenter(Some("native_aa")));
     }
 
@@ -2105,7 +2114,7 @@ unsafe fn run() -> WsiOutcome {
             let display = tuxscaling_display::X11Display::connect().unwrap();
             for &window in &windows {
                 let rect = display.window_rect(window).unwrap();
-                let expected = if presenter_scenario
+                let expected = if presenter_scenario && !starts_borderless()
                     || matches!(
                         std::env::var("TUXSCALING_TEST_SCENARIO").ok().as_deref(),
                         Some("native_aa" | "incompatible_direct")
@@ -2692,12 +2701,25 @@ unsafe fn run() -> WsiOutcome {
             );
         }
         if let Some((_, _, width, height)) = presenter_native {
+            let logical_extent = game_extent();
             eprintln!(
-                "TuxScaling evidence event=wsi_scenario scenario={scenario_name} result=verified logical=1280x720 physical={}x{} presenter_windows={} original_window=logical recreations_after_publish=0",
+                "TuxScaling evidence event=wsi_scenario scenario={scenario_name} result=verified logical={}x{} physical={}x{} presenter_windows={} original_window=logical recreations_after_publish=0",
+                logical_extent.width,
+                logical_extent.height,
                 width,
                 height,
                 windows.len(),
             );
+        }
+        if scenario_name == "promotion_failure" && resizes > 0 {
+            // This scenario injects one synthetic application resize while
+            // the presenter remains independent. Restore that test mutation
+            // before teardown so the final assertion covers only layer-owned
+            // geometry changes.
+            for (window, original, _) in &original_windows {
+                XResizeWindow(display, *window as c_ulong, original.width, original.height);
+            }
+            XFlush(display);
         }
         device.device_wait_idle().unwrap();
         for chain in chains {
