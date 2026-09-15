@@ -2704,6 +2704,78 @@ fn run_gate_command(root: &Path, evidence_dir: &Path, name: &str, args: &[&str])
     output.status.success()
 }
 
+fn proton_acceptance_gate_commands() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        ("fmt", vec!["cargo", "fmt", "--all", "--", "--check"]),
+        ("test", vec!["cargo", "test", "--workspace"]),
+        ("build", vec!["cargo", "build", "--workspace"]),
+        (
+            "clippy",
+            vec![
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        ),
+        (
+            "fidelityfx-check",
+            vec!["cargo", "xtask", "fidelityfx-check"],
+        ),
+        (
+            "gpu-check",
+            vec!["cargo", "xtask", "gpu-check", "--backend", "fsr_3_1_4"],
+        ),
+        (
+            "wsi-compatibility",
+            vec![
+                "cargo",
+                "xtask",
+                "wsi-compatibility",
+                "--backend",
+                "fsr_3_1_4",
+                "--allow-unverified",
+                "display_timing",
+            ],
+        ),
+        (
+            "vkcube",
+            vec![
+                "cargo",
+                "xtask",
+                "vkcube",
+                "--release",
+                "--seconds",
+                "20",
+                "--backend",
+                "fsr_3_1_4",
+                "--control-sequence",
+            ],
+        ),
+        (
+            "visual-quality",
+            vec![
+                "cargo",
+                "xtask",
+                "visual-quality",
+                "--display",
+                "nested-xwayland",
+                "--input",
+                "1280x720",
+                "--output",
+                "2160x1440",
+                "--warmup",
+                "180",
+                "--frames",
+                "120",
+            ],
+        ),
+    ]
+}
+
 fn run_proton_acceptance(root: &Path, options: &ProtonAcceptanceOptions) -> bool {
     let checks = [
         (
@@ -2766,52 +2838,7 @@ fn run_proton_acceptance(root: &Path, options: &ProtonAcceptanceOptions) -> bool
         return true;
     }
 
-    let gates = [
-        ("fmt", vec!["cargo", "fmt", "--all", "--", "--check"]),
-        ("test", vec!["cargo", "test", "--workspace"]),
-        ("build", vec!["cargo", "build", "--workspace"]),
-        (
-            "clippy",
-            vec![
-                "cargo",
-                "clippy",
-                "--workspace",
-                "--all-targets",
-                "--",
-                "-D",
-                "warnings",
-            ],
-        ),
-        (
-            "fidelityfx-check",
-            vec!["cargo", "xtask", "fidelityfx-check"],
-        ),
-        ("gpu-check", vec!["cargo", "xtask", "gpu-check"]),
-        (
-            "wsi-compatibility",
-            vec!["cargo", "xtask", "wsi-compatibility"],
-        ),
-        ("vkcube", vec!["cargo", "xtask", "vkcube"]),
-        (
-            "visual-quality",
-            vec![
-                "cargo",
-                "xtask",
-                "visual-quality",
-                "--display",
-                "nested-xwayland",
-                "--input",
-                "1280x720",
-                "--output",
-                "2160x1440",
-                "--warmup",
-                "180",
-                "--frames",
-                "120",
-            ],
-        ),
-    ];
-    for (name, args) in gates {
+    for (name, args) in proton_acceptance_gate_commands() {
         if !run_gate_command(root, &options.evidence_dir, name, &args) {
             eprintln!("cargo xtask proton-acceptance: pre-Proton gate failed: {name}");
             return false;
@@ -4109,10 +4136,11 @@ mod tests {
         maintenance_evidence_complete, maintenance_output_is_valid, parse_backend_args,
         parse_maintenance_evidence, parse_preset_medians, parse_proton_acceptance_args,
         parse_public_x11_display, parse_visual_quality_args, parse_vkcube_args,
-        parse_vkcube_evidence, parse_wsi_compatibility_args, proton_launchers_on_path,
-        quality_ablation_rows, quality_fixture_passes, quality_metric_lines, quality_preset_rows,
-        visual_quality_metrics_for_test, vkcube_control_sequence_is_valid, vkcube_launch_in,
-        vkcube_output_is_valid, wsi_compatibility_output_is_valid, x11_display_is_available_with,
+        parse_vkcube_evidence, parse_wsi_compatibility_args, proton_acceptance_gate_commands,
+        proton_launchers_on_path, quality_ablation_rows, quality_fixture_passes,
+        quality_metric_lines, quality_preset_rows, visual_quality_metrics_for_test,
+        vkcube_control_sequence_is_valid, vkcube_launch_in, vkcube_output_is_valid,
+        wsi_compatibility_output_is_valid, x11_display_is_available_with,
     };
     use std::path::Path;
 
@@ -4231,6 +4259,49 @@ mod tests {
                 game_command: vec!["steam".into(), "-applaunch".into(), "123".into()],
                 preflight_only: false,
             }
+        );
+    }
+
+    #[test]
+    fn proton_acceptance_gates_pin_fsr_and_allow_radv_timing_exception() {
+        let gates = proton_acceptance_gate_commands();
+        let args_for = |name: &str| {
+            gates
+                .iter()
+                .find(|(gate_name, _)| *gate_name == name)
+                .map(|(_, args)| args.as_slice())
+                .unwrap_or_else(|| panic!("missing gate {name}"))
+        };
+
+        assert_eq!(
+            args_for("gpu-check"),
+            ["cargo", "xtask", "gpu-check", "--backend", "fsr_3_1_4"]
+        );
+        assert_eq!(
+            args_for("wsi-compatibility"),
+            [
+                "cargo",
+                "xtask",
+                "wsi-compatibility",
+                "--backend",
+                "fsr_3_1_4",
+                "--allow-unverified",
+                "display_timing"
+            ]
+        );
+        assert_eq!(
+            args_for("vkcube"),
+            [
+                "cargo",
+                "xtask",
+                "vkcube",
+                "--release",
+                "--seconds",
+                "20",
+                "--backend",
+                "fsr_3_1_4",
+                "--control-sequence"
+            ]
         );
     }
 
