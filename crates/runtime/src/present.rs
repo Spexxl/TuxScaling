@@ -119,6 +119,16 @@ fn submitted_fences(fences: &[vk::Fence]) -> Vec<vk::Fence> {
         .collect()
 }
 
+fn window_mode_name(temporal_enabled: bool, fullscreen: bool) -> &'static str {
+    if temporal_enabled {
+        "Presenter window"
+    } else if fullscreen {
+        "Fullscreen"
+    } else {
+        "Windowed"
+    }
+}
+
 const GPU_PHASES: usize = 15;
 const GPU_TIMESTAMPS: usize = 18;
 const GPU_WARMUP_FRAMES: u64 = 180;
@@ -823,8 +833,6 @@ impl SwapchainRuntime {
                 }
             }
         });
-        let promoted_borderless =
-            diagnostic_resolution.game_extent != diagnostic_resolution.output_extent && fullscreen;
         let monitor = monitor.map_or_else(
             || {
                 format!(
@@ -908,14 +916,7 @@ impl SwapchainRuntime {
                 }
                 .into(),
                 presenter_state: if temporal_enabled { "active" } else { "direct" }.into(),
-                window_mode: if promoted_borderless {
-                    "Promoted borderless"
-                } else if fullscreen {
-                    "Fullscreen"
-                } else {
-                    "Windowed"
-                }
-                .into(),
+                window_mode: window_mode_name(temporal_enabled, fullscreen).into(),
                 monitor,
                 game_extent: [
                     diagnostic_resolution.game_extent.width,
@@ -1132,7 +1133,12 @@ impl SwapchainRuntime {
         self.diagnostics.presenter_state =
             if temporal_enabled { "active" } else { "direct" }.into();
         self.diagnostics.presentation_mode = "Virtual upscale".into();
-        self.diagnostics.window_mode = "Promoted borderless".into();
+        self.diagnostics.window_mode = if temporal_enabled {
+            "Presenter window"
+        } else {
+            "Direct output"
+        }
+        .into();
         eprintln!(
             "TuxScaling evidence event=native_generation_published logical={}x{} physical={}x{} backend={} images={}",
             self.temporal.resolution.game_extent.width,
@@ -2787,7 +2793,7 @@ mod tests {
     use super::{
         GPU_PHASES, GpuTimingWindow, SwapchainImages, backend_debug_view, debug_mode_id,
         fallback_backend_input_diagnostics, record_secondary_transaction, submitted_fences,
-        update_backend_input_diagnostics,
+        update_backend_input_diagnostics, window_mode_name,
     };
     use ash::vk;
     use ash::vk::Handle;
@@ -2858,6 +2864,13 @@ mod tests {
         assert_eq!(backend_debug_view(6), 1);
         assert_eq!(backend_debug_view(10), 5);
         assert_eq!(backend_debug_view(4), 0);
+    }
+
+    #[test]
+    fn diagnostics_distinguish_presenter_from_application_window_modes() {
+        assert_eq!(window_mode_name(true, false), "Presenter window");
+        assert_eq!(window_mode_name(false, true), "Fullscreen");
+        assert_eq!(window_mode_name(false, false), "Windowed");
     }
 
     #[test]
