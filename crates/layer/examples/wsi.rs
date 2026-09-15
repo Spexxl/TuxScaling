@@ -2637,10 +2637,12 @@ unsafe fn run() -> WsiOutcome {
                 frame >= 8,
                 "maintenance scenario did not present enough frames"
             );
-            assert!(
-                grouped >= 2,
-                "maintenance scenario did not group enough presents"
-            );
+            if requires_grouped_presents(window_count) {
+                assert!(
+                    grouped >= 2,
+                    "maintenance scenario did not group enough presents"
+                );
+            }
         }
         if mutable_scenario {
             assert!(mutable_views_validated);
