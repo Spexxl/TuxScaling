@@ -143,6 +143,7 @@ pub struct OverlayRenderer {
     slots: Vec<Slot>,
     input: Option<SharedInput>,
     visible: bool,
+    software_cursor_visible: Option<bool>,
     context: egui::Context,
 }
 
@@ -173,6 +174,7 @@ impl OverlayRenderer {
             slots: Vec::new(),
             input: input_route.and_then(shared_input),
             visible: false,
+            software_cursor_visible: None,
             context: egui::Context::default(),
         };
         let attachments = [vk::AttachmentDescription::default()
@@ -287,6 +289,14 @@ impl OverlayRenderer {
             input.pointer_position,
             input.pointer_present,
         );
+        if self.software_cursor_visible != Some(frame.software_cursor_visible) {
+            eprintln!(
+                "TuxScaling evidence event=software_cursor visible={} overlay={}",
+                u8::from(frame.software_cursor_visible),
+                u8::from(self.visible),
+            );
+            self.software_cursor_visible = Some(frame.software_cursor_visible);
+        }
         for slot in &mut self.slots {
             slot.pending_textures
                 .extend(frame.textures_delta.set.iter().cloned());
