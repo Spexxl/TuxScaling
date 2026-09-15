@@ -129,7 +129,11 @@ Proton/R.E.P.O. acceptance is opt-in and never infers a game command. Probe the 
 cargo xtask proton-acceptance --evidence-dir target/proton-evidence --preflight-only
 ```
 
-A full session still requires `--game-command -- <explicit game command>`. For a finite normal-exit maintenance regression, use the display-backed environment and command below after the maintenance smoke gates:
+A full session still requires `--game-command -- <explicit game command>`. The wrapper pins its prerequisite GPU, WSI, `vkcube`, and visual-quality checks to the FSR 3.1.4 backend; on RADV, only a clean `VK_GOOGLE_display_timing` unavailability may be explicitly allowed with `--allow-unverified display_timing`.
+
+After the game exits, the wrapper validates the complete `proton-session.log` instead of trusting a zero exit status. A valid run must contain the logical game extent, a distinct native presenter extent, presenter publication, active virtualization, repeated FSR dispatch and reconstructed-present events, an egui open/close transition, visible software-cursor evidence, an active input route, and at least three complete FSR capture manifests with their resource files. Validation-layer errors, presenter fallback, panic, missing interaction evidence, incomplete captures, or a failed game process make the gate fail. The acceptance command never invents a game executable; pass the real Proton/Wine command explicitly.
+
+For a finite normal-exit maintenance regression, use the display-backed environment and command below after the maintenance smoke gates:
 
 ```bash
 env \
