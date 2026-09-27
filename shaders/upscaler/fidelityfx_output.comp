@@ -8,9 +8,16 @@ layout(push_constant) uniform Params {
     uint output_height;
     vec2 viewport_offset;
     vec2 viewport_size;
+    uint encode_srgb;
 } params;
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+vec3 linear_to_srgb(vec3 color) {
+    vec3 linear_segment = color * 12.92;
+    vec3 power_segment = 1.055 * pow(max(color, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+    return mix(power_segment, linear_segment, lessThanEqual(color, vec3(0.0031308)));
+}
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -28,5 +35,9 @@ void main() {
         return;
     }
 
-    imageStore(output_image, pixel, texture(fsr_output, local));
+    vec4 color = texture(fsr_output, local);
+    if (params.encode_srgb != 0u) {
+        color.rgb = linear_to_srgb(color.rgb);
+    }
+    imageStore(output_image, pixel, color);
 }

@@ -1,9 +1,9 @@
 use super::{
     FsrInputAdapter, NativeContext, TUX_FFX_CREATE_DEBUG_CHECKING, TUX_FFX_CREATE_DEPTH_INFINITE,
     TUX_FFX_CREATE_DEPTH_INVERTED, TUX_FFX_CREATE_MOTION_VECTORS_JITTER_CANCELLATION,
-    TUX_FFX_CREATE_NON_LINEAR_COLORSPACE, TUX_FFX_IMAGE_STATE_COMPUTE_READ,
-    TUX_FFX_IMAGE_STATE_UNORDERED_ACCESS, TUX_FFX_IMAGE_USAGE_READ_ONLY, TUX_FFX_IMAGE_USAGE_UAV,
-    TuxFfxCreateInfo, TuxFfxDispatchInfo,
+    TUX_FFX_IMAGE_STATE_COMPUTE_READ, TUX_FFX_IMAGE_STATE_UNORDERED_ACCESS,
+    TUX_FFX_IMAGE_USAGE_READ_ONLY, TUX_FFX_IMAGE_USAGE_UAV, TuxFfxCreateInfo, TuxFfxDispatchInfo,
+    color::{FsrColorAdapter, FsrColorPlan},
 };
 use crate::{
     BackendCapabilities, BackendColorEncoding, BackendConfig, BackendEnvironment, BackendError,
@@ -29,10 +29,13 @@ const INTERNAL_FORMATS: &[vk::Format] = &[
     vk::Format::R32_SFLOAT,
     vk::Format::R8_UNORM,
 ];
+const OUTPUT_PUSH_CONSTANT_WORDS: usize = 7;
+const OUTPUT_PUSH_CONSTANT_SIZE: u32 = (OUTPUT_PUSH_CONSTANT_WORDS * size_of::<u32>()) as u32;
 
 pub struct Fsr314Upscaler {
     device: ash::Device,
     native: NativeContext,
+    color: FsrColorAdapter,
     input: FsrInputAdapter,
     outputs: Vec<Image>,
     output_initialized: Vec<bool>,
@@ -80,6 +83,7 @@ impl Fsr314Upscaler {
         if config.color_encoding != BackendColorEncoding::SrgbNonlinear {
             return Err(BackendError::InvalidMetadata("FidelityFX color encoding"));
         }
+        let color_plan = FsrColorPlan::for_source(config.source_format, config.color_encoding)?;
         let game_extent = FrameExtent {
             width: config.game_extent.width,
             height: config.game_extent.height,
@@ -165,6 +169,9 @@ impl Fsr314Upscaler {
             );
         }
 
+        let color = unsafe {
+            FsrColorAdapter::new(environment, config.game_extent, image_count, color_plan)
+        }?;
         let input = unsafe { FsrInputAdapter::new(environment, config.game_extent, image_count) }?;
         let library = super::FidelityFxLibrary::load_bundled()?;
         let create_info = TuxFfxCreateInfo {
@@ -208,7 +215,6 @@ impl Fsr314Upscaler {
             flags: TUX_FFX_CREATE_DEPTH_INVERTED
                 | TUX_FFX_CREATE_DEPTH_INFINITE
                 | TUX_FFX_CREATE_MOTION_VECTORS_JITTER_CANCELLATION
-                | TUX_FFX_CREATE_NON_LINEAR_COLORSPACE
                 | TUX_FFX_CREATE_DEBUG_CHECKING,
             vulkan_api_version: environment.vulkan_api_version,
         };
@@ -284,7 +290,7 @@ impl Fsr314Upscaler {
                     .push_constant_ranges(&[vk::PushConstantRange {
                         stage_flags: vk::ShaderStageFlags::COMPUTE,
                         offset: 0,
-                        size: 24,
+                        size: OUTPUT_PUSH_CONSTANT_SIZE,
                     }]),
                 None,
             )
@@ -327,6 +333,7 @@ impl Fsr314Upscaler {
         Ok(Self {
             device,
             native,
+            color,
             input,
             outputs,
             output_initialized: vec![false; image_count],
@@ -394,13 +401,17 @@ impl Fsr314Upscaler {
                 &[set],
                 &[],
             );
-            let params = [
+            let params: [u32; OUTPUT_PUSH_CONSTANT_WORDS] = [
                 frame.output.extent.width,
                 frame.output.extent.height,
                 self.config.viewport.offset[0].to_bits(),
                 self.config.viewport.offset[1].to_bits(),
                 self.config.viewport.size[0].to_bits(),
                 self.config.viewport.size[1].to_bits(),
+                u32::from(
+                    self.color.plan().output_encoding
+                        == super::color::FsrOutputEncoding::SrgbNonlinear,
+                ),
             ];
             self.device.cmd_push_constants(
                 frame.command_buffer,
@@ -461,6 +472,7 @@ impl UpscalerBackend for Fsr314Upscaler {
         self.input_diagnostics =
             super::input::FsrInputPolicy::from_guidance(guidance).diagnostics();
         let inputs = self.input.outputs(slot);
+        let linear_color = unsafe { self.color.record(frame.command_buffer, slot, frame.source) };
         unsafe {
             self.input
                 .record(frame.command_buffer, slot, frame.frame_id, guidance)?;
@@ -482,7 +494,7 @@ impl UpscalerBackend for Fsr314Upscaler {
         let dispatch = TuxFfxDispatchInfo {
             command_buffer: frame.command_buffer.as_raw(),
             color: image_info(
-                frame.source,
+                linear_color,
                 TUX_FFX_IMAGE_USAGE_READ_ONLY,
                 TUX_FFX_IMAGE_STATE_COMPUTE_READ,
             ),
@@ -619,8 +631,17 @@ fn fsr_jitter_offset(jitter: JitterSample) -> [f32; 2] {
 
 #[cfg(test)]
 mod tests {
-    use super::fsr_jitter_offset;
+    use super::{OUTPUT_PUSH_CONSTANT_SIZE, OUTPUT_PUSH_CONSTANT_WORDS, fsr_jitter_offset};
+    use std::mem::size_of;
     use tuxscaling_temporal::JitterSample;
+
+    #[test]
+    fn output_push_constant_payload_matches_pipeline_range() {
+        assert_eq!(
+            size_of::<[u32; OUTPUT_PUSH_CONSTANT_WORDS]>() as u32,
+            OUTPUT_PUSH_CONSTANT_SIZE
+        );
+    }
 
     #[test]
     fn fsr_jitter_offset_preserves_pixel_units_and_expected_sign() {

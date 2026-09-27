@@ -1,0 +1,31 @@
+#version 450
+
+layout(set = 0, binding = 0) uniform sampler2D source_color;
+layout(rgba16f, set = 0, binding = 1) writeonly uniform image2D linear_color;
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint decode_srgb;
+} params;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+vec3 srgb_to_linear(vec3 color) {
+    vec3 linear_segment = color / 12.92;
+    vec3 power_segment = pow((color + 0.055) / 1.055, vec3(2.4));
+    return mix(power_segment, linear_segment, lessThanEqual(color, vec3(0.04045)));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(params.width) || pixel.y >= int(params.height)) {
+        return;
+    }
+
+    vec4 color = texelFetch(source_color, pixel, 0);
+    if (params.decode_srgb != 0u) {
+        color.rgb = srgb_to_linear(color.rgb);
+    }
+    imageStore(linear_color, pixel, color);
+}

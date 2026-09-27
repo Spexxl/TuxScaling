@@ -1,4 +1,5 @@
 mod backend;
+pub mod color;
 mod ffi;
 mod input;
 mod library;
