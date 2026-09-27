@@ -10,7 +10,7 @@ use tuxscaling_temporal::{
     GuidanceResolution, GuidanceResource, GuidanceScalar, GuidanceView, JitterSample,
     MotionDirection, MotionUnits, SignalState,
 };
-use tuxscaling_upscaler::fidelityfx::Fsr314Upscaler;
+use tuxscaling_upscaler::fidelityfx::{Fsr314Upscaler, FsrCapturePolicy, ReactivePolicy};
 use tuxscaling_upscaler::{
     BackendColorEncoding, BackendConfig, BackendEnvironment, BackendFrame, BackendImage,
     ReferenceUpscaler, UpscalerBackend, content_viewport,
@@ -283,6 +283,66 @@ fn fsr_guidance_modes_and_single_signal_ablations_are_distinct_and_coherent() {
         assert_eq!(result.second_guidance.states, expected_states, "{name}");
         if ablations.post_capture_jitter {
             assert_eq!(result.first_guidance.jitter, JitterSample::default());
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU with the FidelityFX storage-image formats"]
+fn fsr_capture_policy_training_matrix_reports_warmed_frame_quality() {
+    let gpu = unsafe { Gpu::new() };
+    let physical = unsafe { gpu.instance.enumerate_physical_devices() }.unwrap()[0];
+    let environment = BackendEnvironment::new(&gpu.instance, physical, &gpu.device);
+    let policies = [
+        ("neutral", FsrCapturePolicy::default()),
+        (
+            "constant_0_2",
+            FsrCapturePolicy::new(ReactivePolicy::Constant(0.2), false).unwrap(),
+        ),
+        (
+            "constant_0_8",
+            FsrCapturePolicy::new(ReactivePolicy::Constant(0.8), false).unwrap(),
+        ),
+        (
+            "adaptive",
+            FsrCapturePolicy::new(ReactivePolicy::Adaptive, true).unwrap(),
+        ),
+    ];
+
+    for (case_index, (name, factory)) in captured_sequence_catalog().into_iter().take(4).enumerate()
+    {
+        let fixture = factory(INPUT.width, INPUT.height);
+        let source = scene_bytes(case_index, INPUT);
+        let second_source = fixture_scene_bytes(case_index, &fixture, INPUT);
+        let first_expected = expected_pixels(case_index, OUTPUT);
+        let second_expected = fixture_expected_pixels(case_index, &fixture, OUTPUT);
+        for (policy_name, policy) in policies {
+            let result = unsafe {
+                run_fsr_variant_with_policy(
+                    &gpu,
+                    &environment,
+                    &fixture,
+                    &source,
+                    &second_source,
+                    false,
+                    GuidanceAblations::NONE,
+                    policy,
+                )
+            };
+            let psnr = psnr(&result.second, &second_expected);
+            let ssim = ssim(&result.second, &second_expected);
+            let flicker = temporal_error(
+                &result.first,
+                &result.second,
+                &first_expected,
+                &second_expected,
+            );
+            eprintln!(
+                "FSR policy training: sequence={name} policy={policy_name} warmed_psnr={psnr:.3}dB warmed_ssim={ssim:.5} temporal_error={flicker:.6}"
+            );
+            assert!(psnr.is_finite());
+            assert!(ssim.is_finite());
+            assert!(flicker.is_finite());
         }
     }
 }
@@ -919,6 +979,30 @@ unsafe fn run_fsr_variant(
     zero_guidance: bool,
     ablations: GuidanceAblations,
 ) -> FsrVariantResult {
+    unsafe {
+        run_fsr_variant_with_policy(
+            gpu,
+            environment,
+            fixture,
+            source_bytes,
+            second_source_bytes,
+            zero_guidance,
+            ablations,
+            FsrCapturePolicy::default(),
+        )
+    }
+}
+
+unsafe fn run_fsr_variant_with_policy(
+    gpu: &Gpu,
+    environment: &BackendEnvironment,
+    fixture: &SequenceFixture,
+    source_bytes: &[u8],
+    second_source_bytes: &[u8],
+    zero_guidance: bool,
+    ablations: GuidanceAblations,
+    capture_policy: FsrCapturePolicy,
+) -> FsrVariantResult {
     let images = unsafe { Images::new(gpu) };
     let uploads = unsafe { Uploads::new(gpu) };
     let guidance = images.guidance_with_controls(fixture, 1, true, zero_guidance, ablations);
@@ -940,6 +1024,7 @@ unsafe fn run_fsr_variant(
         guidance: guidance.capabilities(),
     };
     let mut backend = unsafe { Fsr314Upscaler::new(environment, config, guidance, 1) }.unwrap();
+    backend.set_capture_policy(capture_policy);
     unsafe {
         upload_frame(
             gpu,

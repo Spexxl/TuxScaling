@@ -4,6 +4,7 @@ use super::{
     TUX_FFX_IMAGE_STATE_COMPUTE_READ, TUX_FFX_IMAGE_STATE_UNORDERED_ACCESS,
     TUX_FFX_IMAGE_USAGE_READ_ONLY, TUX_FFX_IMAGE_USAGE_UAV, TuxFfxCreateInfo, TuxFfxDispatchInfo,
     color::{FsrColorAdapter, FsrColorPlan},
+    policy::{FsrCapturePolicy, FsrCapturePolicyState, fsr_jitter_offset},
 };
 use crate::{
     BackendCapabilities, BackendColorEncoding, BackendConfig, BackendEnvironment, BackendError,
@@ -12,7 +13,7 @@ use crate::{
 use ash::vk;
 use ash::vk::Handle;
 use std::io::Cursor;
-use tuxscaling_temporal::{FrameExtent, GuidanceView, JitterSample};
+use tuxscaling_temporal::{FrameExtent, GuidanceView};
 use tuxscaling_vulkan::{Image, image_barrier};
 
 const FSR_COLOR_FORMATS: &[vk::Format] = &[
@@ -47,6 +48,7 @@ pub struct Fsr314Upscaler {
     pipeline: vk::Pipeline,
     config: BackendConfig,
     input_diagnostics: BackendInputDiagnostics,
+    capture_policy: FsrCapturePolicyState,
 }
 
 impl Fsr314Upscaler {
@@ -212,10 +214,7 @@ impl Fsr314Upscaler {
             max_render_height: config.game_extent.height,
             max_output_width: content_extent.width,
             max_output_height: content_extent.height,
-            flags: TUX_FFX_CREATE_DEPTH_INVERTED
-                | TUX_FFX_CREATE_DEPTH_INFINITE
-                | TUX_FFX_CREATE_MOTION_VECTORS_JITTER_CANCELLATION
-                | TUX_FFX_CREATE_DEBUG_CHECKING,
+            flags: fsr_create_flags(),
             vulkan_api_version: environment.vulkan_api_version,
         };
         let native = NativeContext::create(library, create_info)?;
@@ -345,7 +344,16 @@ impl Fsr314Upscaler {
             pipeline,
             config,
             input_diagnostics: BackendInputDiagnostics::default(),
+            capture_policy: FsrCapturePolicyState::new(FsrCapturePolicy::default()),
         })
+    }
+
+    pub fn set_capture_policy(&mut self, policy: FsrCapturePolicy) -> bool {
+        self.capture_policy.request(policy)
+    }
+
+    pub fn capture_policy(&self) -> FsrCapturePolicy {
+        self.capture_policy.active()
     }
 
     fn capabilities_static() -> BackendCapabilities {
@@ -469,13 +477,19 @@ impl UpscalerBackend for Fsr314Upscaler {
         frame.validate(self.config, self.capabilities())?;
         let slot = frame.slot % self.outputs.len();
         let guidance = frame.guidance;
+        let capture_policy = self.capture_policy.active();
         self.input_diagnostics =
-            super::input::FsrInputPolicy::from_guidance(guidance).diagnostics();
+            super::input::FsrInputPolicy::from_guidance(guidance).diagnostics(capture_policy);
         let inputs = self.input.outputs(slot);
         let linear_color = unsafe { self.color.record(frame.command_buffer, slot, frame.source) };
         unsafe {
-            self.input
-                .record(frame.command_buffer, slot, frame.frame_id, guidance)?;
+            self.input.record(
+                frame.command_buffer,
+                slot,
+                frame.frame_id,
+                guidance,
+                capture_policy,
+            )?;
         }
 
         let output_was_initialized = self.output_initialized[slot];
@@ -546,11 +560,16 @@ impl UpscalerBackend for Fsr314Upscaler {
             render_height: self.config.game_extent.height,
             output_width: content_extent(self.config).width,
             output_height: content_extent(self.config).height,
-            reset: u32::from(frame.reset_history || frame.guidance.requires_history_reset),
+            reset: u32::from(
+                frame.reset_history
+                    || frame.guidance.requires_history_reset
+                    || self.capture_policy.reset_pending(),
+            ),
             enable_sharpening: u32::from(frame.output_sharpening.enabled),
             sharpness: frame.output_sharpening.effective_sharpness(),
         };
         unsafe { self.native.dispatch(&dispatch)? };
+        self.capture_policy.finish_dispatch(true);
         if !output_was_initialized {
             unsafe {
                 image_barrier(
@@ -621,17 +640,18 @@ fn content_extent(config: BackendConfig) -> vk::Extent2D {
     }
 }
 
-fn fsr_jitter_offset(jitter: JitterSample) -> [f32; 2] {
-    if jitter.signal_state() == tuxscaling_temporal::SignalState::Estimated {
-        [-jitter.current[0], -jitter.current[1]]
-    } else {
-        [0.0, 0.0]
-    }
+fn fsr_create_flags() -> u32 {
+    TUX_FFX_CREATE_DEPTH_INVERTED
+        | TUX_FFX_CREATE_DEPTH_INFINITE
+        | TUX_FFX_CREATE_MOTION_VECTORS_JITTER_CANCELLATION
+        | TUX_FFX_CREATE_DEBUG_CHECKING
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{OUTPUT_PUSH_CONSTANT_SIZE, OUTPUT_PUSH_CONSTANT_WORDS, fsr_jitter_offset};
+    use super::{
+        OUTPUT_PUSH_CONSTANT_SIZE, OUTPUT_PUSH_CONSTANT_WORDS, fsr_create_flags, fsr_jitter_offset,
+    };
     use std::mem::size_of;
     use tuxscaling_temporal::JitterSample;
 
@@ -653,5 +673,13 @@ mod tests {
 
         assert_eq!(fsr_jitter_offset(jitter), [-0.25, 0.125]);
         assert_eq!(fsr_jitter_offset(JitterSample::default()), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn fsr_context_uses_the_jittered_motion_vector_convention() {
+        assert_ne!(
+            fsr_create_flags() & super::TUX_FFX_CREATE_MOTION_VECTORS_JITTER_CANCELLATION,
+            0
+        );
     }
 }

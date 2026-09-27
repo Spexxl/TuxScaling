@@ -285,6 +285,7 @@ pub(crate) struct DiagnosticFsrInputs {
     pub(crate) exposure: String,
     pub(crate) reactive: String,
     pub(crate) composition: String,
+    pub(crate) history_risk: String,
     pub(crate) jitter: String,
 }
 
@@ -297,6 +298,7 @@ impl Default for DiagnosticFsrInputs {
             exposure: "NotReported".into(),
             reactive: "NotReported".into(),
             composition: "NotReported".into(),
+            history_risk: "NotReported".into(),
             jitter: "NotReported".into(),
         }
     }
@@ -921,7 +923,7 @@ fn metadata_json(pending: &PendingCapture, frame_prefix: &str) -> String {
             "  \"guidance_mode\":{},\n",
             "  \"ablations\":{{\"motion\":{},\"relative_depth\":{},\"reactive\":{},\"composition\":{},\"exposure\":{},\"confidence_disocclusion\":{},\"post_capture_jitter\":{}}},\n",
             "  \"sharpening\":{{\"enabled\":{},\"sharpness\":{:.6}}},\n",
-            "  \"fsr_inputs\":{{\"motion\":{},\"confidence\":{},\"depth\":{},\"exposure\":{},\"reactive\":{},\"composition\":{},\"jitter\":{}}},\n",
+            "  \"fsr_inputs\":{{\"motion\":{},\"confidence\":{},\"depth\":{},\"exposure\":{},\"reactive\":{},\"composition\":{},\"history_risk\":{},\"jitter\":{}}},\n",
             "  \"history_age\":{},\n",
             "  \"gpu_timings_ms\":[{}],\n",
             "  \"resources\":[{}]\n",
@@ -967,6 +969,7 @@ fn metadata_json(pending: &PendingCapture, frame_prefix: &str) -> String {
         json_string(&metadata.fsr_inputs.exposure),
         json_string(&metadata.fsr_inputs.reactive),
         json_string(&metadata.fsr_inputs.composition),
+        json_string(&metadata.fsr_inputs.history_risk),
         json_string(&metadata.fsr_inputs.jitter),
         metadata.history_age,
         timings,
@@ -1259,6 +1262,7 @@ mod tests {
                     exposure: "SuppressedIncompatible".into(),
                     reactive: "Neutral".into(),
                     composition: "Neutral".into(),
+                    history_risk: "ProducedForProtection".into(),
                     jitter: "Neutral".into(),
                 },
                 history_age: 4,
@@ -1288,6 +1292,7 @@ mod tests {
         assert!(json.contains("\"relative_depth\":true"));
         assert!(json.contains("\"sharpness\":0.200000"));
         assert!(json.contains("\"fsr_inputs\":{\"motion\":\"Estimated\""));
+        assert!(json.contains("\"history_risk\":\"ProducedForProtection\""));
         assert!(json.contains("\"depth\":\"SuppressedIncompatible\""));
         assert!(json.contains("frame-00000007-source.bin"));
     }

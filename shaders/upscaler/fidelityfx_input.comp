@@ -11,11 +11,15 @@ layout(rg16f, set = 0, binding = 6) uniform image2D fsr_motion;
 layout(r32f, set = 0, binding = 7) uniform image2D fsr_depth;
 layout(r8, set = 0, binding = 8) uniform image2D fsr_reactive;
 layout(r8, set = 0, binding = 9) uniform image2D fsr_composition;
+layout(r8, set = 0, binding = 10) uniform image2D fsr_history_risk;
 
 layout(push_constant) uniform Params {
     uint width;
     uint height;
     uint use_estimated_motion;
+    uint reactive_mode;
+    float reactive_constant;
+    uint use_composition;
 } params;
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -32,15 +36,46 @@ void main() {
     float reactive = texelFetch(reactive_image, pixel, 0).r;
     float composition = texelFetch(composition_image, pixel, 0).r;
 
-    vec2 sanitized_motion = params.use_estimated_motion != 0u && confidence > 0.05
-        ? motion
-        : vec2(0.0);
+    bool valid_guidance = params.use_estimated_motion != 0u;
+    bool finite_motion = !any(isnan(motion)) && !any(isinf(motion));
+    vec2 sanitized_motion = valid_guidance && finite_motion ? motion : vec2(0.0);
+    vec2 target = vec2(pixel) + sanitized_motion;
+    bool in_bounds = all(greaterThanEqual(target, vec2(0.0))) &&
+        all(lessThan(target, vec2(params.width, params.height)));
+    float safe_confidence = (isnan(confidence) || isinf(confidence))
+        ? 0.0
+        : clamp(confidence, 0.0, 1.0);
+    float safe_disocclusion = (isnan(disocclusion) || isinf(disocclusion))
+        ? 1.0
+        : clamp(disocclusion, 0.0, 1.0);
+    float confidence_risk = smoothstep(0.2, 0.8, 1.0 - safe_confidence);
+    float history_risk = valid_guidance
+        ? max(max(safe_disocclusion, confidence_risk), (!finite_motion || !in_bounds) ? 1.0 : 0.0)
+        : 1.0;
+    float safe_reactive = (isnan(reactive) || isinf(reactive))
+        ? 0.0
+        : clamp(reactive, 0.0, 1.0);
     float fsr_reactive_value = 0.0;
-    float fsr_composition_value = 0.0;
+    if (valid_guidance && params.reactive_mode == 1u) {
+        fsr_reactive_value = clamp(params.reactive_constant, 0.0, 0.9);
+    } else if (valid_guidance && params.reactive_mode == 2u) {
+        fsr_reactive_value = clamp(
+            max(safe_reactive, 0.9 * smoothstep(0.6, 0.95, history_risk)),
+            0.0,
+            0.9
+        );
+    }
+    float safe_composition = (isnan(composition) || isinf(composition))
+        ? 0.0
+        : clamp(composition, 0.0, 1.0);
+    float fsr_composition_value = valid_guidance && params.use_composition != 0u
+        ? max(safe_composition, 0.5 * history_risk)
+        : 0.0;
     float fsr_depth_value = 0.0;
 
     imageStore(fsr_motion, pixel, vec4(sanitized_motion, 0.0, 1.0));
     imageStore(fsr_depth, pixel, vec4(fsr_depth_value, 0.0, 0.0, 1.0));
     imageStore(fsr_reactive, pixel, vec4(fsr_reactive_value, 0.0, 0.0, 1.0));
     imageStore(fsr_composition, pixel, vec4(fsr_composition_value, 0.0, 0.0, 1.0));
+    imageStore(fsr_history_risk, pixel, vec4(history_risk, 0.0, 0.0, 1.0));
 }

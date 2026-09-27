@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use super::policy::{FsrCapturePolicy, ReactivePolicy};
 use crate::{
     BackendEnvironment, BackendError, BackendImage, BackendInputDiagnostics, BackendInputState,
 };
@@ -13,6 +14,7 @@ pub(crate) struct FsrInputs {
     pub depth: BackendImage,
     pub reactive: BackendImage,
     pub composition: BackendImage,
+    pub history_risk: BackendImage,
     pub exposure: BackendImage,
 }
 
@@ -46,7 +48,7 @@ impl FsrInputPolicy {
         }
     }
 
-    pub(crate) fn diagnostics(self) -> BackendInputDiagnostics {
+    pub(crate) fn diagnostics(self, policy: FsrCapturePolicy) -> BackendInputDiagnostics {
         BackendInputDiagnostics {
             motion: if self.use_estimated_motion {
                 BackendInputState::Estimated
@@ -60,8 +62,17 @@ impl FsrInputPolicy {
             },
             depth: BackendInputState::SuppressedIncompatible,
             exposure: BackendInputState::SuppressedIncompatible,
-            reactive: BackendInputState::Neutral,
-            composition: BackendInputState::Neutral,
+            reactive: if matches!(policy.reactive(), ReactivePolicy::Neutral) {
+                BackendInputState::Neutral
+            } else {
+                BackendInputState::Applied
+            },
+            composition: if policy.use_composition() {
+                BackendInputState::Applied
+            } else {
+                BackendInputState::Neutral
+            },
+            history_risk: BackendInputState::Produced,
             jitter: if self.use_estimated_jitter {
                 BackendInputState::Estimated
             } else {
@@ -76,6 +87,7 @@ struct InputSlot {
     depth: Image,
     reactive: Image,
     composition: Image,
+    history_risk: Image,
 }
 
 impl InputSlot {
@@ -102,6 +114,12 @@ impl InputSlot {
             composition: backend_image(
                 self.composition.handle,
                 self.composition.view,
+                vk::Format::R8_UNORM,
+                extent,
+            ),
+            history_risk: backend_image(
+                self.history_risk.handle,
+                self.history_risk.view,
                 vk::Format::R8_UNORM,
                 extent,
             ),
@@ -182,11 +200,22 @@ impl FsrInputAdapter {
             .map_err(|error| {
                 BackendError::Internal(format!("composition input image: {error:?}"))
             })?;
+            let history_risk = unsafe {
+                Image::new(
+                    &environment.device,
+                    &environment.memory,
+                    extent,
+                    vk::Format::R8_UNORM,
+                    usage,
+                )
+            }
+            .map_err(|error| BackendError::Internal(format!("history risk image: {error:?}")))?;
             slots.push(InputSlot {
                 motion,
                 depth,
                 reactive,
                 composition,
+                history_risk,
             });
         }
 
@@ -220,7 +249,7 @@ impl FsrInputAdapter {
         }
         .map_err(|error| BackendError::Internal(format!("input sampler: {error:?}")))?;
 
-        let bindings = (0..10)
+        let bindings = (0..11)
             .map(|binding| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(binding)
@@ -251,7 +280,7 @@ impl FsrInputAdapter {
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_IMAGE,
-                            descriptor_count: 4 * image_count as u32,
+                            descriptor_count: 5 * image_count as u32,
                         },
                     ]),
                 None,
@@ -274,7 +303,7 @@ impl FsrInputAdapter {
                     .push_constant_ranges(&[vk::PushConstantRange {
                         stage_flags: vk::ShaderStageFlags::COMPUTE,
                         offset: 0,
-                        size: 12,
+                        size: 24,
                     }]),
                 None,
             )
@@ -345,6 +374,7 @@ impl FsrInputAdapter {
         slot: usize,
         frame_id: u64,
         guidance: GuidanceView,
+        capture_policy: FsrCapturePolicy,
     ) -> Result<(), BackendError> {
         let extent = FrameExtent {
             width: self.extent.width,
@@ -399,6 +429,7 @@ impl FsrInputAdapter {
             outputs.depth.view,
             outputs.reactive.view,
             outputs.composition.view,
+            outputs.history_risk.view,
         ];
         let sampled = input_images.map(|image| {
             vk::DescriptorImageInfo::default()
@@ -412,7 +443,7 @@ impl FsrInputAdapter {
                 .image_layout(vk::ImageLayout::GENERAL)
         });
         let set = self.descriptor_sets[slot];
-        let mut writes = Vec::with_capacity(10);
+        let mut writes = Vec::with_capacity(11);
         for (binding, image) in sampled.iter().enumerate() {
             writes.push(
                 vk::WriteDescriptorSet::default()
@@ -438,6 +469,7 @@ impl FsrInputAdapter {
             outputs.depth.handle,
             outputs.reactive.handle,
             outputs.composition.handle,
+            outputs.history_risk.handle,
         ] {
             unsafe {
                 image_barrier(
@@ -468,6 +500,16 @@ impl FsrInputAdapter {
                 self.extent.width,
                 self.extent.height,
                 u32::from(FsrInputPolicy::from_guidance(guidance).use_estimated_motion),
+                match capture_policy.reactive() {
+                    ReactivePolicy::Neutral => 0,
+                    ReactivePolicy::Constant(_) => 1,
+                    ReactivePolicy::Adaptive => 2,
+                },
+                match capture_policy.reactive() {
+                    ReactivePolicy::Constant(value) => value.to_bits(),
+                    ReactivePolicy::Neutral | ReactivePolicy::Adaptive => 0.0_f32.to_bits(),
+                },
+                u32::from(capture_policy.use_composition()),
             ];
             self.device.cmd_push_constants(
                 command,
@@ -529,6 +571,7 @@ fn backend_image(
 
 #[cfg(test)]
 mod tests {
+    use crate::fidelityfx::policy::{FsrCapturePolicy, ReactivePolicy};
     use ash::vk::Handle;
     use tuxscaling_temporal::{
         DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset,
@@ -578,8 +621,9 @@ mod tests {
         for expression in [
             "params.use_estimated_motion != 0u",
             "float fsr_depth_value = 0.0",
-            "float fsr_reactive_value = 0.0",
-            "float fsr_composition_value = 0.0",
+            "imageStore(fsr_history_risk, pixel",
+            "max(safe_composition, 0.5 * history_risk)",
+            "motion : vec2(0.0)",
         ] {
             assert!(
                 shader.contains(expression),
@@ -610,7 +654,7 @@ mod tests {
         );
         let policy = super::FsrInputPolicy::from_guidance(estimated);
         assert!(policy.use_estimated_motion);
-        let diagnostics = policy.diagnostics();
+        let diagnostics = policy.diagnostics(FsrCapturePolicy::default());
         assert_eq!(diagnostics.motion, super::BackendInputState::Estimated);
         assert_eq!(diagnostics.confidence, super::BackendInputState::Estimated);
         assert_eq!(
@@ -623,6 +667,7 @@ mod tests {
         );
         assert_eq!(diagnostics.reactive, super::BackendInputState::Neutral);
         assert_eq!(diagnostics.composition, super::BackendInputState::Neutral);
+        assert_eq!(diagnostics.history_risk, super::BackendInputState::Produced);
         assert_eq!(diagnostics.jitter, super::BackendInputState::Neutral);
 
         let mut resetting = estimated;
@@ -650,7 +695,7 @@ mod tests {
         );
         let policy = super::FsrInputPolicy::from_guidance(zero);
         assert!(!policy.use_estimated_motion);
-        let diagnostics = policy.diagnostics();
+        let diagnostics = policy.diagnostics(FsrCapturePolicy::default());
         assert_eq!(diagnostics.motion, super::BackendInputState::Neutral);
         assert_eq!(diagnostics.confidence, super::BackendInputState::Neutral);
     }
@@ -677,7 +722,39 @@ mod tests {
             phase: 1,
         };
 
-        let diagnostics = super::FsrInputPolicy::from_guidance(estimated).diagnostics();
+        let diagnostics = super::FsrInputPolicy::from_guidance(estimated)
+            .diagnostics(FsrCapturePolicy::default());
         assert_eq!(diagnostics.jitter, super::BackendInputState::Estimated);
+    }
+
+    #[test]
+    fn adapter_diagnostics_distinguish_estimates_from_applied_masks() {
+        let extent = FrameExtent {
+            width: 128,
+            height: 96,
+        };
+        let estimated = guidance(
+            GuidanceMetadata {
+                frame_id: 21,
+                extent,
+                valid_region: tuxscaling_temporal::ValidRegion::full(extent),
+                reset: GuidanceReset::None,
+                valid: true,
+                is_zero: false,
+                requires_history_reset: false,
+            },
+            SignalState::Estimated,
+        );
+        let policy = FsrCapturePolicy::new(ReactivePolicy::Adaptive, true).unwrap();
+        let diagnostics = super::FsrInputPolicy::from_guidance(estimated).diagnostics(policy);
+
+        assert_eq!(diagnostics.reactive, super::BackendInputState::Applied);
+        assert_eq!(diagnostics.composition, super::BackendInputState::Applied);
+        assert_eq!(diagnostics.history_risk, super::BackendInputState::Produced);
+        assert_eq!(estimated.reactive.state, SignalState::Estimated);
+        assert_eq!(
+            estimated.transparency_composition.state,
+            SignalState::Estimated
+        );
     }
 }

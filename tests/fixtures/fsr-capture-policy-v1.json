@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "selected_default": {
+    "reactive": "neutral",
+    "composition": false,
+    "jitter_cancellation": true
+  },
+  "training_candidates": {
+    "constant_reactive": [0.2, 0.8],
+    "adaptive": {
+      "confidence_risk_smoothstep": [0.2, 0.8],
+      "reactive_risk_smoothstep": [0.6, 0.95],
+      "reactive_risk_gain": 0.9,
+      "reactive_cap": 0.9,
+      "composition_risk_gain": 0.5,
+      "history_risk": "max(disocclusion, confidence_risk, out_of_bounds, invalid_motion)",
+      "reactive": "min(max(producer_reactive, reactive_risk_gain * smoothstep(reactive_risk_smoothstep, history_risk)), reactive_cap)",
+      "composition": "max(producer_composition, composition_risk_gain * history_risk)"
+    }
+  }
+}

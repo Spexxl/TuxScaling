@@ -420,6 +420,8 @@ fn signal_name(state: SignalState) -> &'static str {
 fn backend_input_state_name(state: BackendInputState) -> &'static str {
     match state {
         BackendInputState::Estimated => "Estimated",
+        BackendInputState::Applied => "AdapterApplied",
+        BackendInputState::Produced => "ProducedForProtection",
         BackendInputState::Neutral => "Neutral",
         BackendInputState::SuppressedIncompatible => "SuppressedIncompatible",
         BackendInputState::Fallback => "Fallback",
@@ -437,6 +439,7 @@ fn update_backend_input_diagnostics(
     diagnostics.fsr_exposure_state = backend_input_state_name(input.exposure).into();
     diagnostics.fsr_reactive_state = backend_input_state_name(input.reactive).into();
     diagnostics.fsr_composition_state = backend_input_state_name(input.composition).into();
+    diagnostics.fsr_history_risk_state = backend_input_state_name(input.history_risk).into();
     diagnostics.fsr_jitter_state = backend_input_state_name(input.jitter).into();
 }
 
@@ -448,6 +451,7 @@ fn fallback_backend_input_diagnostics() -> BackendInputDiagnostics {
         exposure: BackendInputState::Fallback,
         reactive: BackendInputState::Fallback,
         composition: BackendInputState::Fallback,
+        history_risk: BackendInputState::Fallback,
         jitter: BackendInputState::Fallback,
     }
 }
@@ -1295,6 +1299,7 @@ impl SwapchainRuntime {
                 exposure: self.diagnostics.fsr_exposure_state.clone(),
                 reactive: self.diagnostics.fsr_reactive_state.clone(),
                 composition: self.diagnostics.fsr_composition_state.clone(),
+                history_risk: self.diagnostics.fsr_history_risk_state.clone(),
                 jitter: self.diagnostics.fsr_jitter_state.clone(),
             },
             history_age: self.temporal.history_age,

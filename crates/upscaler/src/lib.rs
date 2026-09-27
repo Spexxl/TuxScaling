@@ -20,6 +20,8 @@ pub enum BackendId {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BackendInputState {
     Estimated,
+    Applied,
+    Produced,
     Neutral,
     SuppressedIncompatible,
     Fallback,
@@ -35,6 +37,7 @@ pub struct BackendInputDiagnostics {
     pub exposure: BackendInputState,
     pub reactive: BackendInputState,
     pub composition: BackendInputState,
+    pub history_risk: BackendInputState,
     pub jitter: BackendInputState,
 }
 

@@ -641,6 +641,46 @@ mod tests {
     }
 
     #[test]
+    fn source_pixel_translations_are_scaled_once_for_guidance_scales_one_and_half() {
+        let guidance_extent = (13, 9);
+        let translations = [
+            [0.5, 0.0],
+            [-0.5, 0.0],
+            [4.0, 0.0],
+            [0.0, 0.5],
+            [0.0, -0.5],
+            [0.0, 4.0],
+        ];
+
+        for game_extent in [guidance_extent, (26, 18)] {
+            let (game_width, game_height) = game_extent;
+            let luma = vec![0.5; (game_width * game_height) as usize];
+            for expected in translations {
+                let input_motion = [
+                    expected[0] * guidance_extent.0 as f32 / game_width as f32,
+                    expected[1] * guidance_extent.1 as f32 / game_height as f32,
+                ];
+                let guidance = CpuGuidance::constant(
+                    guidance_extent.0,
+                    guidance_extent.1,
+                    input_motion,
+                    1.0,
+                    1.0,
+                    1.0,
+                );
+                let resolved = resolve_cpu_guidance(&guidance, game_extent, &luma);
+                assert!(
+                    resolved.motion.iter().all(|motion| {
+                        (motion[0] - expected[0]).abs() < 0.1
+                            && (motion[1] - expected[1]).abs() < 0.1
+                    }),
+                    "expected {expected:?} at game extent {game_extent:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn preserves_translation_and_scale_one_bypasses_the_resolver() {
         let guidance = CpuGuidance::constant(3, 5, [2.0, 1.0], 0.8, 1.0, 0.0);
         let resolved = resolve_cpu_guidance(&guidance, extent(3, 5), &[0.5; 15]);

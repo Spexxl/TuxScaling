@@ -80,6 +80,7 @@ pub struct FrameDiagnostics {
     pub fsr_exposure_state: String,
     pub fsr_reactive_state: String,
     pub fsr_composition_state: String,
+    pub fsr_history_risk_state: String,
     pub fsr_jitter_state: String,
     pub depth_semantics: String,
     pub capture_cpu_ms: f32,
@@ -533,9 +534,10 @@ pub fn render_diagnostics(
                             diagnostics.fsr_exposure_state
                         ));
                         ui.label(format!(
-                            "FSR inputs: reactive {} | composition {} | jitter {}",
+                            "FSR inputs: reactive {} | composition {} | history risk {} | jitter {}",
                             diagnostics.fsr_reactive_state,
                             diagnostics.fsr_composition_state,
+                            diagnostics.fsr_history_risk_state,
                             diagnostics.fsr_jitter_state
                         ));
                     }
