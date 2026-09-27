@@ -946,7 +946,10 @@ dependencies = [
  "ash",
  "bytemuck",
  "libloading",
+ "serde",
+ "serde_json",
  "thiserror",
+ "tuxscaling-motion",
  "tuxscaling-temporal",
  "tuxscaling-vulkan",
 ]

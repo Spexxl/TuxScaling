@@ -1221,7 +1221,7 @@ impl SwapchainRuntime {
         )
     }
 
-    fn diagnostic_metadata(&self, frame_id: u64) -> DiagnosticFrameMetadata {
+    fn diagnostic_metadata(&self, frame_id: u64, slot_index: usize) -> DiagnosticFrameMetadata {
         let viewport = content_viewport(
             self.temporal.resolution.game_extent,
             self.temporal.resolution.output_extent,
@@ -1229,6 +1229,41 @@ impl SwapchainRuntime {
         DiagnosticFrameMetadata {
             frame_id,
             generation_id: self.generation_id,
+            slot_index: slot_index as u32,
+            slot_count: self.output_images.len().min(u32::MAX as usize) as u32,
+            motion_slot_index: self.temporal.history.write_index() as u32,
+            timestamp_ns: self.temporal.pending_time.as_nanos().min(u64::MAX as u128) as u64,
+            frame_delta_raw_ns: self
+                .temporal
+                .pending_timing
+                .raw
+                .as_nanos()
+                .min(u64::MAX as u128) as u64,
+            frame_delta_validated_ns: self
+                .temporal
+                .pending_timing
+                .validated
+                .as_nanos()
+                .min(u64::MAX as u128) as u64,
+            frame_delta_smoothed_ns: self
+                .temporal
+                .pending_timing
+                .smoothed
+                .as_nanos()
+                .min(u64::MAX as u128) as u64,
+            guidance_scale: self.temporal.config.guidance_scale,
+            motion_quality: match self.temporal.config.motion_quality {
+                tuxscaling_config::MotionQuality::Ultra => "ultra",
+                tuxscaling_config::MotionQuality::High => "high",
+                tuxscaling_config::MotionQuality::Balanced => "balanced",
+                tuxscaling_config::MotionQuality::Performance => "performance",
+            }
+            .into(),
+            numeric_encoding: if self.info.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR {
+                "srgb_nonlinear".into()
+            } else {
+                format!("unsupported_color_space_{}", self.info.color_space.as_raw())
+            },
             game_extent: [
                 self.temporal.resolution.game_extent.width,
                 self.temporal.resolution.game_extent.height,
@@ -1357,7 +1392,7 @@ impl SwapchainRuntime {
                 ));
             }
         }
-        let metadata = self.diagnostic_metadata(frame_id);
+        let metadata = self.diagnostic_metadata(frame_id, index);
         let Some(capture) = &mut self.diagnostic_capture else {
             return;
         };

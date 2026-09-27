@@ -3,6 +3,9 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::mpsc::{SyncSender, TrySendError, sync_channel},
+    thread,
+    thread::JoinHandle,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tuxscaling_temporal::GuidanceAblations;
@@ -303,6 +306,16 @@ impl Default for DiagnosticFsrInputs {
 pub(crate) struct DiagnosticFrameMetadata {
     pub(crate) frame_id: u64,
     pub(crate) generation_id: u64,
+    pub(crate) slot_index: u32,
+    pub(crate) slot_count: u32,
+    pub(crate) motion_slot_index: u32,
+    pub(crate) timestamp_ns: u64,
+    pub(crate) frame_delta_raw_ns: u64,
+    pub(crate) frame_delta_validated_ns: u64,
+    pub(crate) frame_delta_smoothed_ns: u64,
+    pub(crate) guidance_scale: f32,
+    pub(crate) motion_quality: String,
+    pub(crate) numeric_encoding: String,
     pub(crate) game_extent: [u32; 2],
     pub(crate) guidance_extent: [u32; 2],
     pub(crate) output_extent: [u32; 2],
@@ -342,6 +355,117 @@ struct PendingCapture {
     resources: Vec<CapturedResource>,
 }
 
+struct CaptureWriteTask {
+    root: PathBuf,
+    frame_id: u64,
+    resources: Vec<(String, Vec<u8>)>,
+    metadata: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueueCapture {
+    Queued,
+    Full,
+    Disconnected,
+}
+
+fn try_enqueue_capture(
+    writer: &SyncSender<CaptureWriteTask>,
+    task: CaptureWriteTask,
+) -> EnqueueCapture {
+    match writer.try_send(task) {
+        Ok(()) => EnqueueCapture::Queued,
+        Err(TrySendError::Full(_)) => EnqueueCapture::Full,
+        Err(TrySendError::Disconnected(_)) => EnqueueCapture::Disconnected,
+    }
+}
+
+fn write_capture_task(task: CaptureWriteTask) -> io::Result<()> {
+    let frame_prefix = format!("frame-{:08}", task.frame_id);
+    for (file, bytes) in task.resources {
+        write_atomic(&task.root, &file, &bytes)?;
+    }
+    write_atomic(&task.root, &format!("{frame_prefix}.json"), &task.metadata)
+}
+
+struct CaptureWriter {
+    sender: Option<SyncSender<CaptureWriteTask>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl CaptureWriter {
+    fn enqueue(&self, task: CaptureWriteTask) -> EnqueueCapture {
+        self.sender
+            .as_ref()
+            .map_or(EnqueueCapture::Disconnected, |sender| {
+                try_enqueue_capture(sender, task)
+            })
+    }
+
+    fn shutdown(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.thread.take()
+            && worker.join().is_err()
+        {
+            eprintln!("TuxScaling: diagnostic capture writer thread panicked");
+        }
+    }
+}
+
+impl Drop for CaptureWriter {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn capture_writer() -> Result<CaptureWriter, vk::Result> {
+    let (sender, receiver) = sync_channel::<CaptureWriteTask>(4);
+    let worker = thread::Builder::new()
+        .name("tuxscaling-capture-writer".into())
+        .spawn(move || {
+            while let Ok(task) = receiver.recv() {
+                let frame_id = task.frame_id;
+                if let Err(error) = write_capture_task(task) {
+                    eprintln!(
+                        "TuxScaling: diagnostic capture writer failed for frame {frame_id}: {error}"
+                    );
+                }
+            }
+        })
+        .map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?;
+    Ok(CaptureWriter {
+        sender: Some(sender),
+        thread: Some(worker),
+    })
+}
+
+unsafe fn allocate_capture_resources(
+    device: &ash::Device,
+    memory: &vk::PhysicalDeviceMemoryProperties,
+    game_extent: vk::Extent2D,
+    guidance_extent: vk::Extent2D,
+    output_extent: vk::Extent2D,
+    output_format: vk::Format,
+    image_count: usize,
+) -> Result<(Vec<ResourceLayout>, Vec<DiagnosticSlot>), vk::Result> {
+    let layouts = resource_layouts(game_extent, guidance_extent, output_extent, output_format)?;
+    let total_size = layouts
+        .iter()
+        .map(|layout| layout.offset.saturating_add(layout.size as u64))
+        .max()
+        .ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
+    let usage = vk::BufferUsageFlags::TRANSFER_DST;
+    let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let mut slots = Vec::with_capacity(image_count.max(1));
+    for _ in 0..image_count.max(1) {
+        slots.push(DiagnosticSlot {
+            staging: unsafe { Buffer::new(device, memory, total_size, usage, flags) }?,
+            pending: None,
+        });
+    }
+    Ok((layouts, slots))
+}
+
 impl PendingCapture {
     #[cfg(test)]
     const fn readback_phase() -> &'static str {
@@ -361,6 +485,7 @@ pub(crate) struct DiagnosticCapture {
     layouts: Vec<ResourceLayout>,
     slots: Vec<DiagnosticSlot>,
     state: CaptureState,
+    writer: CaptureWriter,
 }
 
 impl DiagnosticCapture {
@@ -375,21 +500,18 @@ impl DiagnosticCapture {
         image_count: usize,
         config: DiagnosticCaptureConfig,
     ) -> Result<Self, vk::Result> {
-        let layouts = resource_layouts(game_extent, guidance_extent, output_extent, output_format)?;
-        let total_size = layouts
-            .iter()
-            .map(|layout| layout.offset.saturating_add(layout.size as u64))
-            .max()
-            .ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
-        let usage = vk::BufferUsageFlags::TRANSFER_DST;
-        let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let mut slots = Vec::with_capacity(image_count.max(1));
-        for _ in 0..image_count.max(1) {
-            slots.push(DiagnosticSlot {
-                staging: unsafe { Buffer::new(device, memory, total_size, usage, flags) }?,
-                pending: None,
-            });
-        }
+        let (layouts, slots) = unsafe {
+            allocate_capture_resources(
+                device,
+                memory,
+                game_extent,
+                guidance_extent,
+                output_extent,
+                output_format,
+                image_count,
+            )
+        }?;
+        let writer = capture_writer()?;
         Ok(Self {
             device: device.clone(),
             memory: *memory,
@@ -397,6 +519,7 @@ impl DiagnosticCapture {
             layouts,
             slots,
             state: CaptureState::with_slot_count(config, image_count.max(1)),
+            writer,
         })
     }
 
@@ -555,12 +678,18 @@ impl DiagnosticCapture {
                 .pending
                 .take()
                 .expect("pending checked above");
-            let result = unsafe { self.write_completed(index, &pending) };
-            match result {
-                Ok(()) => self.state.complete(pending.frame_id),
-                Err(error) => {
+            match unsafe { self.queue_completed(index, &pending) } {
+                Ok(EnqueueCapture::Queued) => self.state.complete(pending.frame_id),
+                Ok(EnqueueCapture::Full) => {
                     eprintln!(
-                        "TuxScaling: diagnostic capture disabled after frame {} write failure: {error}",
+                        "TuxScaling: dropping diagnostic capture frame {}; writer queue is full",
+                        pending.frame_id
+                    );
+                    self.state.complete(pending.frame_id);
+                }
+                Ok(EnqueueCapture::Disconnected) | Err(_) => {
+                    eprintln!(
+                        "TuxScaling: diagnostic capture disabled after frame {} writer became unavailable",
                         pending.frame_id
                     );
                     self.state.disable_for_io_error();
@@ -570,11 +699,16 @@ impl DiagnosticCapture {
         }
     }
 
-    unsafe fn write_completed(&self, index: usize, pending: &PendingCapture) -> io::Result<()> {
+    unsafe fn queue_completed(
+        &self,
+        index: usize,
+        pending: &PendingCapture,
+    ) -> io::Result<EnqueueCapture> {
         let frame_prefix = format!("frame-{:08}", pending.frame_id);
         let mut staging_bytes = vec![0_u8; self.slots[index].staging.size as usize];
         unsafe { self.slots[index].staging.read(&mut staging_bytes) }
             .map_err(|error| io::Error::other(format!("staging readback: {error:?}")))?;
+        let mut resources = Vec::with_capacity(pending.resources.len());
         for resource in &pending.resources {
             let file = format!("{frame_prefix}-{}.bin", resource.name);
             let start = resource.offset as usize;
@@ -582,14 +716,15 @@ impl DiagnosticCapture {
             let bytes = staging_bytes.get(start..end).ok_or_else(|| {
                 io::Error::other(format!("readback {file}: staging range is invalid"))
             })?;
-            write_atomic(&self.config.root, &file, bytes)?;
+            resources.push((file, bytes.to_vec()));
         }
-        let report = metadata_json(pending, &frame_prefix);
-        write_atomic(
-            &self.config.root,
-            &format!("{frame_prefix}.json"),
-            report.as_bytes(),
-        )
+        let report = metadata_json(pending, &frame_prefix).into_bytes();
+        Ok(self.writer.enqueue(CaptureWriteTask {
+            root: self.config.root.clone(),
+            frame_id: pending.frame_id,
+            resources,
+            metadata: report,
+        }))
     }
 
     pub(crate) unsafe fn resize(
@@ -600,8 +735,8 @@ impl DiagnosticCapture {
         output_format: vk::Format,
         image_count: usize,
     ) -> Result<(), vk::Result> {
-        let replacement = unsafe {
-            Self::new(
+        let (layouts, slots) = unsafe {
+            allocate_capture_resources(
                 &self.device,
                 &self.memory,
                 game_extent,
@@ -609,11 +744,10 @@ impl DiagnosticCapture {
                 output_extent,
                 output_format,
                 image_count,
-                self.config.clone(),
             )
         }?;
-        self.layouts = replacement.layouts;
-        self.slots = replacement.slots;
+        self.layouts = layouts;
+        self.slots = slots;
         self.state.resize(image_count.max(1));
         Ok(())
     }
@@ -630,6 +764,7 @@ impl DiagnosticCapture {
             slot.pending = None;
         }
         self.state.shutdown();
+        self.writer.shutdown();
     }
 }
 
@@ -769,6 +904,14 @@ fn metadata_json(pending: &PendingCapture, frame_prefix: &str) -> String {
             "{{\n",
             "  \"frame_id\":{},\n",
             "  \"generation_id\":{},\n",
+            "  \"slot_index\":{},\n",
+            "  \"slot_count\":{},\n",
+            "  \"motion_slot_index\":{},\n",
+            "  \"timestamp_ns\":{},\n",
+            "  \"frame_delta_ns\":{{\"raw\":{},\"validated\":{},\"smoothed\":{}}},\n",
+            "  \"guidance_scale\":{:.6},\n",
+            "  \"motion_quality\":{},\n",
+            "  \"numeric_encoding\":{},\n",
             "  \"game_extent\":[{},{}],\n",
             "  \"guidance_extent\":[{},{}],\n",
             "  \"output_extent\":[{},{}],\n",
@@ -786,6 +929,16 @@ fn metadata_json(pending: &PendingCapture, frame_prefix: &str) -> String {
         ),
         metadata.frame_id,
         metadata.generation_id,
+        metadata.slot_index,
+        metadata.slot_count,
+        metadata.motion_slot_index,
+        metadata.timestamp_ns,
+        metadata.frame_delta_raw_ns,
+        metadata.frame_delta_validated_ns,
+        metadata.frame_delta_smoothed_ns,
+        metadata.guidance_scale,
+        json_string(&metadata.motion_quality),
+        json_string(&metadata.numeric_encoding),
         metadata.game_extent[0],
         metadata.game_extent[1],
         metadata.guidance_extent[0],
@@ -841,11 +994,17 @@ fn write_atomic(root: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureState, CapturedResource, DiagnosticCaptureConfig, DiagnosticFrameMetadata,
-        DiagnosticFsrInputs, PendingCapture, SlotState, image_size, metadata_json,
-        resource_layouts,
+        CaptureState, CaptureWriteTask, CapturedResource, DiagnosticCaptureConfig,
+        DiagnosticFrameMetadata, DiagnosticFsrInputs, EnqueueCapture, PendingCapture, SlotState,
+        capture_writer, image_size, metadata_json, resource_layouts, try_enqueue_capture,
+        write_capture_task,
     };
     use ash::vk;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
     use tuxscaling_temporal::GuidanceAblations;
 
     #[test]
@@ -922,6 +1081,99 @@ mod tests {
     }
 
     #[test]
+    fn capture_writer_queue_drops_completed_work_when_full() {
+        use std::sync::mpsc::sync_channel;
+
+        let (sender, receiver) = sync_channel(1);
+        let make_task = |frame_id| CaptureWriteTask {
+            root: PathBuf::from("target/diagnostic-capture-test"),
+            frame_id,
+            resources: Vec::new(),
+            metadata: Vec::new(),
+        };
+
+        assert_eq!(
+            try_enqueue_capture(&sender, make_task(1)),
+            EnqueueCapture::Queued
+        );
+        assert_eq!(
+            try_enqueue_capture(&sender, make_task(2)),
+            EnqueueCapture::Full
+        );
+        drop(receiver);
+        assert_eq!(
+            try_enqueue_capture(&sender, make_task(3)),
+            EnqueueCapture::Disconnected
+        );
+    }
+
+    #[test]
+    fn capture_writer_persists_raw_resources_and_metadata() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tuxscaling-capture-writer-{}-{nonce}",
+            std::process::id()
+        ));
+        let task = CaptureWriteTask {
+            root: root.clone(),
+            frame_id: 9,
+            resources: vec![("frame-00000009-source.bin".into(), vec![1, 2, 3, 4])],
+            metadata: b"{\"frame_id\":9}".to_vec(),
+        };
+
+        write_capture_task(task).unwrap();
+
+        assert_eq!(
+            fs::read(root.join("frame-00000009-source.bin")).unwrap(),
+            [1, 2, 3, 4]
+        );
+        assert_eq!(
+            fs::read(root.join("frame-00000009.json")).unwrap(),
+            b"{\"frame_id\":9}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn capture_writer_shutdown_drains_queued_frames_before_returning() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tuxscaling-capture-writer-drain-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut writer = capture_writer().unwrap();
+        assert_eq!(
+            writer.enqueue(CaptureWriteTask {
+                root: root.clone(),
+                frame_id: 11,
+                resources: vec![("frame-00000011-source.bin".into(), vec![11, 12])],
+                metadata: b"{\"frame_id\":11}".to_vec(),
+            }),
+            EnqueueCapture::Queued
+        );
+
+        writer.shutdown();
+
+        assert_eq!(
+            fs::read(root.join("frame-00000011-source.bin")).unwrap(),
+            [11, 12]
+        );
+        assert_eq!(
+            fs::read(root.join("frame-00000011.json")).unwrap(),
+            b"{\"frame_id\":11}"
+        );
+        drop(writer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn staging_layout_contains_every_quality_signal_without_overlap() {
         let layouts = resource_layouts(
             vk::Extent2D {
@@ -972,6 +1224,16 @@ mod tests {
             metadata: DiagnosticFrameMetadata {
                 frame_id: 7,
                 generation_id: 2,
+                slot_index: 1,
+                slot_count: 3,
+                motion_slot_index: 0,
+                timestamp_ns: 123_456,
+                frame_delta_raw_ns: 16_667,
+                frame_delta_validated_ns: 16_667,
+                frame_delta_smoothed_ns: 16_667,
+                guidance_scale: 1.0,
+                motion_quality: "balanced".into(),
+                numeric_encoding: "srgb_nonlinear".into(),
                 game_extent: [1280, 720],
                 guidance_extent: [1280, 720],
                 output_extent: [1920, 1080],
@@ -1015,6 +1277,14 @@ mod tests {
         };
         let json = metadata_json(&pending, "frame-00000007");
         assert!(json.contains("\"backend\":\"FSR 3.1.4\""));
+        assert!(json.contains("\"timestamp_ns\":123456"));
+        assert!(json.contains("\"slot_index\":1"));
+        assert!(json.contains("\"slot_count\":3"));
+        assert!(json.contains("\"motion_slot_index\":0"));
+        assert!(json.contains("\"frame_delta_ns\":{\"raw\":16667"));
+        assert!(json.contains("\"guidance_scale\":1.000000"));
+        assert!(json.contains("\"motion_quality\":\"balanced\""));
+        assert!(json.contains("\"numeric_encoding\":\"srgb_nonlinear\""));
         assert!(json.contains("\"relative_depth\":true"));
         assert!(json.contains("\"sharpness\":0.200000"));
         assert!(json.contains("\"fsr_inputs\":{\"motion\":\"Estimated\""));

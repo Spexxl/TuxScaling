@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tuxscaling.dev/schemas/temporal-quality-replay-v1.json",
+  "title": "TuxScaling temporal quality replay manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "sequence", "variants"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "sequence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "source_extent",
+        "source_format",
+        "numeric_encoding",
+        "output_extent",
+        "content_viewport",
+        "slot_count",
+        "reset_frame_ids",
+        "frames"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "source_extent": { "$ref": "#/$defs/extent" },
+        "source_format": {
+          "enum": [
+            "R8G8B8A8_UNORM",
+            "R8G8B8A8_SRGB",
+            "B8G8R8A8_UNORM",
+            "B8G8R8A8_SRGB"
+          ]
+        },
+        "numeric_encoding": { "const": "srgb_nonlinear" },
+        "output_extent": { "$ref": "#/$defs/extent" },
+        "content_viewport": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 },
+          "minItems": 4,
+          "maxItems": 4
+        },
+        "slot_count": { "type": "integer", "minimum": 1 },
+        "reset_frame_ids": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "frames": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "$ref": "#/$defs/frame" }
+        }
+      }
+    },
+    "variants": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/variant" }
+    }
+  },
+  "$defs": {
+    "extent": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 1 },
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["frame_id", "timestamp_ns", "slot_index", "motion_slot_index", "source_file", "sha256"],
+      "properties": {
+        "frame_id": { "type": "integer", "minimum": 0 },
+        "timestamp_ns": { "type": "integer", "minimum": 0 },
+        "slot_index": { "type": "integer", "minimum": 0 },
+        "motion_slot_index": { "type": "integer", "minimum": 0, "maximum": 1 },
+        "source_file": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" }
+      }
+    },
+    "variant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "backend", "guidance", "settings"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+        "backend": { "enum": ["fsr_3_1_4", "off"] },
+        "guidance": { "enum": ["estimated", "zero", "none"] },
+        "settings": {
+          "required": ["jitter", "sharpening", "motion_quality"],
+          "minProperties": 3,
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "jitter": { "type": "boolean", "const": false },
+            "sharpening": { "type": "number", "minimum": 0, "maximum": 1 },
+            "motion_quality": { "enum": ["ultra", "high", "balanced", "performance"] }
+          }
+        }
+      }
+    }
+  }
+}

@@ -13,6 +13,8 @@ use std::{
 };
 use tuxscaling_motion::MotionQuality;
 
+mod quality_replay;
+
 const VKCUBE_LAYER_EVIDENCE_MARKER: &str = "TuxScaling swapchain:";
 const PORTABLE_WSI_SCENARIOS: [&str; 5] = [
     "mutable_format",
@@ -921,6 +923,22 @@ struct VisualQualityOptions {
     warmup: usize,
     frames: usize,
     skip_gpu_evidence: bool,
+    verify_replay: bool,
+}
+
+fn visual_quality_capture_contract(
+    options: &VisualQualityOptions,
+) -> Result<(&'static str, &'static str), String> {
+    if options.input == (1280, 720) {
+        Ok(("upscale", "native"))
+    } else if options.input == (1920, 1080) && options.output == options.input {
+        Ok(("native", "native"))
+    } else {
+        Err(format!(
+            "visual-quality supports 1280x720 upscaling and 1920x1080 Native AA; got {}x{} -> {}x{}",
+            options.input.0, options.input.1, options.output.0, options.output.1
+        ))
+    }
 }
 
 fn parse_extent_argument(name: &str, value: &str) -> Result<(u32, u32), String> {
@@ -947,6 +965,7 @@ fn parse_visual_quality_args(args: &[&str]) -> Result<VisualQualityOptions, Stri
     let mut warmup = 180_usize;
     let mut frames = 120_usize;
     let mut skip_gpu_evidence = false;
+    let mut verify_replay = false;
     let mut index = 0;
     while index < args.len() {
         let argument = args[index];
@@ -995,17 +1014,21 @@ fn parse_visual_quality_args(args: &[&str]) -> Result<VisualQualityOptions, Stri
             "--skip-gpu-evidence" => {
                 skip_gpu_evidence = true;
             }
+            "--verify-replay" => verify_replay = true,
             value => return Err(format!("unknown visual-quality argument: {value}")),
         }
     }
-    Ok(VisualQualityOptions {
+    let options = VisualQualityOptions {
         display,
         input: input.ok_or_else(|| "--input is required".to_owned())?,
         output: output.ok_or_else(|| "--output is required".to_owned())?,
         warmup,
         frames,
         skip_gpu_evidence,
-    })
+        verify_replay,
+    };
+    visual_quality_capture_contract(&options)?;
+    Ok(options)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1143,6 +1166,14 @@ fn visual_quality_metrics(
 struct CaptureManifest {
     frame_id: u64,
     generation_id: u64,
+    slot_index: u32,
+    slot_count: u32,
+    motion_slot_index: u32,
+    timestamp_ns: u64,
+    frame_delta_ns: CaptureFrameDelta,
+    guidance_scale: f32,
+    motion_quality: String,
+    numeric_encoding: String,
     game_extent: [u32; 2],
     guidance_extent: [u32; 2],
     output_extent: [u32; 2],
@@ -1156,6 +1187,13 @@ struct CaptureManifest {
     history_age: u64,
     gpu_timings_ms: Vec<f32>,
     resources: Vec<CaptureResource>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CaptureFrameDelta {
+    raw: u64,
+    validated: u64,
+    smoothed: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1253,11 +1291,7 @@ fn read_capture_resource(
     Ok((image, resource.extent))
 }
 
-fn read_capture_series(
-    directory: &Path,
-    options: &VisualQualityOptions,
-    expected_backend: &str,
-) -> Result<Vec<CaptureManifest>, String> {
+fn read_capture_manifests(directory: &Path) -> Result<Vec<CaptureManifest>, String> {
     let mut manifests = fs::read_dir(directory)
         .map_err(|error| format!("read capture directory {}: {error}", directory.display()))?
         .filter_map(Result::ok)
@@ -1274,6 +1308,15 @@ fn read_capture_series(
         })
         .collect::<Vec<_>>();
     manifests.sort_by_key(|manifest| manifest.frame_id);
+    Ok(manifests)
+}
+
+fn read_capture_series(
+    directory: &Path,
+    options: &VisualQualityOptions,
+    expected_backend: &str,
+) -> Result<Vec<CaptureManifest>, String> {
+    let manifests = read_capture_manifests(directory)?;
     let end_frame = options
         .warmup
         .checked_add(options.frames)
@@ -1375,6 +1418,202 @@ fn read_capture_series(
         return Err("FSR Estimated capture contains no stable estimated-motion frame".into());
     }
     Ok(selected)
+}
+
+fn capture_resource_bytes(
+    directory: &Path,
+    manifest: &CaptureManifest,
+    name: &str,
+) -> Result<Vec<u8>, String> {
+    let resource = manifest
+        .resources
+        .iter()
+        .find(|resource| resource.name == name)
+        .ok_or_else(|| format!("capture frame {} is missing {name}", manifest.frame_id))?;
+    let bytes = fs::read(directory.join(&resource.file))
+        .map_err(|error| format!("read capture resource {}: {error}", resource.file))?;
+    if bytes.len() != resource.bytes {
+        return Err(format!(
+            "capture resource {} has {} bytes; metadata declares {}",
+            resource.file,
+            bytes.len(),
+            resource.bytes
+        ));
+    }
+    Ok(bytes)
+}
+
+fn require_identical_capture_sources(
+    fsr_dir: &Path,
+    zero_dir: &Path,
+    off_dir: &Path,
+    fsr: &[CaptureManifest],
+    zero: &[CaptureManifest],
+    off: &[CaptureManifest],
+) -> Result<(), String> {
+    if fsr.len() < 2 || fsr.len() != zero.len() || fsr.len() != off.len() {
+        return Err("live replay capture modes do not contain the same frame count".into());
+    }
+    for index in 0..fsr.len() {
+        if fsr[index].frame_id != zero[index].frame_id || fsr[index].frame_id != off[index].frame_id
+        {
+            return Err(
+                "live replay capture modes do not contain identical ordered frame IDs".into(),
+            );
+        }
+        let fsr_source = capture_resource_bytes(fsr_dir, &fsr[index], "source")?;
+        let zero_source = capture_resource_bytes(zero_dir, &zero[index], "source")?;
+        let off_source = capture_resource_bytes(off_dir, &off[index], "source")?;
+        if fsr_source != zero_source || fsr_source != off_source {
+            return Err(format!(
+                "live replay source pixels differ for frame {}",
+                fsr[index].frame_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn latest_replay_run(output_dir: &Path) -> Result<PathBuf, String> {
+    let mut runs = fs::read_dir(output_dir)
+        .map_err(|error| format!("read replay output directory: {error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("run-"))
+        })
+        .collect::<Vec<_>>();
+    runs.sort();
+    runs.pop()
+        .ok_or_else(|| "quality-replay did not produce a run directory".into())
+}
+
+fn verify_replay_against_live_runtime(
+    root: &Path,
+    report_dir: &Path,
+    fsr_dir: &Path,
+    zero_dir: &Path,
+    off_dir: &Path,
+) -> Result<RuntimeReplayEvidence, String> {
+    let fsr = read_capture_manifests(fsr_dir)?;
+    let zero = read_capture_manifests(zero_dir)?;
+    let off = read_capture_manifests(off_dir)?;
+    require_identical_capture_sources(fsr_dir, zero_dir, off_dir, &fsr, &zero, &off)?;
+
+    let replay_dir = report_dir.join("captured-replay");
+    fs::create_dir_all(&replay_dir)
+        .map_err(|error| format!("create runtime replay evidence directory: {error}"))?;
+    let manifest_path = replay_dir.join("manifest.json");
+    quality_replay::manifest_from_capture(fsr_dir, &manifest_path)?;
+    let replay_output = replay_dir.join("output");
+    let arguments = vec![
+        "--manifest".to_owned(),
+        manifest_path.to_string_lossy().into_owned(),
+        "--output".to_owned(),
+        replay_output.to_string_lossy().into_owned(),
+    ];
+    if !quality_replay::execute(root, &arguments) {
+        return Err("captured quality-replay failed against live runtime frames".into());
+    }
+    let run_dir = latest_replay_run(&replay_output)?;
+    let report_bytes = fs::read(run_dir.join("report.json"))
+        .map_err(|error| format!("read captured replay report: {error}"))?;
+    let replay_report: serde_json::Value = serde_json::from_slice(&report_bytes)
+        .map_err(|error| format!("parse captured replay report: {error}"))?;
+    let manifest_sha256 = replay_report["manifest_sha256"]
+        .as_str()
+        .ok_or_else(|| "captured replay report is missing its manifest hash".to_owned())?
+        .to_owned();
+    let replay_frames = replay_report["variants"][0]["consumed_frames"]
+        .as_array()
+        .ok_or_else(|| "captured replay report is missing FSR frame receipts".to_owned())?;
+    if replay_frames.len() != fsr.len() {
+        return Err("captured replay consumed a different number of live frames".into());
+    }
+
+    let mut exact_frames = 0;
+    let mut maximum_error = 0_u8;
+    let mut absolute_error_sum = 0_u64;
+    let mut channel_count = 0_u64;
+    let mut per_frame = Vec::with_capacity(fsr.len());
+    for (capture, frame_receipt) in fsr.iter().zip(replay_frames) {
+        if frame_receipt["frame_id"].as_u64() != Some(capture.frame_id) {
+            return Err("captured replay frame IDs differ from the live runtime".into());
+        }
+        let (live_pixels, live_extent) = read_capture_resource(fsr_dir, capture, "reconstructed")?;
+        let replay_file = run_dir.join(format!("fsr_estimated-frame-{:08}.rgba", capture.frame_id));
+        let replay_pixels = fs::read(&replay_file).map_err(|error| {
+            format!("read replay output for frame {}: {error}", capture.frame_id)
+        })?;
+        if live_extent != capture.output_extent
+            || replay_pixels.len() != live_pixels.len().saturating_mul(4)
+        {
+            return Err(format!(
+                "runtime/replay output extent mismatch for frame {}",
+                capture.frame_id
+            ));
+        }
+        let mut frame_error = 0_u8;
+        let mut frame_error_sum = 0_u64;
+        for (index, expected) in live_pixels.iter().flatten().enumerate() {
+            let expected = (expected.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let actual = replay_pixels[index];
+            let difference = expected.abs_diff(actual);
+            frame_error = frame_error.max(difference);
+            maximum_error = maximum_error.max(difference);
+            frame_error_sum += u64::from(difference);
+            absolute_error_sum += u64::from(difference);
+            channel_count += 1;
+        }
+        if frame_error == 0 {
+            exact_frames += 1;
+        }
+        per_frame.push(RuntimeReplayFrameEvidence {
+            frame_id: capture.frame_id,
+            exact: frame_error == 0,
+            max_channel_error: frame_error,
+            mean_absolute_channel_error: frame_error_sum as f64
+                / live_pixels.len().saturating_mul(4).max(1) as f64,
+        });
+    }
+    let max_allowed_channel_error = 1;
+    let evidence = RuntimeReplayEvidence {
+        manifest: manifest_path.display().to_string(),
+        manifest_sha256,
+        source_frames: fsr.len(),
+        identical_source_frames_across_live_modes: true,
+        fsr_live_frames: fsr.len(),
+        fsr_live_exact_frames: exact_frames,
+        fsr_live_max_channel_error: maximum_error,
+        fsr_live_mean_absolute_channel_error: absolute_error_sum as f64
+            / channel_count.max(1) as f64,
+        per_frame,
+        max_allowed_channel_error,
+        gate_passed: maximum_error <= max_allowed_channel_error,
+    };
+    let evidence_path = report_dir.join("runtime-replay-comparison.json");
+    fs::write(
+        &evidence_path,
+        serde_json::to_vec_pretty(&evidence)
+            .map_err(|error| format!("serialize runtime replay comparison: {error}"))?,
+    )
+    .map_err(|error| format!("write {}: {error}", evidence_path.display()))?;
+    if !evidence.gate_passed {
+        return Err(format!(
+            "captured replay differs from live FSR output by {} channel values at worst; limit is {} (see {})",
+            evidence.fsr_live_max_channel_error,
+            evidence.max_allowed_channel_error,
+            evidence_path.display()
+        ));
+    }
+    println!(
+        "TuxScaling runtime replay comparison: {} exact frames, max channel error {}",
+        evidence.fsr_live_exact_frames, evidence.fsr_live_max_channel_error
+    );
+    Ok(evidence)
 }
 
 #[cfg(test)]
@@ -1495,6 +1734,29 @@ struct DiagnosticReport {
 }
 
 #[derive(Debug, Serialize)]
+struct RuntimeReplayEvidence {
+    manifest: String,
+    manifest_sha256: String,
+    source_frames: usize,
+    identical_source_frames_across_live_modes: bool,
+    fsr_live_frames: usize,
+    fsr_live_exact_frames: usize,
+    fsr_live_max_channel_error: u8,
+    fsr_live_mean_absolute_channel_error: f64,
+    per_frame: Vec<RuntimeReplayFrameEvidence>,
+    max_allowed_channel_error: u8,
+    gate_passed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeReplayFrameEvidence {
+    frame_id: u64,
+    exact: bool,
+    max_channel_error: u8,
+    mean_absolute_channel_error: f64,
+}
+
+#[derive(Debug, Serialize)]
 struct VisualQualityReport {
     command: String,
     display: String,
@@ -1510,6 +1772,7 @@ struct VisualQualityReport {
     ablations: Vec<AblationReport>,
     presets: Vec<PresetReport>,
     diagnostics: DiagnosticReport,
+    runtime_replay: Option<RuntimeReplayEvidence>,
     artifacts: Vec<String>,
     gate: String,
 }
@@ -1774,9 +2037,18 @@ fn capture_command(
     options: &VisualQualityOptions,
     libraries: &std::ffi::OsString,
 ) -> Command {
-    let end_frame = options
-        .warmup
-        .saturating_add(options.frames)
+    let capture_start = if options.verify_replay {
+        1
+    } else {
+        options.warmup
+    };
+    let capture_count = if options.verify_replay {
+        options.warmup.saturating_add(options.frames)
+    } else {
+        options.frames
+    };
+    let end_frame = capture_start
+        .saturating_add(capture_count)
         .saturating_sub(1);
     let mut command = Command::new(binary);
     validation(&mut command)
@@ -1788,7 +2060,12 @@ fn capture_command(
         )
         .env("TUXSCALING_VIEW", "reconstructed")
         .env("TUXSCALING_CONFIG", config)
-        .env("TUXSCALING_TEST_SCENARIO", "upscale")
+        .env(
+            "TUXSCALING_TEST_SCENARIO",
+            visual_quality_capture_contract(options)
+                .map(|contract| contract.0)
+                .unwrap_or("upscale"),
+        )
         .env("TUXSCALING_TEST_RESIZE_INTERVAL", "0")
         .env("TUXSCALING_TEST_FORCE_VIRTUAL", "1")
         .env(
@@ -1799,8 +2076,8 @@ fn capture_command(
         .env("TUXSCALING_TEST_FORCE_TEMPORAL_FAILURE", "0")
         .env("TUXSCALING_TEST_FORCE_RESIZE_FAILURE", "0")
         .env("TUXSCALING_CAPTURE_DIR", capture_dir)
-        .env("TUXSCALING_CAPTURE_MAX_FRAMES", options.frames.to_string())
-        .env("TUXSCALING_CAPTURE_START_FRAME", options.warmup.to_string())
+        .env("TUXSCALING_CAPTURE_MAX_FRAMES", capture_count.to_string())
+        .env("TUXSCALING_CAPTURE_START_FRAME", capture_start.to_string())
         .env("TUXSCALING_CAPTURE_END_FRAME", end_frame.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2194,7 +2471,7 @@ fn visual_quality_report(
         guidance_resources,
         guidance_resource_bytes_valid: true,
     };
-    let artifacts = [
+    let mut artifacts = [
         "fsr.png",
         "zero.png",
         "off.png",
@@ -2207,7 +2484,12 @@ fn visual_quality_report(
     ]
     .into_iter()
     .map(String::from)
-    .collect();
+    .collect::<Vec<_>>();
+    if options.verify_replay {
+        artifacts.push("runtime-replay-comparison.json".into());
+        artifacts.push("captured-replay/manifest.json".into());
+        artifacts.push("captured-replay/output".into());
+    }
     Ok(VisualQualityReport {
         command: format!(
             "cargo xtask visual-quality --display {} --input {}x{} --output {}x{} --warmup {} --frames {}",
@@ -2232,6 +2514,7 @@ fn visual_quality_report(
         ablations,
         presets,
         diagnostics,
+        runtime_replay: None,
         artifacts,
         gate: if category_gates_passed && temporal_gate_passed {
             "passed: captures, extents, history, validation, finite metrics, source-frame identity, category thresholds, and Estimated-versus-Zero guidance checks are valid; values are an Off-baseline comparison, not a ground-truth claim".into()
@@ -2386,13 +2669,20 @@ fn run_visual_quality(root: &Path, options: &VisualQualityOptions) -> bool {
     let fsr_config = report_dir.join("fsr.toml");
     let zero_config = report_dir.join("zero.toml");
     let off_config = report_dir.join("off.toml");
+    let (_, output_resolution) = match visual_quality_capture_contract(options) {
+        Ok(contract) => contract,
+        Err(error) => {
+            eprintln!("cargo xtask visual-quality: {error}");
+            return false;
+        }
+    };
     let fsr_config_source = generated_config_with_backend_and_sharpening(
-        "native",
+        output_resolution,
         1.0,
         Some("balanced"),
         BackendSelection::Fsr314,
-        true,
-        0.3,
+        false,
+        0.0,
     );
     let zero_config_source = format!("guidance_mode = \"zero\"\n{fsr_config_source}");
     if fs::write(
@@ -2403,7 +2693,7 @@ fn run_visual_quality(root: &Path, options: &VisualQualityOptions) -> bool {
         || fs::write(&zero_config, zero_config_source).is_err()
         || fs::write(
             &off_config,
-            "output_resolution = \"native\"\nguidance_scale = 1.0\nmotion_quality = \"balanced\"\nsharpening_enabled = false\nsharpness = 0.0\nupscaler = \"off\"\n",
+            format!("output_resolution = \"{output_resolution}\"\nguidance_scale = 1.0\nmotion_quality = \"balanced\"\nsharpening_enabled = false\nsharpness = 0.0\nupscaler = \"off\"\n"),
         )
         .is_err()
     {
@@ -2479,7 +2769,24 @@ fn run_visual_quality(root: &Path, options: &VisualQualityOptions) -> bool {
             return false;
         }
     };
-    let report = match visual_quality_report(
+    let runtime_replay = if options.verify_replay {
+        match verify_replay_against_live_runtime(
+            root,
+            &report_dir,
+            &fsr_capture,
+            &zero_capture,
+            &off_capture,
+        ) {
+            Ok(evidence) => Some(evidence),
+            Err(error) => {
+                eprintln!("cargo xtask visual-quality: live replay verification failed: {error}");
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+    let mut report = match visual_quality_report(
         options,
         &fsr_capture,
         &zero_capture,
@@ -2496,6 +2803,7 @@ fn run_visual_quality(root: &Path, options: &VisualQualityOptions) -> bool {
             return false;
         }
     };
+    report.runtime_replay = runtime_replay;
     let json = match serde_json::to_string_pretty(&report) {
         Ok(json) => json,
         Err(error) => {
@@ -4101,6 +4409,11 @@ fn main() -> ExitCode {
             let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
             run_quality_evidence(root)
         }
+        "quality-replay" => {
+            let arguments = std::env::args().skip(2).collect::<Vec<_>>();
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+            quality_replay::execute(root, &arguments)
+        }
         "smoke" => {
             let arguments = std::env::args().skip(2).collect::<Vec<_>>();
             let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
@@ -4368,7 +4681,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "Usage: cargo xtask <benchmark|check|fidelityfx-check|gpu-check|quality-evidence|smoke|vkcube|wsi-compatibility|visual-quality|proton-acceptance> [command options]"
+                "Usage: cargo xtask <benchmark|check|fidelityfx-check|gpu-check|quality-evidence|quality-replay|smoke|vkcube|wsi-compatibility|visual-quality|proton-acceptance> [command options]"
             );
             return ExitCode::from(2);
         }
@@ -4395,9 +4708,9 @@ mod tests {
         parse_vkcube_args, parse_vkcube_evidence, parse_wsi_compatibility_args,
         proton_acceptance_gate_commands, proton_capture_files_are_valid, proton_launchers_on_path,
         proton_session_evidence_is_valid, quality_ablation_rows, quality_fixture_passes,
-        quality_metric_lines, quality_preset_rows, visual_quality_metrics_for_test,
-        vkcube_control_sequence_is_valid, vkcube_launch_in, vkcube_output_is_valid,
-        wsi_compatibility_output_is_valid, x11_display_is_available_with,
+        quality_metric_lines, quality_preset_rows, visual_quality_capture_contract,
+        visual_quality_metrics_for_test, vkcube_control_sequence_is_valid, vkcube_launch_in,
+        vkcube_output_is_valid, wsi_compatibility_output_is_valid, x11_display_is_available_with,
     };
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -5285,6 +5598,18 @@ mod tests {
                 .unwrap()
                 .skip_gpu_evidence
         );
+        let verify_replay = [
+            "--input",
+            "1280x720",
+            "--output",
+            "2160x1440",
+            "--verify-replay",
+        ];
+        assert!(
+            parse_visual_quality_args(&verify_replay)
+                .unwrap()
+                .verify_replay
+        );
     }
 
     #[test]
@@ -5307,6 +5632,27 @@ mod tests {
         assert_eq!(options.output, (2160, 1440));
         assert_eq!(options.warmup, 180);
         assert_eq!(options.frames, 120);
+    }
+
+    #[test]
+    fn visual_quality_selects_upscale_and_native_aa_scenarios_from_input_extent() {
+        let upscale =
+            parse_visual_quality_args(&["--input", "1280x720", "--output", "3440x1440"]).unwrap();
+        assert_eq!(
+            visual_quality_capture_contract(&upscale),
+            Ok(("upscale", "native"))
+        );
+
+        let native_aa =
+            parse_visual_quality_args(&["--input", "1920x1080", "--output", "1920x1080"]).unwrap();
+        assert_eq!(
+            visual_quality_capture_contract(&native_aa),
+            Ok(("native", "native"))
+        );
+
+        assert!(
+            parse_visual_quality_args(&["--input", "1920x1080", "--output", "3440x1440",]).is_err()
+        );
     }
 
     #[test]
