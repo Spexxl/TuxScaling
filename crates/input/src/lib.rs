@@ -355,6 +355,26 @@ pub const fn overlay_hotkey_uses_passive_grab(overlay_open: bool) -> bool {
     !overlay_open
 }
 
+fn hotkey_window(route: &InputRoute, root_window: c_ulong) -> c_ulong {
+    if route.game_window != 0 {
+        route.game_window as c_ulong
+    } else if route.event_window != 0 {
+        route.event_window as c_ulong
+    } else {
+        root_window
+    }
+}
+
+fn should_rebind_hotkey(
+    current: &InputRoute,
+    next: &InputRoute,
+    root_window: c_ulong,
+    owner: InputOwner,
+) -> bool {
+    owner == InputOwner::Game
+        && hotkey_window(current, root_window) != hotkey_window(next, root_window)
+}
+
 pub fn should_forward_to_game(route: &InputRoute, overlay_open: bool) -> bool {
     let _ = (route, overlay_open);
     false
@@ -560,7 +580,15 @@ impl X11Input {
         if event_window != self.event_window {
             return false;
         }
+        let rebind = should_rebind_hotkey(&self.route, &route, self.root_window, self.owner);
+        if rebind {
+            self.release_insert_hotkey();
+        }
         self.route = route;
+        if rebind {
+            self.grab_insert_hotkey();
+            unsafe { (self.flush)(self.display) };
+        }
         true
     }
 
@@ -903,7 +931,7 @@ impl X11Input {
     }
 
     fn hotkey_windows(&self) -> impl Iterator<Item = c_ulong> {
-        std::iter::once(self.root_window).filter(|window| *window != 0)
+        std::iter::once(hotkey_window(&self.route, self.root_window)).filter(|window| *window != 0)
     }
 
     fn set_presenter_interactive(&self, interactive: bool) {
@@ -1213,6 +1241,36 @@ mod tests {
     fn closed_overlay_uses_a_passive_insert_grab() {
         assert!(super::overlay_hotkey_uses_passive_grab(false));
         assert!(!super::overlay_hotkey_uses_passive_grab(true));
+    }
+
+    #[test]
+    fn insert_hotkey_is_scoped_to_each_game_window() {
+        let first = route();
+        let second = InputRoute {
+            game_window: 0x500,
+            event_window: 0xa00,
+            ..first
+        };
+        assert_eq!(super::hotkey_window(&first, 1), 0x400);
+        assert_eq!(super::hotkey_window(&second, 1), 0x500);
+        assert!(super::should_rebind_hotkey(
+            &first,
+            &second,
+            1,
+            super::InputOwner::Game,
+        ));
+        assert!(!super::should_rebind_hotkey(
+            &first,
+            &second,
+            1,
+            super::InputOwner::Suspended,
+        ));
+        assert!(!super::should_rebind_hotkey(
+            &first,
+            &first,
+            1,
+            super::InputOwner::Game,
+        ));
     }
 
     #[test]
