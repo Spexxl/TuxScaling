@@ -199,35 +199,76 @@ pub(super) fn reported_logical_wsi_result(
     }
 }
 
-unsafe fn presents_to_independent_presenter(info: &vk::PresentInfoKHR<'_>) -> bool {
+unsafe fn independent_presenter_mask(info: &vk::PresentInfoKHR<'_>) -> Vec<bool> {
     if info.swapchain_count == 0 || info.p_swapchains.is_null() {
-        return false;
+        return Vec::new();
     }
     let presented =
         unsafe { std::slice::from_raw_parts(info.p_swapchains, info.swapchain_count as usize) };
     let states = swapchains()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    presented.iter().any(|swapchain| {
-        states.get(swapchain).is_some_and(|state| {
-            let state = state.lock().unwrap_or_else(|error| error.into_inner());
-            !state.lifecycle.blocks_frame_operations() && state.present_surface.is_some()
+    presented
+        .iter()
+        .map(|swapchain| {
+            states.get(swapchain).is_some_and(|state| {
+                let state = state.lock().unwrap_or_else(|error| error.into_inner());
+                !state.lifecycle.blocks_frame_operations() && state.present_surface.is_some()
+            })
         })
-    })
+        .collect()
 }
 
-unsafe fn hide_independent_presenter_results(
-    info: &vk::PresentInfoKHR<'_>,
-    independent_presenter: bool,
-) {
-    if !independent_presenter || info.swapchain_count == 0 || info.p_results.is_null() {
+fn all_independent_presenters(mask: &[bool]) -> bool {
+    !mask.is_empty() && mask.iter().all(|independent| *independent)
+}
+
+fn reported_logical_aggregate_result(
+    downstream: vk::Result,
+    mask: &[bool],
+    per_swapchain: Option<&[vk::Result]>,
+) -> vk::Result {
+    if downstream != vk::Result::SUBOPTIMAL_KHR {
+        return downstream;
+    }
+    if all_independent_presenters(mask) {
+        return vk::Result::SUCCESS;
+    }
+    let Some(results) = per_swapchain.filter(|results| results.len() == mask.len()) else {
+        return downstream;
+    };
+    let independent_suboptimal = mask
+        .iter()
+        .zip(results)
+        .any(|(independent, result)| *independent && *result == vk::Result::SUBOPTIMAL_KHR);
+    let remaining_successful = mask.iter().zip(results).all(|(independent, result)| {
+        if *independent {
+            matches!(*result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR)
+        } else {
+            *result == vk::Result::SUCCESS
+        }
+    });
+    if independent_suboptimal && remaining_successful {
+        vk::Result::SUCCESS
+    } else {
+        downstream
+    }
+}
+
+fn reported_logical_present_results(results: &mut [vk::Result], mask: &[bool]) {
+    debug_assert_eq!(results.len(), mask.len());
+    for (result, independent) in results.iter_mut().zip(mask) {
+        *result = reported_logical_wsi_result(*result, *independent);
+    }
+}
+
+unsafe fn hide_independent_presenter_results(info: &vk::PresentInfoKHR<'_>, mask: &[bool]) {
+    if info.swapchain_count == 0 || info.p_results.is_null() {
         return;
     }
     let results =
         unsafe { std::slice::from_raw_parts_mut(info.p_results, info.swapchain_count as usize) };
-    for result in results {
-        *result = reported_logical_wsi_result(*result, true);
-    }
+    reported_logical_present_results(results, mask);
 }
 
 fn with_overlay_wait<R>(
@@ -646,6 +687,7 @@ unsafe fn queue_present_inner(
     {
         return error;
     }
+    let independent_presenters = unsafe { independent_presenter_mask(info) };
     let overlay_complete = crate::handoff::handoff(|handoff| unsafe {
         let _ = submit_overlay(queue, queue_state, info, handoff);
     });
@@ -698,9 +740,19 @@ unsafe fn queue_present_inner(
         {
             rollback_translation_present_ids(translation);
         }
-        let independent_presenter = unsafe { presents_to_independent_presenter(info) };
-        unsafe { hide_independent_presenter_results(info, independent_presenter) };
-        let result = reported_logical_wsi_result(result, independent_presenter);
+        let per_swapchain = if info.p_results.is_null() {
+            None
+        } else {
+            Some(unsafe {
+                std::slice::from_raw_parts(info.p_results, info.swapchain_count as usize)
+            })
+        };
+        // Read the downstream entries before rewriting them. A mixed present
+        // can hide aggregate SUBOPTIMAL only if pResults attributes it solely
+        // to an independent presenter.
+        let result =
+            reported_logical_aggregate_result(result, &independent_presenters, per_swapchain);
+        unsafe { hide_independent_presenter_results(info, &independent_presenters) };
         if result != vk::Result::SUCCESS && !info.p_swapchains.is_null() {
             let presented = unsafe {
                 std::slice::from_raw_parts(info.p_swapchains, info.swapchain_count as usize)
@@ -733,8 +785,9 @@ pub(super) unsafe extern "system" fn queue_present_khr(
 #[cfg(test)]
 mod tests {
     use super::{
-        present_committed, reported_logical_wsi_result, should_retry_native_publication,
-        translate_present, with_overlay_wait,
+        all_independent_presenters, present_committed, reported_logical_aggregate_result,
+        reported_logical_present_results, reported_logical_wsi_result,
+        should_retry_native_publication, translate_present, with_overlay_wait,
     };
     use crate::state::retire_swapchain;
     use ash::vk;
@@ -792,6 +845,66 @@ mod tests {
         assert_eq!(
             reported_logical_wsi_result(vk::Result::SUCCESS, true),
             vk::Result::SUCCESS
+        );
+    }
+
+    #[test]
+    fn mixed_present_keeps_each_swapchains_wsi_result() {
+        let mut results = [vk::Result::SUBOPTIMAL_KHR, vk::Result::SUBOPTIMAL_KHR];
+        reported_logical_present_results(&mut results, &[true, false]);
+        assert_eq!(results, [vk::Result::SUCCESS, vk::Result::SUBOPTIMAL_KHR]);
+    }
+
+    #[test]
+    fn independent_present_results_hide_only_suboptimal() {
+        let mut results = [
+            vk::Result::SUBOPTIMAL_KHR,
+            vk::Result::ERROR_OUT_OF_DATE_KHR,
+        ];
+        reported_logical_present_results(&mut results, &[true, true]);
+        assert_eq!(
+            results,
+            [vk::Result::SUCCESS, vk::Result::ERROR_OUT_OF_DATE_KHR]
+        );
+    }
+
+    #[test]
+    fn mixed_present_preserves_aggregate_suboptimal() {
+        assert!(!all_independent_presenters(&[true, false]));
+        assert!(all_independent_presenters(&[true, true]));
+        assert!(!all_independent_presenters(&[]));
+        let mask = [true, false];
+        assert_eq!(
+            reported_logical_aggregate_result(
+                vk::Result::SUBOPTIMAL_KHR,
+                &mask,
+                Some(&[vk::Result::SUBOPTIMAL_KHR, vk::Result::SUBOPTIMAL_KHR]),
+            ),
+            vk::Result::SUBOPTIMAL_KHR,
+        );
+        assert_eq!(
+            reported_logical_aggregate_result(vk::Result::SUBOPTIMAL_KHR, &mask, None),
+            vk::Result::SUBOPTIMAL_KHR,
+        );
+    }
+
+    #[test]
+    fn aggregate_suboptimal_can_be_attributed_to_the_independent_presenter() {
+        assert_eq!(
+            reported_logical_aggregate_result(
+                vk::Result::SUBOPTIMAL_KHR,
+                &[true, false],
+                Some(&[vk::Result::SUBOPTIMAL_KHR, vk::Result::SUCCESS]),
+            ),
+            vk::Result::SUCCESS,
+        );
+        assert_eq!(
+            reported_logical_aggregate_result(
+                vk::Result::SUBOPTIMAL_KHR,
+                &[true, false],
+                Some(&[vk::Result::SUCCESS]),
+            ),
+            vk::Result::SUBOPTIMAL_KHR,
         );
     }
 
