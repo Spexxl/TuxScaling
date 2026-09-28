@@ -1213,11 +1213,22 @@ fn ideal_pixel_uv(case_index: usize, mut u: f32, mut v: f32) -> [f32; 4] {
     pixel
 }
 
+fn srgb_encoded_pixel(mut pixel: [f32; 4]) -> [f32; 4] {
+    for channel in &mut pixel[..3] {
+        *channel = if *channel <= 0.003_130_8 {
+            *channel * 12.92
+        } else {
+            1.055 * channel.powf(1.0 / 2.4) - 0.055
+        };
+    }
+    pixel
+}
+
 fn scene_bytes(case_index: usize, extent: vk::Extent2D) -> Vec<u8> {
     (0..extent.height)
         .flat_map(|y| {
             (0..extent.width).flat_map(move |x| {
-                ideal_pixel(case_index, x, y, extent)
+                srgb_encoded_pixel(ideal_pixel(case_index, x, y, extent))
                     .map(|value| (value * 255.0).round() as u8)
                     .into_iter()
             })
@@ -1242,7 +1253,7 @@ fn fixture_scene_bytes(
                 let v = ((y as f32 + 0.5) / extent.height as f32
                     + motion[1] / fixture.height as f32)
                     .clamp(0.0, 1.0);
-                ideal_pixel_uv(case_index, u, v)
+                srgb_encoded_pixel(ideal_pixel_uv(case_index, u, v))
                     .map(|value| (value * 255.0).round() as u8)
                     .into_iter()
             })
@@ -1252,7 +1263,10 @@ fn fixture_scene_bytes(
 
 fn expected_pixels(case_index: usize, extent: vk::Extent2D) -> Vec<[f32; 4]> {
     (0..extent.height)
-        .flat_map(|y| (0..extent.width).map(move |x| ideal_pixel(case_index, x, y, extent)))
+        .flat_map(|y| {
+            (0..extent.width)
+                .map(move |x| srgb_encoded_pixel(ideal_pixel(case_index, x, y, extent)))
+        })
         .collect()
 }
 
@@ -1273,7 +1287,7 @@ fn fixture_expected_pixels(
                 let v = ((y as f32 + 0.5) / extent.height as f32
                     + motion[1] / fixture.height as f32)
                     .clamp(0.0, 1.0);
-                ideal_pixel_uv(case_index, u, v)
+                srgb_encoded_pixel(ideal_pixel_uv(case_index, u, v))
             })
         })
         .collect()

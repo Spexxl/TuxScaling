@@ -94,11 +94,23 @@ fn scene_pixel(x: u32, y: u32, extent: vk::Extent2D) -> [f32; 4] {
     ]
 }
 
+fn srgb_encoded_scene_pixel(x: u32, y: u32, extent: vk::Extent2D) -> [f32; 4] {
+    let mut pixel = scene_pixel(x, y, extent);
+    for channel in &mut pixel[..3] {
+        *channel = if *channel <= 0.003_130_8 {
+            *channel * 12.92
+        } else {
+            1.055 * channel.powf(1.0 / 2.4) - 0.055
+        };
+    }
+    pixel
+}
+
 fn rgba8(extent: vk::Extent2D) -> Vec<u8> {
     (0..extent.height)
         .flat_map(|y| {
             (0..extent.width).flat_map(move |x| {
-                scene_pixel(x, y, extent)
+                srgb_encoded_scene_pixel(x, y, extent)
                     .map(|value| (value * 255.0).round() as u8)
                     .into_iter()
             })
@@ -108,7 +120,7 @@ fn rgba8(extent: vk::Extent2D) -> Vec<u8> {
 
 fn expected_high_resolution(extent: vk::Extent2D) -> Vec<[f32; 4]> {
     (0..extent.height)
-        .flat_map(|y| (0..extent.width).map(move |x| scene_pixel(x, y, extent)))
+        .flat_map(|y| (0..extent.width).map(move |x| srgb_encoded_scene_pixel(x, y, extent)))
         .collect()
 }
 
