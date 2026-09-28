@@ -77,6 +77,7 @@ struct ReplayOptions {
     output: Option<PathBuf>,
     validate_only: bool,
     validate_report: Option<PathBuf>,
+    require_quality: bool,
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
@@ -739,6 +740,7 @@ fn parse_options(args: &[String]) -> Result<ReplayOptions, String> {
                 index += 1;
             }
             "--validate-only" => options.validate_only = true,
+            "--require-quality" => options.require_quality = true,
             "--validate-report" => {
                 let value = args.get(index).ok_or("--validate-report requires a path")?;
                 options.validate_report = Some(PathBuf::from(value));
@@ -756,8 +758,8 @@ fn parse_options(args: &[String]) -> Result<ReplayOptions, String> {
     } else if options.manifest.is_none() {
         return Err("--manifest is required".into());
     } else if options.validate_only {
-        if options.output.is_some() {
-            return Err("--validate-only does not accept --output".into());
+        if options.output.is_some() || options.require_quality {
+            return Err("--validate-only does not accept --output or --require-quality".into());
         }
     } else if options.output.is_none() {
         return Err("--output is required unless --validate-only is set".into());
@@ -777,6 +779,7 @@ pub fn execute(root: &Path, args: &[String]) -> bool {
 
 fn execute_result(root: &Path, args: &[String]) -> Result<(), String> {
     let options = parse_options(args)?;
+    let require_quality = options.require_quality;
     if let Some(path) = options.validate_report {
         let report = validate_report(&path)?;
         if let Some(manifest_path) = options.manifest {
@@ -792,6 +795,9 @@ fn execute_result(root: &Path, args: &[String]) -> Result<(), String> {
             "validated {} replay variants; quality={quality}",
             report.variants.len()
         );
+        if require_quality && report.quality_accepted != Some(true) {
+            return Err("replay quality was not accepted".into());
+        }
         return Ok(());
     }
     let manifest_path = options
@@ -854,5 +860,8 @@ fn execute_result(root: &Path, args: &[String]) -> Result<(), String> {
     let report = validate_report(&report_path)?;
     validate_report_matches(&report, &loaded)?;
     println!("quality replay report: {}", report_path.display());
+    if require_quality && report.quality_accepted != Some(true) {
+        return Err("replay quality was not accepted".into());
+    }
     Ok(())
 }

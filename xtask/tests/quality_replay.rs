@@ -139,6 +139,59 @@ fn validate_report_against_manifest(
     ])
 }
 
+fn require_quality_against_manifest(
+    directory: &TestDirectory,
+    manifest: &Value,
+    report: &Value,
+) -> Output {
+    let manifest_path = directory.write_manifest(manifest);
+    let report_path = directory.0.join("report.json");
+    fs::write(&report_path, serde_json::to_vec_pretty(report).unwrap()).unwrap();
+    invoke(&[
+        "quality-replay",
+        "--manifest",
+        manifest_path.to_str().unwrap(),
+        "--validate-report",
+        report_path.to_str().unwrap(),
+        "--require-quality",
+    ])
+}
+
+#[test]
+fn replay_requires_verified_quality_when_gate_is_requested() {
+    let directory = TestDirectory::new();
+    let manifest = valid_manifest(&directory.0);
+    let mut report = matching_report(&directory, &manifest);
+
+    let missing = require_quality_against_manifest(&directory, &manifest, &report);
+    assert!(!missing.status.success());
+
+    report["quality_accepted"] = json!(false);
+    let rejected = require_quality_against_manifest(&directory, &manifest, &report);
+    assert!(!rejected.status.success());
+
+    report["quality_accepted"] = json!(true);
+    let accepted = require_quality_against_manifest(&directory, &manifest, &report);
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+}
+
+#[test]
+fn replay_rejects_source_mismatch_before_quality_status() {
+    let directory = TestDirectory::new();
+    let manifest = valid_manifest(&directory.0);
+    let mut report = matching_report(&directory, &manifest);
+    report["quality_accepted"] = json!(true);
+    report["variants"][0]["consumed_frames"][0]["sha256"] = json!("0".repeat(64));
+
+    let result = require_quality_against_manifest(&directory, &manifest, &report);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("identical ordered source frames"));
+}
+
 fn gpu_manifest(directory: &TestDirectory) -> Value {
     gpu_manifest_for(directory, [32, 32], [64, 64], "captured-pan")
 }
