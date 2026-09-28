@@ -6,6 +6,8 @@ use tuxscaling_vulkan::{Image, image_barrier};
 mod reference;
 pub use reference::{ReferenceUpscaler, scaled_extent};
 
+pub mod protection;
+
 #[cfg(feature = "fidelityfx")]
 pub mod fidelityfx;
 
@@ -171,6 +173,18 @@ pub struct BackendImage {
     pub format: vk::Format,
     pub extent: vk::Extent2D,
     pub layout: vk::ImageLayout,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProtectionInputs {
+    pub motion: BackendImage,
+    pub history_risk: BackendImage,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AppliedMaskImages {
+    pub reactive: BackendImage,
+    pub composition: BackendImage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -809,6 +823,14 @@ pub trait UpscalerBackend: Send {
 
     fn input_diagnostics(&self) -> BackendInputDiagnostics {
         BackendInputDiagnostics::default()
+    }
+
+    fn protection_inputs(&self, _slot: usize) -> Option<ProtectionInputs> {
+        None
+    }
+
+    fn applied_masks(&self, _slot: usize) -> Option<AppliedMaskImages> {
+        None
     }
     fn configure(&mut self, config: BackendConfig) -> Result<(), BackendError>;
     /// Records backend commands into the supplied command buffer only.

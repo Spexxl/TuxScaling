@@ -918,6 +918,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "bytemuck",
+ "serde_json",
  "tracing",
  "tuxscaling-capture",
  "tuxscaling-config",
@@ -949,6 +950,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tuxscaling-config",
  "tuxscaling-motion",
  "tuxscaling-temporal",
  "tuxscaling-vulkan",

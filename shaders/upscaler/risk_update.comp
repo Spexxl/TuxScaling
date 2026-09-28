@@ -1,0 +1,38 @@
+#version 450
+
+layout(set = 0, binding = 0) uniform sampler2D current_risk;
+layout(set = 0, binding = 1) uniform sampler2D previous_risk;
+layout(set = 0, binding = 2) uniform sampler2D motion_image;
+layout(r8, set = 0, binding = 3) writeonly uniform image2D updated_risk;
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    float decay;
+    uint reset;
+} params;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(params.width) || pixel.y >= int(params.height)) {
+        return;
+    }
+
+    float current = texelFetch(current_risk, pixel, 0).r;
+    float previous = 0.0;
+    if (params.reset == 0u) {
+        vec2 motion = texelFetch(motion_image, pixel, 0).rg;
+        vec2 reprojected = vec2(pixel) + motion;
+        bool valid = !any(isnan(motion)) && !any(isinf(motion)) &&
+            all(greaterThanEqual(reprojected, vec2(0.0))) &&
+            all(lessThan(reprojected, vec2(params.width, params.height)));
+        if (valid) {
+            vec2 uv = (reprojected + vec2(0.5)) / vec2(params.width, params.height);
+            previous = texture(previous_risk, uv).r;
+        }
+    }
+    float risk = max(current, previous * params.decay);
+    imageStore(updated_risk, pixel, vec4(clamp(risk, 0.0, 1.0), 0.0, 0.0, 1.0));
+}

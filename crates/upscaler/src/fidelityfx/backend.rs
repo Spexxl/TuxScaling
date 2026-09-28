@@ -458,6 +458,22 @@ impl UpscalerBackend for Fsr314Upscaler {
         self.input_diagnostics
     }
 
+    fn protection_inputs(&self, slot: usize) -> Option<crate::ProtectionInputs> {
+        let inputs = self.input.outputs(slot % self.outputs.len());
+        Some(crate::ProtectionInputs {
+            motion: inputs.motion,
+            history_risk: inputs.history_risk,
+        })
+    }
+
+    fn applied_masks(&self, slot: usize) -> Option<crate::AppliedMaskImages> {
+        let inputs = self.input.outputs(slot % self.outputs.len());
+        Some(crate::AppliedMaskImages {
+            reactive: inputs.reactive,
+            composition: inputs.composition,
+        })
+    }
+
     fn configure(&mut self, config: BackendConfig) -> Result<(), BackendError> {
         config.validate(self.capabilities())?;
         if config.game_extent != self.config.game_extent

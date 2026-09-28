@@ -2,12 +2,17 @@
 #![allow(clippy::missing_safety_doc)]
 
 use ash::vk;
+use std::time::Duration;
+use tuxscaling_config::{ProtectionMode, ProtectionRegion};
 use tuxscaling_temporal::{
     DepthSemantics, FrameExtent, FrameTiming, GuidanceMetadata, GuidanceReset, GuidanceResolution,
     GuidanceResource, GuidanceScalar, GuidanceView, JitterSample, MotionDirection, MotionUnits,
     SignalState,
 };
 use tuxscaling_upscaler::fidelityfx::Fsr314Upscaler;
+use tuxscaling_upscaler::protection::{
+    ProtectionFrame, ProtectionRenderer, ProtectionSettings, record_spatial_blit,
+};
 use tuxscaling_upscaler::{
     BackendColorEncoding, BackendConfig, BackendEnvironment, BackendFrame, BackendImage,
     OutputSharpening, UpscalerBackend, content_viewport,
@@ -188,6 +193,9 @@ fn fsr314_lifecycle_dispatches_reset_and_native_aa() {
         guidance: guidance.capabilities(),
     };
     let mut backend = unsafe { Fsr314Upscaler::new(&environment, config, guidance, 1) }.unwrap();
+    let mut protection =
+        unsafe { ProtectionRenderer::new(&gpu.device, &gpu.memory, GAME, GAME, output.format, 1) }
+            .unwrap();
     assert_eq!(backend.id().as_str(), "fsr_3_1_4");
 
     let frame = BackendFrame {
@@ -242,6 +250,38 @@ fn fsr314_lifecycle_dispatches_reset_and_native_aa() {
             let mut frame = frame;
             frame.command_buffer = command;
             backend.record(frame).unwrap();
+            let inputs = backend.protection_inputs(0).unwrap();
+            protection
+                .record(ProtectionFrame {
+                    command,
+                    slot: 0,
+                    frame_id: 1,
+                    source: frame.source,
+                    output: frame.output,
+                    guidance: inputs,
+                    viewport: frame.viewport,
+                    settings: ProtectionSettings::new(
+                        ProtectionMode::Regions,
+                        &[ProtectionRegion::new([0.0, 0.0], [1.0, 1.0]).unwrap()],
+                    )
+                    .unwrap(),
+                    elapsed: Duration::from_millis(16),
+                    reset: true,
+                })
+                .unwrap();
+            let masks = backend.applied_masks(0).unwrap();
+            for image in [masks.reactive, masks.composition] {
+                record_spatial_blit(
+                    &gpu.device,
+                    command,
+                    image.image,
+                    image.extent,
+                    image.layout,
+                    output.handle,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    GAME,
+                );
+            }
         });
         backend.reset().unwrap();
         gpu.submit(|command| {

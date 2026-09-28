@@ -15,6 +15,7 @@ ash.workspace = true
 bytemuck.workspace = true
 libloading = { workspace = true, optional = true }
 thiserror.workspace = true
+tuxscaling-config = { path = "../config" }
 tuxscaling-temporal = { path = "../temporal" }
 tuxscaling-vulkan = { path = "../vulkan" }
 

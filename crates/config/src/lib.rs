@@ -5,6 +5,52 @@ pub const CRATE_NAME: &str = "tuxscaling-config";
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[repr(u32)]
+pub enum ProtectionMode {
+    #[default]
+    Disabled,
+    Adaptive,
+    Regions,
+    AdaptiveAndRegions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProtectionRegion {
+    min: [f32; 2],
+    max: [f32; 2],
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectionRegionError {
+    #[error("protection region bounds must be finite, ordered and within [0, 1]")]
+    InvalidBounds,
+}
+
+impl ProtectionRegion {
+    pub fn new(min: [f32; 2], max: [f32; 2]) -> Result<Self, ProtectionRegionError> {
+        if (0..2).any(|axis| {
+            !min[axis].is_finite()
+                || !max[axis].is_finite()
+                || min[axis] < 0.0
+                || max[axis] > 1.0
+                || min[axis] >= max[axis]
+        }) {
+            return Err(ProtectionRegionError::InvalidBounds);
+        }
+        Ok(Self { min, max })
+    }
+
+    pub const fn min(self) -> [f32; 2] {
+        self.min
+    }
+
+    pub const fn max(self) -> [f32; 2] {
+        self.max
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Upscaler {
     #[default]
     Reference,
@@ -30,6 +76,10 @@ pub struct Config {
     pub sharpness: f32,
     pub comparison_enabled: bool,
     pub comparison_split: f32,
+    #[serde(skip)]
+    pub protection_mode: ProtectionMode,
+    #[serde(skip)]
+    pub protection_regions: Vec<ProtectionRegion>,
     pub motion_quality: MotionQuality,
     pub output_resolution: OutputResolution,
     #[serde(alias = "processing_scale", alias = "render_scale")]
@@ -67,11 +117,11 @@ pub enum JitterMode {
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DebugView {
-    #[default]
     Original,
     Luminance,
     Motion,
     Confidence,
+    #[default]
     Reconstructed,
     History,
     Reactive,
@@ -79,6 +129,10 @@ pub enum DebugView {
     Depth,
     Composition,
     Exposure,
+    FsrRaw,
+    Protection,
+    ReactiveApplied,
+    CompositionApplied,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -127,13 +181,15 @@ impl Default for Config {
             upscaler: Upscaler::Reference,
             quality: "balanced".into(),
             toggle_key: "Insert".into(),
-            debug_view: DebugView::Original,
+            debug_view: DebugView::Reconstructed,
             jitter_mode: JitterMode::Off,
             guidance_mode: GuidanceMode::Estimated,
             sharpening_enabled: true,
             sharpness: 0.3,
             comparison_enabled: false,
             comparison_split: 0.5,
+            protection_mode: ProtectionMode::Disabled,
+            protection_regions: Vec::new(),
             motion_quality: MotionQuality::Balanced,
             output_resolution: OutputResolution::Native,
             guidance_scale: 1.0,
@@ -190,7 +246,7 @@ fn clamp_comparison_split(value: f32) -> f32 {
 mod tests {
     use super::{
         Config, ConfigError, DebugView, GuidanceMode, JitterMode, MotionQuality, OutputResolution,
-        Upscaler,
+        ProtectionMode, ProtectionRegion, Upscaler,
     };
 
     #[test]
@@ -257,6 +313,7 @@ mod tests {
 
         assert_eq!(config.output_resolution, OutputResolution::Native);
         assert_eq!(config.guidance_scale, 1.0);
+        assert_eq!(config.debug_view, DebugView::Reconstructed);
     }
 
     #[test]
@@ -285,6 +342,18 @@ mod tests {
         assert_eq!(DebugView::Depth as u32, 8);
         assert_eq!(DebugView::Composition as u32, 9);
         assert_eq!(DebugView::Exposure as u32, 10);
+    }
+
+    #[test]
+    fn debug_view_config_accepts_raw_fsr_and_applied_masks() {
+        for name in [
+            "fsr_raw",
+            "protection",
+            "reactive_applied",
+            "composition_applied",
+        ] {
+            assert!(Config::parse(&format!("debug_view = '{name}'")).is_ok());
+        }
     }
 
     #[test]
@@ -395,5 +464,24 @@ mod tests {
                 .comparison_split,
             0.5
         );
+    }
+
+    #[test]
+    fn protection_regions_require_finite_ordered_normalized_bounds() {
+        assert!(ProtectionRegion::new([0.0, 0.0], [1.0, 1.0]).is_ok());
+        assert!(ProtectionRegion::new([0.25, 0.25], [0.75, 0.5]).is_ok());
+        assert!(ProtectionRegion::new([0.5, 0.0], [0.5, 1.0]).is_err());
+        assert!(ProtectionRegion::new([0.75, 0.0], [0.5, 1.0]).is_err());
+        assert!(ProtectionRegion::new([-0.1, 0.0], [0.5, 1.0]).is_err());
+        assert!(ProtectionRegion::new([0.0, 0.0], [1.1, 1.0]).is_err());
+        assert!(ProtectionRegion::new([f32::NAN, 0.0], [0.5, 1.0]).is_err());
+        assert!(ProtectionRegion::new([0.0, 0.0], [f32::INFINITY, 1.0]).is_err());
+    }
+
+    #[test]
+    fn protection_starts_disabled_and_session_regions_are_empty() {
+        let config = Config::default();
+        assert_eq!(config.protection_mode, ProtectionMode::Disabled);
+        assert!(config.protection_regions.is_empty());
     }
 }

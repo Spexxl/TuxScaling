@@ -15,6 +15,8 @@ fn main() {
         "fidelityfx_color",
         "fidelityfx_input",
         "fidelityfx_output",
+        "risk_update",
+        "protect",
     ] {
         let source = shader_root.join(format!("{name}.comp"));
         println!("cargo:rerun-if-changed={}", source.display());

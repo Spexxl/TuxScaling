@@ -1,0 +1,64 @@
+#version 450
+
+layout(set = 0, binding = 0) uniform sampler2D fsr_raw;
+layout(set = 0, binding = 1) uniform sampler2D spatial_off;
+layout(set = 0, binding = 2) uniform sampler2D history_risk;
+layout(set = 0, binding = 3) writeonly uniform image2D output_image;
+layout(r8, set = 0, binding = 4) writeonly uniform image2D spatial_weight_image;
+
+layout(push_constant) uniform Params {
+    uint output_width;
+    uint output_height;
+    vec2 viewport_offset;
+    vec2 viewport_size;
+    vec2 source_extent;
+    uint mode;
+    uint region_count;
+    vec4 regions[4];
+} params;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+float region_weight(vec4 region, vec2 source_position) {
+    vec2 region_min = region.xy * params.source_extent;
+    vec2 region_max = region.zw * params.source_extent;
+    float distance_to_edge = min(
+        min(source_position.x - region_min.x, region_max.x - source_position.x),
+        min(source_position.y - region_min.y, region_max.y - source_position.y)
+    );
+    return clamp(0.5 + distance_to_edge / 2.0, 0.0, 1.0);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(params.output_width) || pixel.y >= int(params.output_height)) {
+        return;
+    }
+
+    vec2 output_extent = vec2(params.output_width, params.output_height);
+    vec2 center = vec2(pixel) + vec2(0.5);
+    vec2 local = (center - params.viewport_offset * output_extent) /
+        (params.viewport_size * output_extent);
+    if (any(lessThan(local, vec2(0.0))) || any(greaterThanEqual(local, vec2(1.0)))) {
+        imageStore(output_image, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(spatial_weight_image, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    float weight = 0.0;
+    if (params.mode == 1u || params.mode == 3u) {
+        weight = clamp(texture(history_risk, local).r, 0.0, 1.0);
+    }
+    if (params.mode == 2u || params.mode == 3u) {
+        vec2 source_position = local * params.source_extent;
+        for (uint index = 0u; index < params.region_count; ++index) {
+            weight = max(weight, region_weight(params.regions[index], source_position));
+        }
+    }
+
+    vec2 output_uv = center / output_extent;
+    vec4 temporal = texture(fsr_raw, output_uv);
+    vec4 spatial = texture(spatial_off, output_uv);
+    imageStore(output_image, pixel, mix(temporal, spatial, weight));
+    imageStore(spatial_weight_image, pixel, vec4(weight, 0.0, 0.0, 1.0));
+}

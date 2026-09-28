@@ -13,15 +13,21 @@ use tuxscaling_overlay_vulkan::{InputRouteConfig, OverlayRenderer, SwapchainInfo
 use tuxscaling_temporal::{
     DepthSemantics, FrameExtent, GuidanceAblations, GuidanceReset, JitterSample, SignalState,
 };
+use tuxscaling_upscaler::protection::record_spatial_blit;
 use tuxscaling_upscaler::{
     BackendError, BackendFrame, BackendImage, BackendInputDiagnostics, BackendInputState,
     OutputSharpening, ResolutionPlan, content_viewport,
 };
-use tuxscaling_vulkan::{compute_memory_barrier, image_barrier, transfer_memory_barrier};
+use tuxscaling_vulkan::{compute_memory_barrier, image_barrier};
 
+#[path = "debug_view.rs"]
+mod debug_view;
 #[path = "pipeline.rs"]
 mod pipeline;
+#[path = "protection.rs"]
+mod protection;
 use crate::next_generation_id;
+use debug_view::{DebugImage, DebugImages, record_debug_image, selected_debug_image};
 pub use pipeline::{FrameTimingState, TemporalPipeline, TemporalPipelineDescriptor, TimingState};
 
 pub type SetLoaderData = unsafe extern "system" fn(vk::Device, *mut std::ffi::c_void) -> vk::Result;
@@ -377,6 +383,10 @@ fn debug_mode_id(name: &str) -> Option<u32> {
         "depth" => 8,
         "composition" => 9,
         "exposure" => 10,
+        "fsr_raw" => 11,
+        "protection" => 12,
+        "reactive_applied" => 13,
+        "composition_applied" => 14,
         _ => return None,
     })
 }
@@ -394,19 +404,15 @@ fn debug_view_id(view: DebugView) -> u32 {
         DebugView::Depth => 8,
         DebugView::Composition => 9,
         DebugView::Exposure => 10,
+        DebugView::FsrRaw => 11,
+        DebugView::Protection => 12,
+        DebugView::ReactiveApplied => 13,
+        DebugView::CompositionApplied => 14,
     }
 }
 
-fn backend_debug_view(mode: u32) -> u32 {
-    match mode {
-        5 => 6,
-        6 => 1,
-        7 => 2,
-        8 => 3,
-        9 => 4,
-        10 => 5,
-        _ => 0,
-    }
+fn backend_debug_view(_mode: u32) -> u32 {
+    0
 }
 
 fn signal_name(state: SignalState) -> &'static str {
@@ -635,100 +641,6 @@ unsafe fn clear_guidance_image(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-unsafe fn record_spatial_blit(
-    device: &ash::Device,
-    command: vk::CommandBuffer,
-    source: vk::Image,
-    source_extent: vk::Extent2D,
-    source_layout: vk::ImageLayout,
-    output: vk::Image,
-    output_layout: vk::ImageLayout,
-    output_extent: vk::Extent2D,
-) {
-    let viewport = content_viewport(source_extent, output_extent);
-    let left = (viewport.offset[0] * output_extent.width as f32).round() as i32;
-    let top = (viewport.offset[1] * output_extent.height as f32).round() as i32;
-    let right =
-        ((viewport.offset[0] + viewport.size[0]) * output_extent.width as f32).round() as i32;
-    let bottom =
-        ((viewport.offset[1] + viewport.size[1]) * output_extent.height as f32).round() as i32;
-    let layers = vk::ImageSubresourceLayers::default()
-        .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .layer_count(1);
-    unsafe {
-        image_barrier(
-            device,
-            command,
-            source,
-            source_layout,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        );
-        image_barrier(
-            device,
-            command,
-            output,
-            output_layout,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        );
-        device.cmd_clear_color_image(
-            command,
-            output,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 0.0, 0.0, 1.0],
-            },
-            &[tuxscaling_vulkan::color_range()],
-        );
-        transfer_memory_barrier(device, command);
-        device.cmd_blit_image(
-            command,
-            source,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            output,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &[vk::ImageBlit::default()
-                .src_subresource(layers)
-                .dst_subresource(layers)
-                .src_offsets([
-                    vk::Offset3D::default(),
-                    vk::Offset3D {
-                        x: source_extent.width as i32,
-                        y: source_extent.height as i32,
-                        z: 1,
-                    },
-                ])
-                .dst_offsets([
-                    vk::Offset3D {
-                        x: left,
-                        y: top,
-                        z: 0,
-                    },
-                    vk::Offset3D {
-                        x: right,
-                        y: bottom,
-                        z: 1,
-                    },
-                ])],
-            vk::Filter::LINEAR,
-        );
-        image_barrier(
-            device,
-            command,
-            source,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            source_layout,
-        );
-        image_barrier(
-            device,
-            command,
-            output,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        );
-    }
-}
-
 unsafe fn create_output_views(
     device: &ash::Device,
     images: &[vk::Image],
@@ -936,6 +848,8 @@ impl SwapchainRuntime {
                 active_sharpness: config.sharpness,
                 active_comparison_enabled: config.comparison_enabled,
                 active_comparison_split: config.comparison_split,
+                active_protection_mode: config.protection_mode,
+                active_protection_regions: config.protection_regions.clone(),
                 jitter_mode: config.jitter_mode,
                 debug_view: config.debug_view,
                 fsr_motion_state: "NotReported".into(),
@@ -1159,6 +1073,9 @@ impl SwapchainRuntime {
         self.diagnostics.active_sharpness = self.requested_config.sharpness;
         self.diagnostics.active_comparison_enabled = self.requested_config.comparison_enabled;
         self.diagnostics.active_comparison_split = self.requested_config.comparison_split;
+        self.diagnostics.active_protection_mode = self.requested_config.protection_mode;
+        self.diagnostics.active_protection_regions =
+            self.requested_config.protection_regions.clone();
         update_ablation_diagnostics(&mut self.diagnostics, self.temporal.guidance_ablations);
         self.diagnostics.game_extent = [
             self.temporal.resolution.game_extent.width,
@@ -1631,6 +1548,9 @@ impl SwapchainRuntime {
         self.diagnostics.active_sharpness = self.temporal.config.sharpness;
         self.diagnostics.active_comparison_enabled = self.temporal.config.comparison_enabled;
         self.diagnostics.active_comparison_split = self.temporal.config.comparison_split;
+        self.diagnostics.active_protection_mode = self.temporal.config.protection_mode;
+        self.diagnostics.active_protection_regions =
+            self.temporal.config.protection_regions.clone();
         update_ablation_diagnostics(&mut self.diagnostics, self.temporal.guidance_ablations);
         self.diagnostics.history_valid = self.temporal.history.valid(self.temporal.pending_time);
         self.diagnostics.history_age = self.temporal.history_age;
@@ -1761,6 +1681,7 @@ impl SwapchainRuntime {
             self.requested_config.comparison_split = split;
             self.diagnostics.requested_comparison_split = Some(split);
         }
+        self.queue_protection_requests(&frame);
         emit_control_sequence_evidence(self.generation_id, &frame);
         if let Some(mode) = frame.requested_jitter_mode
             && self.temporal.jitter.set_mode(mode)
@@ -2305,6 +2226,11 @@ impl SwapchainRuntime {
                     );
                 }
             }
+            let protection_outputs = if backend_recorded {
+                self.record_protection_frame(slot.command, index, guidance_view, valid)
+            } else {
+                None
+            };
             let diagnostic_source = self.temporal.capture.as_ref().map(|capture| {
                 DiagnosticImage::new(
                     "source",
@@ -2326,6 +2252,73 @@ impl SwapchainRuntime {
                 diagnostic_source,
                 true,
             );
+            if backend_recorded
+                && self.temporal.active_upscaler == Upscaler::Fsr314
+                && let Some(inputs) = self
+                    .temporal
+                    .upscaler
+                    .as_ref()
+                    .and_then(|backend| backend.protection_inputs(index))
+                && let Some(capture) = &mut self.diagnostic_capture
+            {
+                capture.record_additional(
+                    slot.command,
+                    index,
+                    DiagnosticImage::new(
+                        "history_risk",
+                        inputs.history_risk.image,
+                        inputs.history_risk.extent,
+                        inputs.history_risk.format,
+                        inputs.history_risk.layout,
+                    ),
+                );
+            }
+            if backend_recorded
+                && self.temporal.active_upscaler == Upscaler::Fsr314
+                && let Some(masks) = self
+                    .temporal
+                    .upscaler
+                    .as_ref()
+                    .and_then(|backend| backend.applied_masks(index))
+                && let Some(capture) = &mut self.diagnostic_capture
+            {
+                for (name, image) in [
+                    ("reactive_applied", masks.reactive),
+                    ("composition_applied", masks.composition),
+                ] {
+                    capture.record_additional(
+                        slot.command,
+                        index,
+                        DiagnosticImage::new(
+                            name,
+                            image.image,
+                            image.extent,
+                            image.format,
+                            image.layout,
+                        ),
+                    );
+                }
+            }
+            if let (Some(capture), Some(outputs)) =
+                (&mut self.diagnostic_capture, protection_outputs)
+            {
+                for (name, image) in [
+                    ("fsr_raw", outputs.fsr_raw),
+                    ("protection_weight", outputs.spatial_weight),
+                ] {
+                    capture.record_additional(
+                        slot.command,
+                        index,
+                        DiagnosticImage::new(
+                            name,
+                            image.image,
+                            image.extent,
+                            image.format,
+                            image.layout,
+                        ),
+                    );
+                }
+            }
             if backend_recorded
                 && self.temporal.config.comparison_enabled
                 && let (Some(comparison), Some(source)) =
@@ -2361,68 +2354,74 @@ impl SwapchainRuntime {
                     );
                 }
             }
-            if self.mode != 0
-                && self.mode <= 3
-                && let Some(motion) = &self.temporal.motion
-            {
-                image_barrier(
+            let mut debug_images = DebugImages::default();
+            if let Some(capture) = &self.temporal.capture {
+                debug_images.original = Some(DebugImage {
+                    image: capture.source.color.handle,
+                    extent: capture.source.color.extent,
+                    layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                });
+            }
+            if backend_recorded {
+                if let Some(motion) = &self.temporal.motion {
+                    debug_images.visualization = Some(DebugImage {
+                        image: motion.visualization.handle,
+                        extent: motion.visualization.extent,
+                        layout: vk::ImageLayout::GENERAL,
+                    });
+                }
+                if let Some(guidance) = &self.temporal.guidance {
+                    let guidance_image = |image: &tuxscaling_vulkan::Image| DebugImage {
+                        image: image.handle,
+                        extent: image.extent,
+                        layout: vk::ImageLayout::GENERAL,
+                    };
+                    debug_images.reactive_estimated = Some(guidance_image(&guidance.reactive));
+                    debug_images.disocclusion = Some(guidance_image(&guidance.disocclusion));
+                    debug_images.depth = Some(guidance_image(&guidance.depth));
+                    debug_images.composition_estimated =
+                        Some(guidance_image(&guidance.transparency));
+                    debug_images.exposure = Some(guidance_image(&guidance.exposure));
+                }
+                if self.temporal.active_upscaler == Upscaler::Fsr314 {
+                    if let Some(masks) = self
+                        .temporal
+                        .upscaler
+                        .as_ref()
+                        .and_then(|backend| backend.applied_masks(index))
+                    {
+                        debug_images.reactive_applied = Some(DebugImage {
+                            image: masks.reactive.image,
+                            extent: masks.reactive.extent,
+                            layout: masks.reactive.layout,
+                        });
+                        debug_images.composition_applied = Some(DebugImage {
+                            image: masks.composition.image,
+                            extent: masks.composition.extent,
+                            layout: masks.composition.layout,
+                        });
+                    }
+                    if let Some(outputs) = protection_outputs {
+                        debug_images.fsr_raw = Some(DebugImage {
+                            image: outputs.fsr_raw.image,
+                            extent: outputs.fsr_raw.extent,
+                            layout: outputs.fsr_raw.layout,
+                        });
+                        debug_images.protection = Some(DebugImage {
+                            image: outputs.spatial_weight.image,
+                            extent: outputs.spatial_weight.extent,
+                            layout: outputs.spatial_weight.layout,
+                        });
+                    }
+                }
+            }
+            if let Some(source) = selected_debug_image(self.mode, &debug_images) {
+                record_debug_image(
                     &self.device,
                     slot.command,
-                    motion.visualization.handle,
-                    vk::ImageLayout::GENERAL,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                );
-                image_barrier(
-                    &self.device,
-                    slot.command,
+                    source,
                     self.output_images[index],
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                );
-                let layers = vk::ImageSubresourceLayers::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .layer_count(1);
-                let region = vk::ImageBlit::default()
-                    .src_subresource(layers)
-                    .dst_subresource(layers)
-                    .src_offsets([
-                        vk::Offset3D::default(),
-                        vk::Offset3D {
-                            x: motion.visualization.extent.width as i32,
-                            y: motion.visualization.extent.height as i32,
-                            z: 1,
-                        },
-                    ])
-                    .dst_offsets([
-                        vk::Offset3D::default(),
-                        vk::Offset3D {
-                            x: self.info.extent.width as i32,
-                            y: self.info.extent.height as i32,
-                            z: 1,
-                        },
-                    ]);
-                self.device.cmd_blit_image(
-                    slot.command,
-                    motion.visualization.handle,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    self.output_images[index],
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[region],
-                    vk::Filter::NEAREST,
-                );
-                image_barrier(
-                    &self.device,
-                    slot.command,
-                    motion.visualization.handle,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    vk::ImageLayout::GENERAL,
-                );
-                image_barrier(
-                    &self.device,
-                    slot.command,
-                    self.output_images[index],
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    self.temporal.resolution.output_extent,
                 );
             }
             if self.temporal.queries != vk::QueryPool::null() {
@@ -2669,6 +2668,7 @@ impl SwapchainRuntime {
             self.requested_config.comparison_split = split;
             self.diagnostics.requested_comparison_split = Some(split);
         }
+        self.queue_protection_requests(&frame);
         emit_control_sequence_evidence(self.generation_id, &frame);
         unsafe {
             self.device
@@ -2974,10 +2974,10 @@ mod tests {
     }
 
     #[test]
-    fn backend_debug_view_keeps_history_and_signal_modes() {
-        assert_eq!(backend_debug_view(5), 6);
-        assert_eq!(backend_debug_view(6), 1);
-        assert_eq!(backend_debug_view(10), 5);
+    fn backend_debug_view_never_claims_internal_history_or_common_signals() {
+        assert_eq!(backend_debug_view(5), 0);
+        assert_eq!(backend_debug_view(6), 0);
+        assert_eq!(backend_debug_view(10), 0);
         assert_eq!(backend_debug_view(4), 0);
     }
 

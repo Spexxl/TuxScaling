@@ -2,7 +2,9 @@ use egui::{
     ClippedPrimitive, Color32, Context, Id, LayerId, Order, Pos2, RawInput, Rect, Shape, Stroke,
     TexturesDelta, vec2,
 };
-use tuxscaling_config::{DebugView, GuidanceMode, JitterMode, MotionQuality, Upscaler};
+use tuxscaling_config::{
+    DebugView, GuidanceMode, JitterMode, MotionQuality, ProtectionMode, ProtectionRegion, Upscaler,
+};
 
 pub const CRATE_NAME: &str = "tuxscaling-overlay";
 
@@ -42,6 +44,10 @@ pub struct FrameDiagnostics {
     pub requested_comparison_enabled: Option<bool>,
     pub active_comparison_split: f32,
     pub requested_comparison_split: Option<f32>,
+    pub active_protection_mode: ProtectionMode,
+    pub requested_protection_mode: Option<ProtectionMode>,
+    pub active_protection_regions: Vec<ProtectionRegion>,
+    pub requested_protection_regions: Option<Vec<ProtectionRegion>>,
     pub requested_jitter_mode: Option<JitterMode>,
     pub requested_debug_view: Option<DebugView>,
     pub jitter_mode: JitterMode,
@@ -124,12 +130,34 @@ pub fn debug_view_label(view: DebugView) -> &'static str {
         DebugView::Motion => "Motion",
         DebugView::Confidence => "Confidence",
         DebugView::Reconstructed => "Reconstructed",
-        DebugView::History => "History",
-        DebugView::Reactive => "Reactive",
+        DebugView::History => "FSR history (unavailable)",
+        DebugView::Reactive => "Reactive (estimated)",
         DebugView::Disocclusion => "Disocclusion",
         DebugView::Depth => "Depth",
-        DebugView::Composition => "Composition",
+        DebugView::Composition => "Composition (estimated)",
         DebugView::Exposure => "Exposure",
+        DebugView::FsrRaw => "FSR raw",
+        DebugView::Protection => "Protection weight",
+        DebugView::ReactiveApplied => "Reactive (FSR applied)",
+        DebugView::CompositionApplied => "Composition (FSR applied)",
+    }
+}
+
+fn debug_view_available(view: DebugView, diagnostics: &FrameDiagnostics) -> bool {
+    if diagnostics.fallback_reason.is_some() {
+        return matches!(view, DebugView::Original | DebugView::Reconstructed);
+    }
+    match view {
+        DebugView::Original | DebugView::Reconstructed => true,
+        DebugView::History => false,
+        DebugView::FsrRaw | DebugView::ReactiveApplied | DebugView::CompositionApplied => {
+            diagnostics.active_upscaler == Upscaler::Fsr314
+        }
+        DebugView::Protection => {
+            diagnostics.active_upscaler == Upscaler::Fsr314
+                && diagnostics.active_protection_mode != ProtectionMode::Disabled
+        }
+        _ => diagnostics.active_upscaler != Upscaler::Off,
     }
 }
 
@@ -211,6 +239,8 @@ pub fn render_diagnostics(
     diagnostics.requested_sharpness = None;
     diagnostics.requested_comparison_enabled = None;
     diagnostics.requested_comparison_split = None;
+    diagnostics.requested_protection_mode = None;
+    diagnostics.requested_protection_regions = None;
     diagnostics.requested_jitter_mode = None;
     diagnostics.requested_debug_view = None;
     let software_cursor_visible =
@@ -452,6 +482,7 @@ pub fn render_diagnostics(
                                 }
                                 ui.small("Left: Off | Right: active backend");
                             }
+                            protection_controls(ui, diagnostics);
                             let mut jitter_mode = diagnostics.jitter_mode;
                             egui::ComboBox::from_label("Capture jitter")
                                 .selected_text(format_jitter_mode(jitter_mode))
@@ -488,15 +519,22 @@ pub fn render_diagnostics(
                                         DebugView::Depth,
                                         DebugView::Composition,
                                         DebugView::Exposure,
+                                        DebugView::FsrRaw,
+                                        DebugView::Protection,
+                                        DebugView::ReactiveApplied,
+                                        DebugView::CompositionApplied,
                                     ] {
                                         if ui
-                                            .selectable_value(
-                                                &mut debug_view,
-                                                view,
-                                                debug_view_label(view),
+                                            .add_enabled(
+                                                debug_view_available(view, diagnostics),
+                                                egui::Button::selectable(
+                                                    debug_view == view,
+                                                    debug_view_label(view),
+                                                ),
                                             )
-                                            .changed()
+                                            .clicked()
                                         {
+                                            debug_view = view;
                                             diagnostics.requested_debug_view = Some(view);
                                         }
                                     }
@@ -615,6 +653,8 @@ pub fn render_diagnostics(
         requested_sharpness: diagnostics.requested_sharpness,
         requested_comparison_enabled: diagnostics.requested_comparison_enabled,
         requested_comparison_split: diagnostics.requested_comparison_split,
+        requested_protection_mode: diagnostics.requested_protection_mode,
+        requested_protection_regions: diagnostics.requested_protection_regions.clone(),
         requested_jitter_mode: diagnostics.requested_jitter_mode,
         requested_debug_view: diagnostics.requested_debug_view,
         software_cursor_visible,
@@ -625,6 +665,77 @@ fn ablation_checkbox(ui: &mut egui::Ui, label: &str, active: bool, requested: &m
     let mut selected = active;
     if ui.checkbox(&mut selected, label).changed() {
         *requested = Some(selected);
+    }
+}
+
+fn protection_controls(ui: &mut egui::Ui, diagnostics: &mut FrameDiagnostics) {
+    let mut mode = diagnostics.active_protection_mode;
+    egui::ComboBox::from_label("Local protection")
+        .selected_text(format_protection_mode(mode))
+        .show_ui(ui, |ui| {
+            for candidate in [
+                ProtectionMode::Disabled,
+                ProtectionMode::Adaptive,
+                ProtectionMode::Regions,
+                ProtectionMode::AdaptiveAndRegions,
+            ] {
+                if ui
+                    .selectable_value(&mut mode, candidate, format_protection_mode(candidate))
+                    .changed()
+                {
+                    diagnostics.requested_protection_mode = Some(candidate);
+                }
+            }
+        });
+    let mut regions = diagnostics.active_protection_regions.clone();
+    let mut changed = false;
+    let mut remove_index = None;
+    for (index, region) in regions.iter_mut().enumerate() {
+        ui.push_id(index, |ui| {
+            ui.collapsing(format!("Region {}", index + 1), |ui| {
+                let mut min = region.min();
+                let mut max = region.max();
+                let edited = ui
+                    .add(egui::Slider::new(&mut min[0], 0.0..=1.0).text("Left"))
+                    .changed()
+                    | ui.add(egui::Slider::new(&mut min[1], 0.0..=1.0).text("Top"))
+                        .changed()
+                    | ui.add(egui::Slider::new(&mut max[0], 0.0..=1.0).text("Right"))
+                        .changed()
+                    | ui.add(egui::Slider::new(&mut max[1], 0.0..=1.0).text("Bottom"))
+                        .changed();
+                if edited && let Ok(updated) = ProtectionRegion::new(min, max) {
+                    *region = updated;
+                    changed = true;
+                }
+                if ui.button("Remove region").clicked() {
+                    remove_index = Some(index);
+                }
+            });
+        });
+    }
+    if let Some(index) = remove_index {
+        regions.remove(index);
+        changed = true;
+    }
+    if regions.len() < 4
+        && ui.button("Add region").clicked()
+        && let Ok(region) = ProtectionRegion::new([0.0, 0.0], [0.2, 0.2])
+    {
+        regions.push(region);
+        changed = true;
+    }
+    if changed {
+        diagnostics.requested_protection_regions = Some(regions);
+    }
+}
+
+fn format_protection_mode(mode: ProtectionMode) -> &'static str {
+    match mode {
+        ProtectionMode::Disabled => "Disabled",
+        ProtectionMode::Adaptive => "Adaptive",
+        ProtectionMode::Regions => "Regions",
+        ProtectionMode::AdaptiveAndRegions => "Adaptive + regions",
     }
 }
 
@@ -779,6 +890,8 @@ pub struct OverlayFrame {
     pub requested_sharpness: Option<f32>,
     pub requested_comparison_enabled: Option<bool>,
     pub requested_comparison_split: Option<f32>,
+    pub requested_protection_mode: Option<ProtectionMode>,
+    pub requested_protection_regions: Option<Vec<ProtectionRegion>>,
     pub requested_jitter_mode: Option<JitterMode>,
     pub requested_debug_view: Option<DebugView>,
     pub software_cursor_visible: bool,
@@ -829,6 +942,8 @@ pub fn render_smoke_frame(
         requested_sharpness: None,
         requested_comparison_enabled: None,
         requested_comparison_split: None,
+        requested_protection_mode: None,
+        requested_protection_regions: None,
         requested_jitter_mode: None,
         requested_debug_view: None,
         software_cursor_visible: false,
@@ -859,9 +974,9 @@ impl Default for OverlayState {
 #[cfg(test)]
 mod tests {
     use super::{
-        FrameDiagnostics, OverlayState, debug_view_label, guidance_scale_request,
-        input_to_output_scale, render_diagnostics, render_smoke_frame, resolution_mode,
-        software_cursor_is_visible,
+        FrameDiagnostics, OverlayState, debug_view_available, debug_view_label,
+        guidance_scale_request, input_to_output_scale, render_diagnostics, render_smoke_frame,
+        resolution_mode, software_cursor_is_visible,
     };
     use tuxscaling_config::{DebugView, GuidanceMode, MotionQuality, Upscaler};
 
@@ -1011,8 +1126,34 @@ mod tests {
     #[test]
     fn labels_new_guidance_debug_views() {
         assert_eq!(debug_view_label(DebugView::Depth), "Depth");
-        assert_eq!(debug_view_label(DebugView::Composition), "Composition");
+        assert_eq!(
+            debug_view_label(DebugView::Composition),
+            "Composition (estimated)"
+        );
+        assert_eq!(
+            debug_view_label(DebugView::CompositionApplied),
+            "Composition (FSR applied)"
+        );
         assert_eq!(debug_view_label(DebugView::Exposure), "Exposure");
+    }
+
+    #[test]
+    fn debug_choices_hide_unavailable_history_and_stale_off_signals() {
+        let mut diagnostics = FrameDiagnostics {
+            active_upscaler: Upscaler::Off,
+            ..Default::default()
+        };
+        assert!(debug_view_available(DebugView::Original, &diagnostics));
+        assert!(!debug_view_available(DebugView::Reactive, &diagnostics));
+        assert!(!debug_view_available(DebugView::History, &diagnostics));
+        diagnostics.active_upscaler = Upscaler::Fsr314;
+        assert!(debug_view_available(
+            DebugView::ReactiveApplied,
+            &diagnostics
+        ));
+        assert!(!debug_view_available(DebugView::Protection, &diagnostics));
+        diagnostics.active_protection_mode = tuxscaling_config::ProtectionMode::Regions;
+        assert!(debug_view_available(DebugView::Protection, &diagnostics));
     }
 
     #[test]

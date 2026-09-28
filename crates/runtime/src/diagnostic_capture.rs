@@ -384,10 +384,97 @@ fn try_enqueue_capture(
 
 fn write_capture_task(task: CaptureWriteTask) -> io::Result<()> {
     let frame_prefix = format!("frame-{:08}", task.frame_id);
+    let mut metadata: serde_json::Value = serde_json::from_slice(&task.metadata)
+        .map_err(|error| io::Error::other(format!("capture metadata: {error}")))?;
+    if let Some((file, bytes)) = task
+        .resources
+        .iter()
+        .find(|(file, _)| file == &format!("{frame_prefix}-protection_weight.bin"))
+    {
+        let layout = metadata["resources"]
+            .as_array()
+            .and_then(|resources| resources.iter().find(|resource| resource["file"] == *file))
+            .ok_or_else(|| io::Error::other("protection weight layout missing"))?;
+        let extent = layout["extent"]
+            .as_array()
+            .and_then(|values| Some([values.first()?.as_u64()?, values.get(1)?.as_u64()?]))
+            .ok_or_else(|| io::Error::other("protection weight extent invalid"))?;
+        let viewport = metadata["viewport"]
+            .as_array()
+            .and_then(|values| {
+                Some([
+                    values.first()?.as_f64()?,
+                    values.get(1)?.as_f64()?,
+                    values.get(2)?.as_f64()?,
+                    values.get(3)?.as_f64()?,
+                ])
+            })
+            .ok_or_else(|| io::Error::other("protection viewport invalid"))?;
+        let stats = spatial_weight_stats(bytes, extent, viewport)
+            .ok_or_else(|| io::Error::other("protection mask dimensions invalid"))?;
+        metadata["spatial_weight_stats"] = serde_json::json!({
+            "mean": stats.mean,
+            "max": stats.max,
+            "coverage_ge_half": stats.coverage_ge_half,
+            "content_pixels": stats.content_pixels,
+        });
+    }
     for (file, bytes) in task.resources {
         write_atomic(&task.root, &file, &bytes)?;
     }
-    write_atomic(&task.root, &format!("{frame_prefix}.json"), &task.metadata)
+    let report = serde_json::to_vec(&metadata)
+        .map_err(|error| io::Error::other(format!("capture metadata: {error}")))?;
+    write_atomic(&task.root, &format!("{frame_prefix}.json"), &report)
+}
+
+struct SpatialWeightStats {
+    mean: f64,
+    max: f64,
+    coverage_ge_half: f64,
+    content_pixels: usize,
+}
+
+fn spatial_weight_stats(
+    bytes: &[u8],
+    extent: [u64; 2],
+    viewport: [f64; 4],
+) -> Option<SpatialWeightStats> {
+    let width = usize::try_from(extent[0]).ok()?;
+    let height = usize::try_from(extent[1]).ok()?;
+    if bytes.len() != width.checked_mul(height)?
+        || width == 0
+        || height == 0
+        || !viewport.iter().all(|value| value.is_finite())
+        || viewport[2] <= 0.0
+        || viewport[3] <= 0.0
+    {
+        return None;
+    }
+    let mut sum = 0_u64;
+    let mut maximum = 0_u8;
+    let mut covered = 0_usize;
+    let mut count = 0_usize;
+    for (index, value) in bytes.iter().copied().enumerate() {
+        let x = ((index % width) as f64 + 0.5) / width as f64;
+        let y = ((index / width) as f64 + 0.5) / height as f64;
+        if x < viewport[0]
+            || y < viewport[1]
+            || x >= viewport[0] + viewport[2]
+            || y >= viewport[1] + viewport[3]
+        {
+            continue;
+        }
+        sum += u64::from(value);
+        maximum = maximum.max(value);
+        covered += usize::from(value >= 128);
+        count += 1;
+    }
+    (count > 0).then_some(SpatialWeightStats {
+        mean: sum as f64 / (count as f64 * 255.0),
+        max: f64::from(maximum) / 255.0,
+        coverage_ge_half: covered as f64 / count as f64,
+        content_pixels: count,
+    })
 }
 
 struct CaptureWriter {
@@ -779,6 +866,9 @@ fn resource_layouts(
     let definitions = [
         ("source", game_extent, output_format),
         ("reconstructed", output_extent, output_format),
+        ("fsr_raw", output_extent, output_format),
+        ("protection_weight", output_extent, vk::Format::R8_UNORM),
+        ("history_risk", game_extent, vk::Format::R8_UNORM),
         ("spatial_off", output_extent, output_format),
         ("comparison", output_extent, output_format),
         ("motion", guidance_extent, vk::Format::R16G16_SFLOAT),
@@ -786,6 +876,8 @@ fn resource_layouts(
         ("disocclusion", guidance_extent, vk::Format::R8_UNORM),
         ("reactive", guidance_extent, vk::Format::R8_UNORM),
         ("composition", guidance_extent, vk::Format::R8_UNORM),
+        ("reactive_applied", game_extent, vk::Format::R8_UNORM),
+        ("composition_applied", game_extent, vk::Format::R8_UNORM),
         ("relative_depth", guidance_extent, vk::Format::R32_SFLOAT),
         (
             "exposure",
@@ -1141,6 +1233,34 @@ mod tests {
     }
 
     #[test]
+    fn capture_writer_reports_spatial_coverage_from_completed_mask() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tuxscaling-capture-weight-{}-{nonce}",
+            std::process::id()
+        ));
+        let file = "frame-00000009-protection_weight.bin";
+        let metadata = format!(
+            "{{\"frame_id\":9,\"viewport\":[0,0,1,1],\"resources\":[{{\"name\":\"protection_weight\",\"file\":\"{file}\",\"extent\":[4,2]}}]}}"
+        );
+        write_capture_task(CaptureWriteTask {
+            root: root.clone(),
+            frame_id: 9,
+            resources: vec![(file.into(), vec![0, 128, 255, 255, 0, 0, 0, 0])],
+            metadata: metadata.into_bytes(),
+        })
+        .unwrap();
+
+        let report = fs::read_to_string(root.join("frame-00000009.json")).unwrap();
+        assert!(report.contains("\"spatial_weight_stats\""));
+        assert!(report.contains("\"coverage_ge_half\":0.375"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn capture_writer_shutdown_drains_queued_frames_before_returning() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1194,7 +1314,16 @@ mod tests {
             vk::Format::R8G8B8A8_UNORM,
         )
         .unwrap();
-        assert_eq!(layouts.len(), 11);
+        assert_eq!(layouts.len(), 16);
+        for name in [
+            "fsr_raw",
+            "protection_weight",
+            "history_risk",
+            "reactive_applied",
+            "composition_applied",
+        ] {
+            assert!(layouts.iter().any(|layout| layout.name == name));
+        }
         for pair in layouts.windows(2) {
             assert!(pair[0].offset + pair[0].size as u64 <= pair[1].offset);
         }

@@ -155,7 +155,9 @@ impl FsrInputAdapter {
             ));
         }
 
-        let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE;
+        let usage = vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::STORAGE
+            | vk::ImageUsageFlags::TRANSFER_SRC;
         let mut slots = Vec::with_capacity(image_count);
         for _ in 0..image_count {
             let motion = unsafe {

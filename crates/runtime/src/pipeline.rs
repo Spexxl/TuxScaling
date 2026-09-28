@@ -2,12 +2,13 @@ use super::{Capture, GpuTimingWindow, SwapchainInfo};
 use ash::vk;
 use std::time::{Duration, Instant};
 use tuxscaling_capture::{GuidanceCapture, JitterState};
-use tuxscaling_config::{Config, GuidanceMode, Upscaler};
+use tuxscaling_config::{Config, GuidanceMode, ProtectionMode, ProtectionRegion, Upscaler};
 use tuxscaling_motion::{MotionEstimator, MotionQuality};
 use tuxscaling_temporal::{
     FrameTiming, GuidanceAblations, GuidanceEstimator, GuidanceReset, GuidanceResolver,
     GuidanceView, History,
 };
+use tuxscaling_upscaler::protection::{MAX_PROTECTION_REGIONS, ProtectionRenderer};
 use tuxscaling_upscaler::{
     BackendColorEncoding, BackendConfig, BackendEnvironment, BackendError, BackendFrame,
     ComparisonRenderer, ReferenceUpscaler, ResolutionPlan, UpscalerBackend, content_viewport,
@@ -201,6 +202,8 @@ pub struct TemporalPipeline {
     pub(crate) pending_sharpness: Option<f32>,
     pub(crate) pending_comparison_enabled: Option<bool>,
     pub(crate) pending_comparison_split: Option<f32>,
+    pub(crate) pending_protection_mode: Option<ProtectionMode>,
+    pub(crate) pending_protection_regions: Option<Vec<ProtectionRegion>>,
     pub(crate) active_upscaler: Upscaler,
     pub(crate) pending_upscaler: Option<Upscaler>,
     pub(crate) unavailable_upscaler: Option<Upscaler>,
@@ -212,6 +215,7 @@ pub struct TemporalPipeline {
     pub(crate) config: Config,
     pub(crate) jitter: JitterState,
     pub(crate) comparison: Option<ComparisonRenderer>,
+    pub(crate) protection: Option<ProtectionRenderer>,
     pub(crate) history_age: u64,
 }
 
@@ -438,6 +442,8 @@ impl TemporalPipeline {
             pending_sharpness: None,
             pending_comparison_enabled: None,
             pending_comparison_split: None,
+            pending_protection_mode: None,
+            pending_protection_regions: None,
             active_upscaler,
             pending_upscaler: None,
             unavailable_upscaler: None,
@@ -449,6 +455,7 @@ impl TemporalPipeline {
             config: config.clone(),
             jitter: JitterState::new(config.jitter_mode),
             comparison,
+            protection: None,
             history_age: 0,
         })
     }
@@ -658,6 +665,16 @@ impl TemporalPipeline {
         }
     }
 
+    pub(crate) fn request_protection_mode(&mut self, mode: ProtectionMode) {
+        self.pending_protection_mode = (mode != self.config.protection_mode).then_some(mode);
+    }
+
+    pub(crate) fn request_protection_regions(&mut self, regions: Vec<ProtectionRegion>) {
+        if regions.len() <= MAX_PROTECTION_REGIONS && regions != self.config.protection_regions {
+            self.pending_protection_regions = Some(regions);
+        }
+    }
+
     pub(crate) fn apply_pending_manual_controls(&mut self) -> bool {
         let mut reset_history = false;
         if let Some(mode) = self.pending_guidance_mode.take()
@@ -683,6 +700,15 @@ impl TemporalPipeline {
         }
         if let Some(split) = self.pending_comparison_split.take() {
             self.config.comparison_split = split;
+        }
+        if let Some(mode) = self.pending_protection_mode.take() {
+            self.config.protection_mode = mode;
+            if let Some(protection) = &mut self.protection {
+                protection.reset();
+            }
+        }
+        if let Some(regions) = self.pending_protection_regions.take() {
+            self.config.protection_regions = regions;
         }
         if reset_history {
             self.reset_history(GuidanceReset::PresetChanged);
@@ -791,6 +817,8 @@ impl TemporalPipeline {
             pending_sharpness: None,
             pending_comparison_enabled: None,
             pending_comparison_split: None,
+            pending_protection_mode: None,
+            pending_protection_regions: None,
             active_upscaler: Upscaler::Reference,
             pending_upscaler: None,
             unavailable_upscaler: None,
@@ -802,6 +830,7 @@ impl TemporalPipeline {
             config: Config::default(),
             jitter: JitterState::default(),
             comparison: None,
+            protection: None,
             history_age: 0,
         }
     }
