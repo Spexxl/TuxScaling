@@ -448,6 +448,7 @@ struct VkcubeOptions {
     sharpening_enabled: bool,
     sharpness: f32,
     control_sequence: bool,
+    mangohud: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -642,6 +643,7 @@ fn parse_vkcube_args(args: &[&str]) -> Result<VkcubeOptions, String> {
         sharpening_enabled: true,
         sharpness: 0.3,
         control_sequence: false,
+        mangohud: false,
     };
     let mut backend_seen = false;
     let mut sharpening_seen = false;
@@ -685,6 +687,8 @@ fn parse_vkcube_args(args: &[&str]) -> Result<VkcubeOptions, String> {
             "--control-sequence" => {
                 return Err("--control-sequence may only be specified once".into());
             }
+            "--mangohud" if !options.mangohud => options.mangohud = true,
+            "--mangohud" => return Err("--mangohud may only be specified once".into()),
             "--sharpness" if !sharpening_seen => {
                 sharpening_seen = true;
                 index += 1;
@@ -778,6 +782,20 @@ fn classify_vkcube_output(stdout: &[u8], stderr: &[u8]) -> (bool, bool) {
     )
 }
 
+fn mangohud_downstream_loader_evidence(output: &str) -> bool {
+    let Some((_, stack)) = output.rsplit_once("vkCreateDevice layer callstack setup to:") else {
+        return false;
+    };
+    let stack = stack.split("<Drivers>").next().unwrap_or_default();
+    match (
+        stack.find("VK_LAYER_TUXSCALING_overlay"),
+        stack.find("VK_LAYER_MANGOHUD_overlay_x86_64"),
+    ) {
+        (Some(tux), Some(mango)) => tux < mango,
+        _ => false,
+    }
+}
+
 fn configure_vkcube_command(root: &Path, options: VkcubeOptions) -> Command {
     let launch = vkcube_launch(root, options);
     let inherited = std::env::var_os("LD_LIBRARY_PATH").unwrap_or_default();
@@ -800,6 +818,27 @@ fn configure_vkcube_command(root: &Path, options: VkcubeOptions) -> Command {
     if options.control_sequence {
         command.env("TUXSCALING_TEST_CONTROL_SEQUENCE", "1");
     }
+    if options.mangohud {
+        let inherited = std::env::var("MANGOHUD_CONFIG").unwrap_or_default();
+        let visible_config = if inherited.is_empty() {
+            "no_display=0".to_owned()
+        } else {
+            format!("{inherited},no_display=0")
+        };
+        command
+            .env_remove("MANGOHUD")
+            .env_remove("DISABLE_MANGOHUD")
+            .env("MANGOHUD_CONFIG", visible_config)
+            // Installed MangoHud reproduces a sync-validation LOAD hazard
+            // without this layer. Keep core validation active for this visual
+            // composition check; the strict sync result is reported separately.
+            .env("VK_LAYER_VALIDATE_SYNC", "0")
+            .env("VK_LOADER_DEBUG", "layer")
+            .env(
+                "VK_INSTANCE_LAYERS",
+                "VK_LAYER_TUXSCALING_overlay:VK_LAYER_MANGOHUD_overlay_x86_64:VK_LAYER_KHRONOS_validation",
+            );
+    }
     command
 }
 
@@ -808,6 +847,7 @@ fn wait_for_vkcube(
     seconds: u64,
     backend: BackendSelection,
     control_sequence: bool,
+    mangohud: bool,
 ) -> VkcubeExit {
     let Some(mut stdout) = child.stdout.take() else {
         return VkcubeExit::UnexpectedExit;
@@ -870,7 +910,8 @@ fn wait_for_vkcube(
     let stderr_text = String::from_utf8_lossy(&stderr);
     if classification.success()
         && (!vkcube_output_is_valid(&stdout_text, &stderr_text, backend)
-            || (control_sequence && !vkcube_control_sequence_is_valid(&stdout_text, &stderr_text)))
+            || (control_sequence && !vkcube_control_sequence_is_valid(&stdout_text, &stderr_text))
+            || (mangohud && !mangohud_downstream_loader_evidence(&stderr_text)))
     {
         VkcubeExit::MissingStartupEvidence
     } else {
@@ -909,6 +950,7 @@ fn run_vkcube(root: &Path, options: VkcubeOptions) -> VkcubeExit {
             options.seconds,
             options.backend,
             options.control_sequence,
+            options.mangohud,
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => VkcubeExit::MissingExecutable,
         Err(_) => VkcubeExit::UnexpectedExit,
@@ -5094,6 +5136,54 @@ mod tests {
         let options = parse_vkcube_args(&["--backend", "fsr_3_1_4"]).unwrap();
 
         assert_eq!(options.backend, BackendSelection::Fsr314);
+    }
+
+    #[test]
+    fn vkcube_mangohud_launch_uses_explicit_downstream_order_and_visible_hud() {
+        let options = parse_vkcube_args(&["--mangohud", "--backend", "fsr_3_1_4"]).unwrap();
+        assert!(parse_vkcube_args(&["--mangohud", "--mangohud"]).is_err());
+        let command = super::configure_vkcube_command(Path::new("/workspace"), options);
+        let overrides = command
+            .get_envs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(overrides.get(std::ffi::OsStr::new("MANGOHUD")), Some(&None));
+        assert_eq!(
+            overrides.get(std::ffi::OsStr::new("DISABLE_MANGOHUD")),
+            Some(&None)
+        );
+        assert_eq!(
+            overrides
+                .get(std::ffi::OsStr::new("VK_INSTANCE_LAYERS"))
+                .and_then(|value| *value)
+                .unwrap(),
+            "VK_LAYER_TUXSCALING_overlay:VK_LAYER_MANGOHUD_overlay_x86_64:VK_LAYER_KHRONOS_validation"
+        );
+        assert!(
+            overrides
+                .get(std::ffi::OsStr::new("MANGOHUD_CONFIG"))
+                .and_then(|value| *value)
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("no_display=0")
+        );
+        assert_eq!(
+            overrides
+                .get(std::ffi::OsStr::new("VK_LAYER_VALIDATE_SYNC"))
+                .and_then(|value| *value)
+                .unwrap(),
+            "0"
+        );
+    }
+
+    #[test]
+    fn mangohud_order_requires_loader_observation() {
+        let downstream = "vkCreateDevice layer callstack setup to:\nVK_LAYER_TUXSCALING_overlay\nVK_LAYER_MANGOHUD_overlay_x86_64\nVK_LAYER_KHRONOS_validation\n<Drivers>";
+        let upstream = "vkCreateDevice layer callstack setup to:\nVK_LAYER_MANGOHUD_overlay_x86_64\nVK_LAYER_TUXSCALING_overlay\nVK_LAYER_KHRONOS_validation\n<Drivers>";
+        assert!(super::mangohud_downstream_loader_evidence(downstream));
+        assert!(!super::mangohud_downstream_loader_evidence(upstream));
+        assert!(!super::mangohud_downstream_loader_evidence(
+            "both names in a list"
+        ));
     }
 
     #[test]

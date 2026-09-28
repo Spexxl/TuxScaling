@@ -1577,6 +1577,21 @@ unsafe fn find_layer_link(
     None
 }
 
+fn effective_instance_api_version(
+    requested: u32,
+    downstream_supported: Option<u32>,
+    loader_supported: Option<u32>,
+) -> u32 {
+    let supported = downstream_supported
+        .unwrap_or(vk::API_VERSION_1_0)
+        .max(loader_supported.unwrap_or(vk::API_VERSION_1_0));
+    if requested < vk::API_VERSION_1_2 && supported >= vk::API_VERSION_1_2 {
+        vk::API_VERSION_1_2
+    } else {
+        requested
+    }
+}
+
 unsafe fn create_instance_inner(
     create_info: *const vk::InstanceCreateInfo<'_>,
     allocation_callbacks: *const vk::AllocationCallbacks<'_>,
@@ -1622,21 +1637,34 @@ unsafe fn create_instance_inner(
             .filter(|version| *version != 0)
             .unwrap_or(vk::API_VERSION_1_0)
     };
-    let mut supported_api_version = vk::API_VERSION_1_0;
-    if let Some(proc) = unsafe {
+    let downstream_api_version = unsafe {
         get_instance_proc_addr(vk::Instance::null(), c"vkEnumerateInstanceVersion".as_ptr())
-    } {
+    }
+    .and_then(|proc| {
         let enumerate_instance_version: vk::PFN_vkEnumerateInstanceVersion =
             unsafe { std::mem::transmute(proc) };
-        let _ = unsafe { enumerate_instance_version(&mut supported_api_version) };
-    }
-    let vulkan_api_version = if requested_api_version < vk::API_VERSION_1_2
-        && supported_api_version >= vk::API_VERSION_1_2
-    {
-        vk::API_VERSION_1_2
-    } else {
-        requested_api_version
-    };
+        let mut version = vk::API_VERSION_1_0;
+        (unsafe { enumerate_instance_version(&mut version) } == vk::Result::SUCCESS)
+            .then_some(version)
+    });
+    // Some intervening layers do not expose global commands before an
+    // instance exists. Query the loader export when that happens so the
+    // downstream chain does not silently downgrade FSR to Vulkan 1.0.
+    let loader_api_version =
+        if downstream_api_version.unwrap_or(vk::API_VERSION_1_0) < vk::API_VERSION_1_2 {
+            unsafe { ash::Entry::load() }.ok().and_then(|entry| {
+                unsafe { entry.try_enumerate_instance_version() }
+                    .ok()
+                    .flatten()
+            })
+        } else {
+            None
+        };
+    let vulkan_api_version = effective_instance_api_version(
+        requested_api_version,
+        downstream_api_version,
+        loader_api_version,
+    );
     let requested_extensions = unsafe {
         if (*create_info).enabled_extension_count == 0
             || (*create_info).pp_enabled_extension_names.is_null()
@@ -2983,6 +3011,22 @@ mod tests {
     use crate::state::retire_swapchain;
     use ash::vk;
     use ash::vk::Handle;
+
+    #[test]
+    fn missing_downstream_global_version_uses_loader_version() {
+        assert_eq!(
+            super::effective_instance_api_version(
+                vk::API_VERSION_1_0,
+                None,
+                Some(vk::make_api_version(0, 1, 4, 0)),
+            ),
+            vk::API_VERSION_1_2,
+        );
+        assert_eq!(
+            super::effective_instance_api_version(vk::API_VERSION_1_0, None, None),
+            vk::API_VERSION_1_0,
+        );
+    }
     use std::time::{Duration, Instant};
     use tuxscaling_display::{
         Extent, PresentationNegotiation, PresentationState, Rect, SurfaceExtent,
