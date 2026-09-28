@@ -1,9 +1,12 @@
 use egui::{Event, Key, Modifiers, PointerButton, Pos2, Vec2};
 use libloading::Library;
+use ownership::{InputOwner, can_open, on_focus_in, open_transition, release_transition};
 use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong};
 use thiserror::Error;
 
 pub const CRATE_NAME: &str = "tuxscaling-input";
+
+pub mod ownership;
 
 const KEY_PRESS: c_int = 2;
 const KEY_RELEASE: c_int = 3;
@@ -185,6 +188,10 @@ pub enum InputError {
     Library(#[from] libloading::Error),
     #[error("XOpenDisplay failed")]
     DisplayUnavailable,
+    #[error("presenter input routing is unavailable")]
+    RoutingUnavailable,
+    #[error("X11 {0} grab failed with status {1}")]
+    GrabFailed(&'static str, c_int),
 }
 
 #[derive(Debug, Default)]
@@ -353,8 +360,16 @@ pub fn should_forward_to_game(route: &InputRoute, overlay_open: bool) -> bool {
     false
 }
 
-const fn focus_out_closes_overlay(_mode: c_int) -> bool {
-    false
+const fn focus_out_closes_overlay(mode: c_int) -> bool {
+    mode == 0
+}
+
+fn insert_press_is_toggle(down: bool, last_release_time: Option<c_ulong>, time: c_ulong) -> bool {
+    !down && last_release_time != Some(time)
+}
+
+fn insert_release_time(was_down: bool, time: c_ulong) -> Option<c_ulong> {
+    was_down.then_some(time)
 }
 
 pub struct X11Input {
@@ -367,6 +382,9 @@ pub struct X11Input {
     event_window: c_ulong,
     insert_keycode: u8,
     overlay_open: bool,
+    owner: InputOwner,
+    insert_down: bool,
+    last_insert_release_time: Option<c_ulong>,
     pointer_mode: PointerMode,
     cursor_hidden: bool,
     last_root: Option<[i32; 2]>,
@@ -494,6 +512,9 @@ impl X11Input {
             },
             insert_keycode,
             overlay_open: false,
+            owner: InputOwner::Game,
+            insert_down: false,
+            last_insert_release_time: None,
             pointer_mode: PointerMode::Absolute,
             cursor_hidden: false,
             last_root: None,
@@ -518,7 +539,8 @@ impl X11Input {
             destroy_region,
             set_window_shape_region,
         };
-        input.update_grab();
+        input.set_presenter_interactive(false);
+        input.grab_insert_hotkey();
         let sync = load::<Sync>(&input._library, b"XSync\0")?;
         unsafe { sync(display, 0) };
         Ok(input)
@@ -570,11 +592,23 @@ impl X11Input {
                         continue;
                     }
                     if is_insert {
-                        frame.toggle_overlay = true;
-                        self.overlay_open = !self.overlay_open;
-                        self.update_grab();
-                        self.update_cursor_visibility();
-                        frame.events.push(key_event(true));
+                        let toggle = insert_press_is_toggle(
+                            self.insert_down,
+                            self.last_insert_release_time,
+                            event.time,
+                        );
+                        self.insert_down = true;
+                        if toggle {
+                            if self.overlay_open {
+                                self.release_overlay();
+                                frame.toggle_overlay = true;
+                            } else if self.try_open_overlay().is_ok() {
+                                frame.toggle_overlay = true;
+                            }
+                            if frame.toggle_overlay {
+                                frame.events.push(key_event(true));
+                            }
+                        }
                     }
                 }
                 KEY_RELEASE => {
@@ -590,6 +624,9 @@ impl X11Input {
                         continue;
                     }
                     if is_insert {
+                        let was_down = self.insert_down;
+                        self.insert_down = false;
+                        self.last_insert_release_time = insert_release_time(was_down, event.time);
                         frame.events.push(key_event(false));
                     }
                 }
@@ -725,17 +762,24 @@ impl X11Input {
                     if self.overlay_open {
                         frame.events.push(Event::WindowFocused(kind == FOCUS_IN));
                     }
+                    if kind == FOCUS_IN && self.owner == InputOwner::Suspended {
+                        self.owner = on_focus_in(self.owner);
+                        self.grab_insert_hotkey();
+                        unsafe { (self.flush)(self.display) };
+                    }
                     // XGrabKeyboard/XUngrabKeyboard emit focus transitions
                     // with NotifyGrab/NotifyUngrab. They acknowledge the
                     // overlay's own input grab, rather than a real focus loss.
                     if kind == FOCUS_OUT && focus_out_closes_overlay(event.mode) {
+                        self.insert_down = false;
                         self.pointer_present = false;
                         if self.overlay_open {
-                            self.overlay_open = false;
-                            self.update_grab();
-                            self.update_cursor_visibility();
+                            self.release_overlay();
                             frame.toggle_overlay = true;
                         }
+                        self.owner = InputOwner::Suspended;
+                        self.release_insert_hotkey();
+                        unsafe { (self.flush)(self.display) };
                     }
                 }
                 _ => {}
@@ -747,35 +791,80 @@ impl X11Input {
         frame
     }
 
-    fn update_grab(&self) {
-        if self.overlay_open {
-            self.release_insert_hotkey();
-            self.set_presenter_interactive(true);
+    pub fn try_open_overlay(&mut self) -> Result<(), InputError> {
+        if self.owner == InputOwner::Overlay {
+            return Ok(());
+        }
+        if !can_open(self.owner)
+            || self.route.event_window == 0
+            || (self.route.event_window != self.route.game_window
+                && (self.empty_input_region == 0 || self.set_window_shape_region.is_none()))
+        {
+            return Err(InputError::RoutingUnavailable);
+        }
+        self.release_insert_hotkey();
+        self.set_presenter_interactive(true);
+        let keyboard = unsafe { (self.grab_keyboard)(self.display, self.event_window, 0, 1, 1, 0) };
+        let pointer = if keyboard == 0 {
             unsafe {
-                (self.grab_keyboard)(self.display, self.event_window, 0, 1, 1, 0);
                 (self.grab_pointer)(
                     self.display,
                     self.event_window,
                     0,
                     POINTER_GRAB_MASK,
-                    1,
-                    1,
+                    GRAB_MODE_ASYNC,
+                    GRAB_MODE_ASYNC,
                     0,
                     0,
                     0,
-                );
+                )
             }
         } else {
+            -1
+        };
+        let outcome = open_transition(keyboard == 0, pointer == 0);
+        if outcome.owner != InputOwner::Overlay {
+            unsafe {
+                if outcome.release_keyboard {
+                    (self.ungrab_keyboard)(self.display, 0);
+                }
+                if outcome.release_pointer {
+                    (self.ungrab_pointer)(self.display, 0);
+                }
+            }
+            self.set_presenter_interactive(false);
+            self.grab_insert_hotkey();
+            unsafe { (self.flush)(self.display) };
+            return Err(if keyboard != 0 {
+                InputError::GrabFailed("keyboard", keyboard)
+            } else {
+                InputError::GrabFailed("pointer", pointer)
+            });
+        }
+        self.owner = InputOwner::Overlay;
+        self.overlay_open = true;
+        self.update_cursor_visibility();
+        unsafe { (self.flush)(self.display) };
+        Ok(())
+    }
+
+    pub fn release_overlay(&mut self) {
+        let transition = release_transition(self.owner);
+        if !transition.restore_game_route {
+            return;
+        }
+        if transition.release_grabs {
             unsafe {
                 (self.ungrab_keyboard)(self.display, 0);
                 (self.ungrab_pointer)(self.display, 0);
             }
-            self.set_presenter_interactive(false);
-            self.grab_insert_hotkey();
         }
-        unsafe {
-            (self.flush)(self.display);
-        }
+        self.overlay_open = false;
+        self.owner = transition.owner;
+        self.set_presenter_interactive(false);
+        self.grab_insert_hotkey();
+        self.update_cursor_visibility();
+        unsafe { (self.flush)(self.display) };
     }
 
     fn grab_insert_hotkey(&self) {
@@ -934,11 +1023,9 @@ impl Drop for X11Input {
     fn drop(&mut self) {
         if !self.display.is_null() {
             unsafe {
-                self.show_native_cursor();
+                self.release_overlay();
+                self.owner = InputOwner::Destroyed;
                 self.release_insert_hotkey();
-                (self.ungrab_keyboard)(self.display, 0);
-                (self.ungrab_pointer)(self.display, 0);
-                self.set_presenter_interactive(false);
                 if self.empty_input_region != 0
                     && let Some(destroy_region) = self.destroy_region
                 {
@@ -1155,10 +1242,26 @@ mod tests {
     }
 
     #[test]
-    fn focus_changes_do_not_close_the_overlay() {
+    fn real_focus_loss_closes_overlay_but_grab_notifications_do_not() {
         assert!(!super::focus_out_closes_overlay(1));
         assert!(!super::focus_out_closes_overlay(2));
-        assert!(!super::focus_out_closes_overlay(0));
+        assert!(super::focus_out_closes_overlay(0));
         assert!(!super::focus_out_closes_overlay(3));
+    }
+
+    #[test]
+    fn insert_auto_repeat_pairs_do_not_toggle_again() {
+        assert!(super::insert_press_is_toggle(false, None, 100));
+        assert!(!super::insert_press_is_toggle(true, None, 140));
+        assert!(!super::insert_press_is_toggle(false, Some(180), 180));
+        assert!(super::insert_press_is_toggle(false, Some(180), 220));
+    }
+
+    #[test]
+    fn stray_release_does_not_suppress_the_first_insert_press() {
+        let release_time = super::insert_release_time(false, 100);
+        assert!(super::insert_press_is_toggle(false, release_time, 100));
+        let repeat_time = super::insert_release_time(true, 140);
+        assert!(!super::insert_press_is_toggle(false, repeat_time, 140));
     }
 }
