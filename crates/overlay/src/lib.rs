@@ -8,6 +8,30 @@ use tuxscaling_config::{
 
 pub const CRATE_NAME: &str = "tuxscaling-overlay";
 
+mod layout;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum OverlayTab {
+    #[default]
+    Control,
+    Diagnostics,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OverlaySessionState {
+    tab: OverlayTab,
+    ui_scale: f32,
+}
+
+impl Default for OverlaySessionState {
+    fn default() -> Self {
+        Self {
+            tab: OverlayTab::Control,
+            ui_scale: 1.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FrameDiagnostics {
     pub frame_id: u64,
@@ -224,6 +248,12 @@ pub fn render_diagnostics(
     pointer_position: Option<[f32; 2]>,
     pointer_present: bool,
 ) -> OverlayFrame {
+    let session_id = Id::new("tuxscaling-overlay-session");
+    let mut session = context.data_mut(|data| {
+        data.get_temp::<OverlaySessionState>(session_id)
+            .unwrap_or_default()
+    });
+    let [panel_x, panel_y, panel_width, panel_height] = layout::initial_panel_geometry(size, 1.0);
     diagnostics.requested_quality = None;
     diagnostics.requested_upscaler = None;
     diagnostics.requested_guidance_scale = None;
@@ -256,7 +286,25 @@ pub fn render_diagnostics(
         },
         |context| {
             if visible {
-                egui::Window::new("TuxScaling").show(context, |ui| {
+                egui::Window::new("TuxScaling")
+                    .default_pos(egui::pos2(panel_x, panel_y))
+                    .default_size(vec2(panel_width, panel_height))
+                    .resizable(true)
+                    .show(context, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut session.tab, OverlayTab::Control, "Control");
+                        ui.selectable_value(&mut session.tab, OverlayTab::Diagnostics, "Diagnostics");
+                    });
+                    ui.add(egui::Slider::new(&mut session.ui_scale, 0.75..=1.5).text("UI scale"));
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    let scale = session.ui_scale;
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                    ui.style_mut().spacing.interact_size *= scale;
+                    ui.style_mut().spacing.item_spacing *= scale;
+                    for font in ui.style_mut().text_styles.values_mut() {
+                        font.size *= scale;
+                    }
+                    if session.tab == OverlayTab::Control {
                     ui.label(&diagnostics.state);
                     ui.label(format!(
                         "{} x {} | Frame {}",
@@ -540,6 +588,7 @@ pub fn render_diagnostics(
                                     }
                                 });
                         });
+                    } else {
                     ui.label(format!("Frame delta: {:.2} ms", diagnostics.frame_delta_ms));
                     ui.label(format!(
                         "Delta raw {:.2} | validated {:.2} | smoothed {:.2} ms",
@@ -620,6 +669,8 @@ pub fn render_diagnostics(
                     if diagnostics.p95_ms > 0.0 {
                         ui.label(format!("Temporal p95: {:.2} ms", diagnostics.p95_ms));
                     }
+                    }
+                    });
                 });
             }
             if software_cursor_visible {
@@ -630,6 +681,7 @@ pub fn render_diagnostics(
             }
         },
     );
+    context.data_mut(|data| data.insert_temp(session_id, session));
     if control_sequence_enabled() {
         apply_control_sequence_tick(diagnostics);
     }
@@ -997,6 +1049,43 @@ mod tests {
                 .iter()
                 .any(|primitive| matches!(primitive.primitive, egui::epaint::Primitive::Mesh(_)))
         );
+    }
+
+    #[test]
+    fn long_diagnostics_stay_inside_the_initial_compact_panel() {
+        let context = egui::Context::default();
+        context.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("tuxscaling-overlay-session"),
+                super::OverlaySessionState {
+                    tab: super::OverlayTab::Diagnostics,
+                    ui_scale: 1.0,
+                },
+            );
+        });
+        let mut diagnostics = FrameDiagnostics {
+            reset_reason: "long diagnostic reason ".repeat(120),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let frame = render_diagnostics(
+                &context,
+                [1280, 720],
+                &mut diagnostics,
+                &[],
+                true,
+                None,
+                false,
+            );
+            let panel_right = frame
+                .primitives
+                .iter()
+                .filter(|primitive| primitive.clip_rect.max.x < 1280.0)
+                .map(|primitive| primitive.clip_rect.max.x)
+                .reduce(f32::max)
+                .unwrap_or_default();
+            assert!(panel_right <= 640.0, "panel spilled to x={panel_right}");
+        }
     }
 
     #[test]
