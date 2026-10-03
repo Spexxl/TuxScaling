@@ -160,6 +160,15 @@ type Flush = unsafe extern "C" fn(*mut Display) -> c_int;
 type CloseDisplay = unsafe extern "C" fn(*mut Display) -> c_int;
 type Sync = unsafe extern "C" fn(*mut Display, c_int) -> c_int;
 type SelectInput = unsafe extern "C" fn(*mut Display, c_ulong, c_long) -> c_int;
+type QueryTree = unsafe extern "C" fn(
+    *mut Display,
+    c_ulong,
+    *mut c_ulong,
+    *mut c_ulong,
+    *mut *mut c_ulong,
+    *mut c_uint,
+) -> c_int;
+type Free = unsafe extern "C" fn(*mut std::ffi::c_void) -> c_int;
 type WarpPointer = unsafe extern "C" fn(
     *mut Display,
     c_ulong,
@@ -365,14 +374,44 @@ fn hotkey_window(route: &InputRoute, root_window: c_ulong) -> c_ulong {
     }
 }
 
-fn should_rebind_hotkey(
-    current: &InputRoute,
-    next: &InputRoute,
-    root_window: c_ulong,
-    owner: InputOwner,
-) -> bool {
-    owner == InputOwner::Game
-        && hotkey_window(current, root_window) != hotkey_window(next, root_window)
+fn resolve_hotkey_window(
+    display: *mut Display,
+    window: c_ulong,
+    root: c_ulong,
+    query: QueryTree,
+    free: Free,
+) -> c_ulong {
+    // Wine's Vulkan surface can be a child of the keyboard focus window.
+    // A passive grab on that child only activates while it contains the pointer.
+    // Keep the grab scoped to this game's top-level ancestor, never the desktop.
+    let mut current = window;
+    for _ in 0..64 {
+        if current == 0 || current == root {
+            break;
+        }
+        let mut tree_root = 0;
+        let mut parent = 0;
+        let mut children = std::ptr::null_mut();
+        let mut count = 0;
+        let ok = unsafe {
+            query(
+                display,
+                current,
+                &mut tree_root,
+                &mut parent,
+                &mut children,
+                &mut count,
+            )
+        };
+        if !children.is_null() {
+            unsafe { free(children.cast()) };
+        }
+        if ok == 0 || parent == 0 || parent == tree_root || parent == current {
+            break;
+        }
+        current = parent;
+    }
+    current
 }
 
 pub fn should_forward_to_game(route: &InputRoute, overlay_open: bool) -> bool {
@@ -381,7 +420,16 @@ pub fn should_forward_to_game(route: &InputRoute, overlay_open: bool) -> bool {
 }
 
 const fn focus_out_closes_overlay(mode: c_int) -> bool {
-    mode == 0
+    mode == 0 || mode == 3
+}
+
+fn focus_out_suspends_input(
+    window: c_ulong,
+    hotkey: c_ulong,
+    overlay_open: bool,
+    mode: c_int,
+) -> bool {
+    focus_out_closes_overlay(mode) && (window == hotkey || overlay_open)
 }
 
 fn insert_press_is_toggle(down: bool, last_release_time: Option<c_ulong>, time: c_ulong) -> bool {
@@ -399,6 +447,7 @@ pub struct X11Input {
     display: *mut Display,
     route: InputRoute,
     root_window: c_ulong,
+    hotkey_window: c_ulong,
     event_window: c_ulong,
     insert_keycode: u8,
     overlay_open: bool,
@@ -420,6 +469,9 @@ pub struct X11Input {
     ungrab_key: UngrabKey,
     flush: Flush,
     close_display: CloseDisplay,
+    query_tree: QueryTree,
+    free: Free,
+    select_input: SelectInput,
     warp_pointer: WarpPointer,
     fake_button: Option<FakeButtonEvent>,
     fake_relative_motion: Option<FakeRelativeMotionEvent>,
@@ -458,6 +510,10 @@ impl X11Input {
         let root = unsafe { root_window(display, screen) };
         let insert_keycode = unsafe { keysym_to_keycode(display, INSERT_KEYSYM) };
         let select_input = load::<SelectInput>(&library, b"XSelectInput\0")?;
+        let query_tree = load::<QueryTree>(&library, b"XQueryTree\0")?;
+        let free = load::<Free>(&library, b"XFree\0")?;
+        let hotkey_window =
+            resolve_hotkey_window(display, hotkey_window(&route, root), root, query_tree, free);
         let event_window = if route.event_window == 0 {
             root
         } else {
@@ -465,8 +521,8 @@ impl X11Input {
         };
         unsafe {
             select_input(display, event_window, PASSIVE_EVENT_MASK);
-            if route.game_window != 0 && route.game_window as c_ulong != event_window {
-                select_input(display, route.game_window as c_ulong, 1 | 2);
+            if hotkey_window != 0 && hotkey_window != event_window {
+                select_input(display, hotkey_window, 1 | 2 | (1 << 21));
             }
         }
         let xtest_library = unsafe { Library::new("libXtst.so.6") }.ok();
@@ -525,6 +581,7 @@ impl X11Input {
             display,
             route,
             root_window: root,
+            hotkey_window,
             event_window: if route.event_window == 0 {
                 root
             } else {
@@ -550,6 +607,9 @@ impl X11Input {
             ungrab_key,
             flush,
             close_display,
+            query_tree,
+            free,
+            select_input,
             warp_pointer,
             fake_button,
             fake_relative_motion,
@@ -580,13 +640,29 @@ impl X11Input {
         if event_window != self.event_window {
             return false;
         }
-        let rebind = should_rebind_hotkey(&self.route, &route, self.root_window, self.owner);
-        if rebind {
+        let next_hotkey = resolve_hotkey_window(
+            self.display,
+            hotkey_window(&route, self.root_window),
+            self.root_window,
+            self.query_tree,
+            self.free,
+        );
+        let changed = self.hotkey_window != next_hotkey;
+        if changed && self.owner == InputOwner::Game {
             self.release_insert_hotkey();
         }
         self.route = route;
-        if rebind {
-            self.grab_insert_hotkey();
+        if changed {
+            if self.hotkey_window != self.event_window {
+                unsafe { (self.select_input)(self.display, self.hotkey_window, 0) };
+            }
+            self.hotkey_window = next_hotkey;
+            if next_hotkey != self.event_window {
+                unsafe { (self.select_input)(self.display, next_hotkey, 1 | 2 | (1 << 21)) };
+            }
+            if self.owner == InputOwner::Game {
+                self.grab_insert_hotkey();
+            }
             unsafe { (self.flush)(self.display) };
         }
         true
@@ -612,7 +688,7 @@ impl X11Input {
                     let is_insert = event.keycode as u8 == self.insert_keycode;
                     if event.send_event != 0
                         || if is_insert {
-                            !should_accept_toggle_key(&self.route, self.root_window, event.window)
+                            !should_accept_toggle_key(&self.route, self.hotkey_window, event.window)
                         } else {
                             !should_accept_event(&self.route, event.window)
                         }
@@ -630,8 +706,13 @@ impl X11Input {
                             if self.overlay_open {
                                 self.release_overlay();
                                 frame.toggle_overlay = true;
-                            } else if self.try_open_overlay().is_ok() {
-                                frame.toggle_overlay = true;
+                            } else {
+                                match self.try_open_overlay() {
+                                    Ok(()) => frame.toggle_overlay = true,
+                                    Err(error) => {
+                                        eprintln!("TuxScaling input: cannot open overlay: {error}")
+                                    }
+                                }
                             }
                             if frame.toggle_overlay {
                                 frame.events.push(key_event(true));
@@ -644,7 +725,7 @@ impl X11Input {
                     let is_insert = event.keycode as u8 == self.insert_keycode;
                     if event.send_event != 0
                         || if is_insert {
-                            !should_accept_toggle_key(&self.route, self.root_window, event.window)
+                            !should_accept_toggle_key(&self.route, self.hotkey_window, event.window)
                         } else {
                             !should_accept_event(&self.route, event.window)
                         }
@@ -784,7 +865,12 @@ impl X11Input {
                 }
                 FOCUS_IN | FOCUS_OUT => {
                     let event = unsafe { event.focus };
-                    if !should_accept_event(&self.route, event.window) || event.send_event != 0 {
+                    if (!should_accept_event(&self.route, event.window)
+                        && event.window != self.hotkey_window)
+                        || event.send_event != 0
+                        || event.detail == 2
+                    {
+                        // NotifyInferior means focus moved within the game subtree.
                         continue;
                     }
                     if self.overlay_open {
@@ -798,7 +884,14 @@ impl X11Input {
                     // XGrabKeyboard/XUngrabKeyboard emit focus transitions
                     // with NotifyGrab/NotifyUngrab. They acknowledge the
                     // overlay's own input grab, rather than a real focus loss.
-                    if kind == FOCUS_OUT && focus_out_closes_overlay(event.mode) {
+                    if kind == FOCUS_OUT
+                        && focus_out_suspends_input(
+                            event.window,
+                            self.hotkey_window,
+                            self.overlay_open,
+                            event.mode,
+                        )
+                    {
                         self.insert_down = false;
                         self.pointer_present = false;
                         if self.overlay_open {
@@ -931,7 +1024,7 @@ impl X11Input {
     }
 
     fn hotkey_windows(&self) -> impl Iterator<Item = c_ulong> {
-        std::iter::once(hotkey_window(&self.route, self.root_window)).filter(|window| *window != 0)
+        std::iter::once(self.hotkey_window).filter(|window| *window != 0)
     }
 
     fn set_presenter_interactive(&self, interactive: bool) {
@@ -1244,6 +1337,14 @@ mod tests {
     }
 
     #[test]
+    fn closed_presenter_focus_loss_keeps_game_hotkey_active() {
+        assert!(!super::focus_out_suspends_input(20, 10, false, 0));
+        assert!(super::focus_out_suspends_input(10, 10, false, 0));
+        assert!(super::focus_out_suspends_input(20, 10, true, 0));
+        assert!(!super::focus_out_suspends_input(20, 10, true, 1));
+    }
+
+    #[test]
     fn insert_hotkey_is_scoped_to_each_game_window() {
         let first = route();
         let second = InputRoute {
@@ -1253,24 +1354,6 @@ mod tests {
         };
         assert_eq!(super::hotkey_window(&first, 1), 0x400);
         assert_eq!(super::hotkey_window(&second, 1), 0x500);
-        assert!(super::should_rebind_hotkey(
-            &first,
-            &second,
-            1,
-            super::InputOwner::Game,
-        ));
-        assert!(!super::should_rebind_hotkey(
-            &first,
-            &second,
-            1,
-            super::InputOwner::Suspended,
-        ));
-        assert!(!super::should_rebind_hotkey(
-            &first,
-            &first,
-            1,
-            super::InputOwner::Game,
-        ));
     }
 
     #[test]
@@ -1304,7 +1387,8 @@ mod tests {
         assert!(!super::focus_out_closes_overlay(1));
         assert!(!super::focus_out_closes_overlay(2));
         assert!(super::focus_out_closes_overlay(0));
-        assert!(!super::focus_out_closes_overlay(3));
+        // Alt-Tab while XGrabKeyboard is active reports NotifyWhileGrabbed.
+        assert!(super::focus_out_closes_overlay(3));
     }
 
     #[test]

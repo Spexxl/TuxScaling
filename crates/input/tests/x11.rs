@@ -18,6 +18,264 @@ const EVENT_DEADLINE: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_TOGGLE_ATTEMPTS: u32 = 5;
 
+#[test]
+#[ignore = "requires an X11 desktop and temporarily focuses test windows"]
+fn switching_application_while_overlay_is_open_releases_both_grabs() {
+    let (connection, screen) = x11rb::connect(None).unwrap();
+    let root = connection.setup().roots[screen].root;
+    let original_focus = connection.get_input_focus().unwrap().reply().unwrap().focus;
+    let game = connection.generate_id().unwrap();
+    let presenter = connection.generate_id().unwrap();
+    let other = connection.generate_id().unwrap();
+    for window in [game, presenter, other] {
+        connection
+            .create_window(
+                0,
+                window,
+                root,
+                0,
+                0,
+                64,
+                64,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new().override_redirect(1),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        connection.map_window(window).unwrap().check().unwrap();
+    }
+    ensure_focused(&connection, game);
+    let mut input = X11Input::connect(InputRoute::new(
+        presenter.into(),
+        game.into(),
+        [64, 64],
+        [64, 64],
+        PointerViewport {
+            offset: [0.0, 0.0],
+            extent: [64.0, 64.0],
+        },
+    ))
+    .unwrap();
+    input.poll();
+    input.try_open_overlay().unwrap();
+    input.poll();
+    assert_eq!(input.cursor_owner(), CursorOwner::Overlay);
+    ensure_focused(&connection, other);
+    let frame = wait_frame(&mut input, EVENT_DEADLINE, |frame| {
+        frame.cursor_owner == CursorOwner::Native
+    });
+    assert_eq!(
+        frame.cursor_owner,
+        CursorOwner::Native,
+        "a real focus change during a keyboard grab must close the overlay"
+    );
+    assert!(
+        connection
+            .shape_get_rectangles(presenter, SK::INPUT)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .rectangles
+            .is_empty()
+    );
+    assert_eq!(
+        connection
+            .grab_keyboard(false, other, 0u32, GrabMode::ASYNC, GrabMode::ASYNC)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .status,
+        GrabStatus::SUCCESS
+    );
+    connection.ungrab_keyboard(0u32).unwrap().check().unwrap();
+    assert_eq!(
+        connection
+            .grab_pointer(
+                false,
+                other,
+                EventMask::POINTER_MOTION,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+                0u32,
+                0u32,
+                0u32
+            )
+            .unwrap()
+            .reply()
+            .unwrap()
+            .status,
+        GrabStatus::SUCCESS
+    );
+    connection.ungrab_pointer(0u32).unwrap().check().unwrap();
+    drop(input);
+    connection
+        .set_input_focus(InputFocus::PARENT, original_focus, 0u32)
+        .unwrap()
+        .check()
+        .unwrap();
+    for window in [game, presenter, other] {
+        connection.destroy_window(window).unwrap().check().unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires an X11 server"]
+fn insert_grab_uses_game_ancestor_when_vulkan_surface_is_a_child() {
+    let (connection, screen) = x11rb::connect(None).unwrap();
+    let root = connection.setup().roots[screen].root;
+    let parent = connection.generate_id().unwrap();
+    let child = connection.generate_id().unwrap();
+    let second_parent = connection.generate_id().unwrap();
+    let second_child = connection.generate_id().unwrap();
+    for (window, ancestor) in [
+        (parent, root),
+        (child, parent),
+        (second_parent, root),
+        (second_child, second_parent),
+    ] {
+        connection
+            .create_window(
+                0,
+                window,
+                ancestor,
+                0,
+                0,
+                64,
+                64,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new().override_redirect(1),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+    let setup = connection.setup();
+    let mapping = connection
+        .get_keyboard_mapping(setup.min_keycode, setup.max_keycode - setup.min_keycode + 1)
+        .unwrap()
+        .reply()
+        .unwrap();
+    let insert = mapping
+        .keysyms
+        .chunks(mapping.keysyms_per_keycode as usize)
+        .position(|keys| keys.first() == Some(&0xff63))
+        .unwrap() as u8
+        + setup.min_keycode;
+    let route = InputRoute::new(
+        child.into(),
+        child.into(),
+        [64, 64],
+        [64, 64],
+        PointerViewport {
+            offset: [0.0, 0.0],
+            extent: [64.0, 64.0],
+        },
+    );
+    let mut input = X11Input::connect(route).unwrap();
+    // A second client must find Insert reserved on the keyboard ancestor.
+    // Reserving only the render child misses keys when the pointer is on the presenter.
+    let collision = connection
+        .grab_key(
+            false,
+            parent,
+            ModMask::ANY,
+            insert,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )
+        .unwrap()
+        .check();
+    assert!(
+        matches!(collision,
+            Err(x11rb::errors::ReplyError::X11Error(ref error))
+            if error.error_kind == x11rb::protocol::ErrorKind::Access
+        ),
+        "Insert must be grabbed on the game ancestor: {collision:?}"
+    );
+    // Independent games must reserve their own ancestors without a root grab.
+    let second = X11Input::connect(InputRoute {
+        event_window: second_child.into(),
+        game_window: second_child.into(),
+        ..route
+    })
+    .unwrap();
+    let collision = connection
+        .grab_key(
+            false,
+            second_parent,
+            ModMask::ANY,
+            insert,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )
+        .unwrap()
+        .check();
+    assert!(matches!(collision,
+        Err(x11rb::errors::ReplyError::X11Error(ref error))
+        if error.error_kind == x11rb::protocol::ErrorKind::Access));
+    drop(second);
+    // A route change releases the old ancestor and reserves the new one.
+    assert!(input.update_route(InputRoute {
+        game_window: second_child.into(),
+        ..route
+    }));
+    connection
+        .grab_key(
+            false,
+            parent,
+            ModMask::ANY,
+            insert,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    connection
+        .ungrab_key(insert, parent, ModMask::ANY)
+        .unwrap()
+        .check()
+        .unwrap();
+    let collision = connection
+        .grab_key(
+            false,
+            second_parent,
+            ModMask::ANY,
+            insert,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )
+        .unwrap()
+        .check();
+    assert!(matches!(collision,
+        Err(x11rb::errors::ReplyError::X11Error(ref error))
+        if error.error_kind == x11rb::protocol::ErrorKind::Access));
+    drop(input);
+    connection
+        .grab_key(
+            false,
+            second_parent,
+            ModMask::ANY,
+            insert,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    connection.destroy_window(parent).unwrap().check().unwrap();
+    connection
+        .destroy_window(second_parent)
+        .unwrap()
+        .check()
+        .unwrap();
+}
+
 /// Round-trip barrier proving the server processed all prior requests.
 fn barrier<C: Connection + XprotoConnectionExt>(connection: &C) {
     connection.get_input_focus().unwrap().reply().unwrap();
